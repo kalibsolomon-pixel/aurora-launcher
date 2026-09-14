@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Aurora Launcher">
+  <defs>
+    <linearGradient id="aurora" x1="10" y1="58" x2="55" y2="6" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6de5b8"/>
+      <stop offset="0.52" stop-color="#8b80ff"/>
+      <stop offset="1" stop-color="#d494ff"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="#111524"/>
+  <path d="M13 49 29 13h7l15 36h-9l-3.2-8H24.9l-3.3 8H13Zm15-16h7.7L32 23.5 28 33Z" fill="url(#aurora)"/>
+</svg>
