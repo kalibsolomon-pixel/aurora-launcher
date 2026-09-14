@@ -84,3 +84,35 @@ export async function getLauncherState(): Promise<LauncherState> {
     );
   }
 }
+
+export type AcquisitionOrigin = "downloaded" | "cacheHit";
+
+export interface AcquireArtifactRequest {
+  url: string;
+  sha256: string;
+  sizeBytes: number | null;
+}
+
+export interface AcquiredArtifact {
+  path: string;
+  sha256: string;
+  bytes: number;
+  origin: AcquisitionOrigin;
+}
+
+export async function acquireArtifact(
+  request: AcquireArtifactRequest,
+): Promise<AcquiredArtifact> {
+  try {
+    return await invoke<AcquiredArtifact>("acquire_artifact", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The artifact acquisition could not be completed.",
+    );
+  }
+}

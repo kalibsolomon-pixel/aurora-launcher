@@ -1,9 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
+use crate::cache::{AcquisitionError, ArtifactCache, ArtifactOrigin};
 use crate::config::{ConfigError, ConfigLoad};
 use crate::distribution::ReleaseChannel;
+use crate::downloads::{ArtifactSource, DownloadError, InvalidArtifactSource};
 use crate::instances::{InstanceRecord, InstanceRegistry, InstanceRegistryError};
 use crate::paths::ManagedPaths;
 
@@ -142,6 +144,33 @@ impl From<InstanceRegistryError> for CommandError {
     }
 }
 
+impl From<InvalidArtifactSource> for CommandError {
+    fn from(error: InvalidArtifactSource) -> Self {
+        Self::new("artifact_source_invalid", error.to_string())
+    }
+}
+
+impl From<AcquisitionError> for CommandError {
+    fn from(error: AcquisitionError) -> Self {
+        let code = match &error {
+            AcquisitionError::Download(download) => match download {
+                DownloadError::Network(_) => "network_unavailable",
+                DownloadError::Timeout(_) => "download_timeout",
+                DownloadError::Redirect(_) => "download_redirect_failure",
+                DownloadError::HttpStatus { .. } => "download_http_failure",
+                DownloadError::SizeMismatch { .. } => "artifact_size_mismatch",
+                DownloadError::Sha256Mismatch { .. } => "artifact_hash_mismatch",
+                DownloadError::StagingIo(_) => "cache_io_failure",
+            },
+            AcquisitionError::StoreIo(_) => "cache_io_failure",
+            AcquisitionError::Promotion(_) | AcquisitionError::PromotionBlocked { .. } => {
+                "artifact_promotion_failure"
+            }
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
 fn managed_paths(app: &AppHandle) -> Result<ManagedPaths, CommandError> {
     let resolved_root = app.path().app_local_data_dir().map_err(|error| {
         CommandError::managed_path(format!(
@@ -193,6 +222,78 @@ pub fn get_launcher_state(app: AppHandle) -> Result<LauncherState, CommandError>
     let registry = InstanceRegistry::load(&managed_paths.instance_registry_file())?;
 
     Ok(LauncherState::from_parts(loaded.into_config(), registry))
+}
+
+/// Typed artifact metadata accepted by the acquisition command.
+///
+/// The native layer re-validates everything: the URL must be HTTPS, the
+/// digest must be a canonical hexadecimal SHA-256 value, and the optional
+/// size must be positive.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireArtifactRequest {
+    url: String,
+    sha256: String,
+    size_bytes: Option<u64>,
+}
+
+/// The typed result of one acquisition: the verified cache object and how it
+/// came to be there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquiredArtifact {
+    path: String,
+    sha256: String,
+    bytes: u64,
+    origin: AcquisitionOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AcquisitionOrigin {
+    Downloaded,
+    CacheHit,
+}
+
+/// Acquires one artifact into the launcher's verified cache.
+///
+/// This is the development-facing proof of the acquisition pipeline: it takes
+/// typed artifact metadata (never a shell string or arbitrary path), runs the
+/// full untrusted-staging → verify → promote flow natively, and returns the
+/// verified object. It accepts no fixture shortcuts, so it can only be driven
+/// with a real reachable source — deterministic pipeline verification lives
+/// in the Rust test suite, which uses local loopback test servers.
+#[tauri::command]
+pub async fn acquire_artifact(
+    app: AppHandle,
+    request: AcquireArtifactRequest,
+) -> Result<AcquiredArtifact, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+
+    let source = ArtifactSource::https(&request.url, &request.sha256, request.size_bytes)?;
+
+    let cache = ArtifactCache::new(managed_paths);
+    let artifact = cache.acquire(&source).await?;
+
+    eprintln!(
+        "[aurora-launcher] artifact {} verified ({}) at {}",
+        artifact.sha256,
+        match artifact.origin {
+            ArtifactOrigin::Downloaded => "downloaded",
+            ArtifactOrigin::CacheHit => "cache hit",
+        },
+        artifact.path.display()
+    );
+
+    Ok(AcquiredArtifact {
+        path: artifact.path.to_string_lossy().into_owned(),
+        sha256: artifact.sha256.as_hex(),
+        bytes: artifact.bytes,
+        origin: match artifact.origin {
+            ArtifactOrigin::Downloaded => AcquisitionOrigin::Downloaded,
+            ArtifactOrigin::CacheHit => AcquisitionOrigin::CacheHit,
+        },
+    })
 }
 
 #[cfg(test)]
@@ -249,6 +350,133 @@ mod tests {
 
         let io = CommandError::from(InstanceRegistryError::Read(std::io::Error::other("disk")));
         assert_eq!(io.code, "storage_io_failure");
+    }
+
+    #[test]
+    fn invalid_artifact_sources_map_to_a_stable_machine_code() {
+        let insecure = CommandError::from(
+            crate::downloads::ArtifactSource::https(
+                "http://example.invalid/x",
+                "0".repeat(64).as_str(),
+                None,
+            )
+            .unwrap_err(),
+        );
+        assert_eq!(insecure.code, "artifact_source_invalid");
+        assert!(insecure.message.contains("HTTPS"));
+    }
+
+    #[test]
+    fn acquisition_errors_map_to_stable_machine_codes() {
+        let cases: Vec<(AcquisitionError, &str)> = vec![
+            (
+                AcquisitionError::Download(DownloadError::Redirect(
+                    crate::downloads::RedirectRefusal::LimitExceeded { limit: 8 },
+                )),
+                "download_redirect_failure",
+            ),
+            (
+                AcquisitionError::Download(DownloadError::Redirect(
+                    crate::downloads::RedirectRefusal::InsecureDowngrade {
+                        to: "http://example.invalid/x".to_owned(),
+                    },
+                )),
+                "download_redirect_failure",
+            ),
+            (
+                AcquisitionError::Download(DownloadError::HttpStatus { status: 404 }),
+                "download_http_failure",
+            ),
+            (
+                AcquisitionError::Download(DownloadError::SizeMismatch {
+                    expected: 1,
+                    actual: 2,
+                }),
+                "artifact_size_mismatch",
+            ),
+            (
+                AcquisitionError::Download(DownloadError::Sha256Mismatch {
+                    expected: "e".repeat(64),
+                    actual: "f".repeat(64),
+                }),
+                "artifact_hash_mismatch",
+            ),
+            (
+                AcquisitionError::Download(DownloadError::StagingIo(std::io::Error::other("disk"))),
+                "cache_io_failure",
+            ),
+            (
+                AcquisitionError::StoreIo(std::io::Error::other("disk")),
+                "cache_io_failure",
+            ),
+            (
+                AcquisitionError::Promotion(crate::cache::PromotionError {
+                    context: "replacing a corrupt cache object",
+                    source: std::io::Error::other("locked"),
+                }),
+                "artifact_promotion_failure",
+            ),
+            (
+                AcquisitionError::PromotionBlocked {
+                    rename: std::io::Error::other("rename"),
+                    validation: std::io::Error::other("validation"),
+                },
+                "artifact_promotion_failure",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
+    }
+
+    /// Transport-level classifications are exercised on genuine reqwest
+    /// errors produced by a dead loopback endpoint, keeping the mapping
+    /// honest without public internet access. Whether the platform surfaces
+    /// the dead endpoint as a connect error or lets the timeout win the race
+    /// is platform-dependent; both must map to a transport category.
+    #[tokio::test]
+    async fn real_transport_errors_map_to_their_machine_codes() {
+        // Bind and drop a listener to obtain a guaranteed-dead port.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        // Build through the launcher's own client so the rustls crypto
+        // provider is installed exactly like in production.
+        let source = crate::downloads::ArtifactSource::loopback_http_for_testing(
+            &format!("http://127.0.0.1:{port}/aurora.jar"),
+            &"a".repeat(64),
+            None,
+        )
+        .unwrap();
+        let destination = std::env::temp_dir()
+            .join("aurora-application-test")
+            .join(std::process::id().to_string())
+            .join("unreachable.part");
+
+        let error = crate::downloads::download(
+            &source,
+            &destination,
+            &crate::downloads::DownloadOptions::default(),
+        )
+        .await
+        .expect_err("a dead endpoint must fail");
+
+        let command_error = CommandError::from(AcquisitionError::Download(error));
+        assert!(
+            matches!(
+                command_error.code.as_str(),
+                "network_unavailable" | "download_timeout"
+            ),
+            "a transport failure must map to a transport category, got: {}",
+            command_error.code
+        );
     }
 
     #[test]

@@ -22,6 +22,24 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "system-proxy",
+] }
+# reqwest's default rustls provider (aws-lc-rs) needs CMake/NASM on some hosts;
+# the ring provider builds with a plain C compiler, so the launcher supplies it.
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "ring",
+    "std",
+    "tls12",
+] }
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

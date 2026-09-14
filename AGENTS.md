@@ -35,9 +35,13 @@ npm run tauri build
 - Add a dependency only with current functionality that needs it; prefer standard-library code and focused maintained packages. Commit lockfiles.
 - Passwords never enter this application. Future auth uses Microsoft OAuth, native handling, and OS-backed credential storage where practical.
 - Treat downloads as untrusted until an expected hash is verified; use temporary files and rollback-safe activation.
+- Never trust a cache object because of its filename: verified cache artifacts are re-validated by hashing before reuse, and a corrupt object is replaced only through a full verified acquisition.
+- Never install, extract, activate, or execute from an unverified staging file; only the verified store under `cache/artifacts/sha256/<digest>` contains trusted artifacts.
+- Remote file names, `Content-Disposition`, and URLs never determine local paths; verified cache identity is the SHA-256 digest alone.
+- Production artifact sources are HTTPS-only. Cleartext HTTP is acceptable exclusively for explicit loopback hosts (`127.0.0.1`, `::1`, `localhost`) as the documented test transport path; deterministic tests use local loopback servers, never public internet.
 - Spawn processes with structured executable/argument APIs, never shell strings. Sanitize diagnostics and never log secrets or reusable tokens.
 - Validate path containment before destructive operations. Distinguish managed paths from user-selected external paths.
-- Do not casually change the Tauri identifier (`com.aurora.launcher`), managed-data semantics, command DTOs, or isolation model; they become compatibility contracts.
+- Do not casually change the Tauri identifier (`com.aurora.launcher`), managed-data semantics, command DTOs, error codes, or isolation model; they become compatibility contracts.
 
 ## Verification and Git
 

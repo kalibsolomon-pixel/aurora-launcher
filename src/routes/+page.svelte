@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
+    acquireArtifact,
     getApplicationStatus,
     getLauncherState,
     LauncherBackendError,
+    type AcquiredArtifact,
     type ApplicationStatus,
     type LauncherState,
   } from "$lib/backend";
@@ -12,6 +14,16 @@
   let launcherState = $state<LauncherState | null>(null);
   let statusError = $state<LauncherBackendError | null>(null);
   let stateError = $state<LauncherBackendError | null>(null);
+
+  // Development proof of the native acquisition pipeline; stripped from
+  // production builds.
+  const devPipelineProof = import.meta.env.DEV;
+  let artifactUrl = $state("");
+  let artifactSha256 = $state("");
+  let artifactSize = $state("");
+  let acquisitionBusy = $state(false);
+  let acquisition = $state<AcquiredArtifact | null>(null);
+  let acquisitionError = $state<LauncherBackendError | null>(null);
 
   onMount(async () => {
     try {
@@ -32,6 +44,29 @@
           : new LauncherBackendError("unknown_error", "The launcher state could not be loaded.");
     }
   });
+
+  async function runAcquisition(event: SubmitEvent) {
+    event.preventDefault();
+    acquisitionBusy = true;
+    acquisition = null;
+    acquisitionError = null;
+
+    const parsedSize = artifactSize.trim() === "" ? null : Number(artifactSize);
+    try {
+      acquisition = await acquireArtifact({
+        url: artifactUrl.trim(),
+        sha256: artifactSha256.trim(),
+        sizeBytes: parsedSize !== null && Number.isFinite(parsedSize) ? parsedSize : null,
+      });
+    } catch (cause: unknown) {
+      acquisitionError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The artifact acquisition failed.");
+    } finally {
+      acquisitionBusy = false;
+    }
+  }
 </script>
 
 <svelte:head>
@@ -148,6 +183,84 @@
       </div>
     {/if}
   </section>
+
+  {#if devPipelineProof}
+    <section class="status-card" aria-labelledby="acquire-title" aria-live="polite">
+      <div class="status-heading">
+        <div>
+          <p class="eyebrow">Native pipeline proof</p>
+          <h2 id="acquire-title">Artifact acquisition</h2>
+        </div>
+
+        {#if acquisitionBusy}
+          <span class="badge loading"><span aria-hidden="true"></span>Acquiring</span>
+        {:else if acquisition}
+          <span class="badge ready"><span aria-hidden="true"></span>Verified</span>
+        {:else if acquisitionError}
+          <span class="badge error"><span aria-hidden="true"></span>Rejected</span>
+        {/if}
+      </div>
+
+      <form class="acquire-form" onsubmit={runAcquisition}>
+        <label>
+          <span>Artifact URL (HTTPS)</span>
+          <input type="url" bind:value={artifactUrl} placeholder="https://…" required />
+        </label>
+        <label>
+          <span>Expected SHA-256</span>
+          <input
+            type="text"
+            bind:value={artifactSha256}
+            placeholder="64 hexadecimal characters"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          <span>Expected size in bytes (optional)</span>
+          <input type="number" min="1" bind:value={artifactSize} placeholder="optional" />
+        </label>
+        <button type="submit" disabled={acquisitionBusy}>
+          {acquisitionBusy ? "Acquiring…" : "Acquire into verified cache"}
+        </button>
+      </form>
+
+      {#if acquisition}
+        <dl>
+          <div>
+            <dt>Result</dt>
+            <dd>
+              {acquisition.origin === "cacheHit"
+                ? "Cache hit — existing object revalidated"
+                : "Downloaded and verified"}
+            </dd>
+          </div>
+          <div>
+            <dt>Verified bytes</dt>
+            <dd>{acquisition.bytes}</dd>
+          </div>
+          <div>
+            <dt>SHA-256</dt>
+            <dd>{acquisition.sha256}</dd>
+          </div>
+          <div class="path-row">
+            <dt>Verified object</dt>
+            <dd>{acquisition.path}</dd>
+          </div>
+        </dl>
+      {:else if acquisitionError}
+        <div class="error-message" role="alert">
+          <p>{acquisitionError.message}</p>
+          <code>{acquisitionError.code}</code>
+        </div>
+      {/if}
+
+      <p class="footnote">
+        Development-only proof of the native download, verification, and promotion
+        pipeline. Installation features are not implemented in this phase.
+      </p>
+    </section>
+  {/if}
 </main>
 
 <style>
@@ -311,6 +424,56 @@
     padding: 1rem 1.5rem;
     color: #818ca4;
     font-size: 0.82rem;
+  }
+
+  .acquire-form {
+    display: grid;
+    gap: 0.9rem;
+    padding: 1.25rem 1.5rem 0.5rem;
+  }
+
+  .acquire-form label {
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .acquire-form label span {
+    color: #818ca4;
+    font-size: 0.86rem;
+  }
+
+  .acquire-form input {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid #2a3149;
+    border-radius: 8px;
+    background: #10141f;
+    color: #e7ecf7;
+    font: inherit;
+    font-size: 0.9rem;
+  }
+
+  .acquire-form input:focus {
+    border-color: #a99dff;
+    outline: none;
+  }
+
+  .acquire-form button {
+    justify-self: start;
+    padding: 0.55rem 1.1rem;
+    border: none;
+    border-radius: 8px;
+    background: #6f5df2;
+    color: #ffffff;
+    font: inherit;
+    font-size: 0.88rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .acquire-form button:disabled {
+    opacity: 0.6;
+    cursor: progress;
   }
 
   .loading-message {
