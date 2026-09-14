@@ -24,6 +24,12 @@ npm run tauri build
 - Use platform application-data APIs. Never default an instance to the user's normal `.minecraft`, and never write mutable data beside the executable.
 - Grow Rust by launcher domain, not in a giant `main.rs` or catch-all service. Add modules only with implemented behavior.
 
+## Persisted state
+
+- Versioned persisted documents (launcher configuration, instance registry) fail deliberately on unknown schema versions and on malformed data; never migrate speculatively and never overwrite a damaged file.
+- Instance filesystem identity is always a validated `InstanceId`. Never derive paths from display names, user text, or raw strings.
+- Add persisted preferences only when implemented behavior needs them; secrets never enter ordinary configuration files.
+
 ## Discipline and security
 
 - Add a dependency only with current functionality that needs it; prefer standard-library code and focused maintained packages. Commit lockfiles.

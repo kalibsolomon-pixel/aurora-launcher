@@ -50,3 +50,37 @@ export async function getApplicationStatus(): Promise<ApplicationStatus> {
     );
   }
 }
+
+export type ReleaseChannel = "stable" | "beta" | "nightly";
+
+export interface LauncherConfigSummary {
+  schemaVersion: number;
+  selectedInstanceId: string | null;
+}
+
+export interface InstanceSummary {
+  id: string;
+  displayName: string;
+  channel: ReleaseChannel;
+  auroraVersion: string | null;
+}
+
+export interface LauncherState {
+  config: LauncherConfigSummary;
+  instances: InstanceSummary[];
+}
+
+export async function getLauncherState(): Promise<LauncherState> {
+  try {
+    return await invoke<LauncherState>("get_launcher_state");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "Aurora's persisted launcher state could not be loaded.",
+    );
+  }
+}

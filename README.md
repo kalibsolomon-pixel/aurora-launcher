@@ -4,9 +4,9 @@ Aurora Launcher is a standalone launcher for the Aurora client mod for Minecraft
 
 ## Development status
 
-This repository currently contains the Phase 0 foundation only: a Tauri 2 desktop shell, a Svelte/TypeScript frontend, a typed native status command, platform-correct managed-data path resolution, and architecture documentation.
+This repository contains the Phase 0 foundation (a Tauri 2 desktop shell, a Svelte/TypeScript frontend, a typed native status command, and platform-correct managed-data path resolution) plus the Phase 1 state model: a small versioned launcher configuration persisted as JSON under the managed-data root, a validated instance domain model with a read-only instance registry, deterministic managed-path derivation, and a validated Aurora release-manifest data model.
 
-Minecraft launching, Microsoft/Minecraft authentication, game installation, Fabric installation, Aurora downloads, profiles, and updates are **not implemented**.
+Minecraft launching, Microsoft/Minecraft authentication, game installation, Fabric installation, Aurora downloads, instance creation, profiles, and updates are **not implemented**.
 
 ## Prerequisites
 

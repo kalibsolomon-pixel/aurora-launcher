@@ -2,21 +2,34 @@
   import { onMount } from "svelte";
   import {
     getApplicationStatus,
+    getLauncherState,
     LauncherBackendError,
     type ApplicationStatus,
+    type LauncherState,
   } from "$lib/backend";
 
   let status = $state<ApplicationStatus | null>(null);
-  let error = $state<LauncherBackendError | null>(null);
+  let launcherState = $state<LauncherState | null>(null);
+  let statusError = $state<LauncherBackendError | null>(null);
+  let stateError = $state<LauncherBackendError | null>(null);
 
   onMount(async () => {
     try {
       status = await getApplicationStatus();
     } catch (cause: unknown) {
-      error =
+      statusError =
         cause instanceof LauncherBackendError
           ? cause
           : new LauncherBackendError("unknown_error", "The launcher status could not be loaded.");
+    }
+
+    try {
+      launcherState = await getLauncherState();
+    } catch (cause: unknown) {
+      stateError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The launcher state could not be loaded.");
     }
   });
 </script>
@@ -43,7 +56,7 @@
 
       {#if status}
         <span class="badge ready"><span aria-hidden="true"></span>Ready</span>
-      {:else if error}
+      {:else if statusError}
         <span class="badge error"><span aria-hidden="true"></span>Unavailable</span>
       {:else}
         <span class="badge loading"><span aria-hidden="true"></span>Connecting</span>
@@ -66,15 +79,72 @@
         </div>
       </dl>
       <p class="footnote">No Minecraft installation or account data is accessed in this phase.</p>
-    {:else if error}
+    {:else if statusError}
       <div class="error-message" role="alert">
-        <p>{error.message}</p>
-        <code>{error.code}</code>
+        <p>{statusError.message}</p>
+        <code>{statusError.code}</code>
       </div>
     {:else}
       <div class="loading-message">
         <span class="spinner" aria-hidden="true"></span>
         <p>Requesting status from the native launcher core…</p>
+      </div>
+    {/if}
+  </section>
+
+  <section class="status-card" aria-labelledby="state-title" aria-live="polite">
+    <div class="status-heading">
+      <div>
+        <p class="eyebrow">Persisted model</p>
+        <h2 id="state-title">Launcher state</h2>
+      </div>
+
+      {#if launcherState}
+        <span class="badge ready"><span aria-hidden="true"></span>Loaded</span>
+      {:else if stateError}
+        <span class="badge error"><span aria-hidden="true"></span>Unavailable</span>
+      {:else}
+        <span class="badge loading"><span aria-hidden="true"></span>Loading</span>
+      {/if}
+    </div>
+
+    {#if launcherState}
+      <dl>
+        <div>
+          <dt>Config schema version</dt>
+          <dd>{launcherState.config.schemaVersion}</dd>
+        </div>
+        <div>
+          <dt>Selected instance</dt>
+          <dd>{launcherState.config.selectedInstanceId ?? "None"}</dd>
+        </div>
+        <div>
+          <dt>Known instances</dt>
+          <dd>{launcherState.instances.length}</dd>
+        </div>
+        {#each launcherState.instances as instance (instance.id)}
+          <div>
+            <dt>{instance.id}</dt>
+            <dd>
+              {instance.displayName} · {instance.channel}{#if instance.auroraVersion}
+                · Aurora {instance.auroraVersion}
+              {/if}
+            </dd>
+          </div>
+        {/each}
+      </dl>
+      <p class="footnote">
+        Instances cannot be created yet; instance management arrives in a later phase.
+      </p>
+    {:else if stateError}
+      <div class="error-message" role="alert">
+        <p>{stateError.message}</p>
+        <code>{stateError.code}</code>
+      </div>
+    {:else}
+      <div class="loading-message">
+        <span class="spinner" aria-hidden="true"></span>
+        <p>Loading persisted launcher state…</p>
       </div>
     {/if}
   </section>
@@ -157,6 +227,10 @@
     border-radius: 16px;
     background: rgba(18, 22, 35, 0.84);
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.24);
+  }
+
+  .status-card + .status-card {
+    margin-top: 1.5rem;
   }
 
   .status-heading {
