@@ -606,3 +606,84 @@ export async function refreshAccountSession(accountId: string): Promise<AccountS
     );
   }
 }
+
+export type LaunchInstanceStatus = "ready" | "missing" | "installing" | "damaged";
+export type LaunchRuntimeStatus = "ready" | "missing" | "damaged" | "unresolved";
+export type LaunchAccountStatus =
+  | "ready"
+  | "missing"
+  | "reauthenticationRequired"
+  | "configurationMissing";
+export type LaunchProcessStatus = "stopped" | "starting" | "running" | "exited" | "failed";
+
+export interface PlayBlocker {
+  code: string;
+  message: string;
+}
+
+/** Rust's complete non-secret decision about whether Play may proceed. */
+export interface PlayReadiness {
+  ready: boolean;
+  instanceId: string;
+  accountId: string | null;
+  accountName: string | null;
+  instanceStatus: LaunchInstanceStatus;
+  runtimeStatus: LaunchRuntimeStatus;
+  accountStatus: LaunchAccountStatus;
+  processStatus: LaunchProcessStatus;
+  blockers: PlayBlocker[];
+}
+
+/** Non-secret state of the exact child supervised by this launcher process. */
+export interface LaunchProcess {
+  instanceId: string;
+  status: LaunchProcessStatus;
+  processId: number | null;
+  startedAtUnixSeconds: number | null;
+  exitCode: number | null;
+  message: string | null;
+}
+
+export interface LaunchProgressEvent {
+  phase:
+    | "checkingPreconditions"
+    | "resolvingLaunch"
+    | "restoringSession"
+    | "assemblingArguments"
+    | "startingProcess";
+}
+
+export async function getPlayReadiness(
+  instanceId: string,
+  accountId: string | null,
+): Promise<PlayReadiness> {
+  try {
+    return await invoke<PlayReadiness>("get_play_readiness", {
+      request: { instanceId, accountId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "Play readiness could not be determined.",
+    );
+  }
+}
+
+export async function playInstance(
+  instanceId: string,
+  accountId: string,
+): Promise<LaunchProcess> {
+  try {
+    return await invoke<LaunchProcess>("play_instance", {
+      request: { instanceId, accountId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError("backend_unavailable", "Minecraft could not be started.");
+  }
+}

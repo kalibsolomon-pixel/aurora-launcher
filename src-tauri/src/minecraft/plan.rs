@@ -98,20 +98,28 @@ impl AssetIndexRequirement {
 /// launch.
 ///
 /// Current documents publish a log4j2 XML configuration file with an official
-/// SHA-1; installing it is part of a complete installation (the launch-time
-/// JVM argument that references it is deliberately not constructed here).
+/// SHA-1; installing it is part of a complete installation. The official
+/// launch-time JVM argument template is preserved for later `${path}`
+/// substitution rather than reconstructed or hardcoded by the launcher.
 /// A version without a logging block plans without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoggingRequirement {
     /// The official file id (for example `client-1.21.2.xml`); a validated
     /// single-segment name used as the installed file name.
     file_name: String,
+    /// The single JVM argument template published alongside the file. The
+    /// `${path}` value remains unresolved until launch assembly.
+    argument: String,
     artifact: ArtifactRequirement,
 }
 
 impl LoggingRequirement {
     pub fn file_name(&self) -> &str {
         &self.file_name
+    }
+
+    pub fn argument(&self) -> &str {
+        &self.argument
     }
 
     pub fn artifact(&self) -> &ArtifactRequirement {
@@ -228,14 +236,14 @@ impl PlannedLibrary {
 /// An empty feature list means the argument applies unconditionally on the
 /// planned platform. Values are verbatim metadata strings: unresolved
 /// `${placeholder}` tokens stay unresolved; substituting real values is a
-/// future launch concern.
+/// launch resolution concern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchArgument {
     pub features: Vec<FeatureFlag>,
     pub values: Vec<String>,
 }
 
-/// The launch metadata a future launch-plan construction needs.
+/// The launch metadata consumed by launch-plan construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchMetadata {
     main_class: String,
@@ -389,6 +397,7 @@ pub fn plan_version_document(
             let file_name = validate_logging_file_name(&client.file.id)?;
             Ok(LoggingRequirement {
                 file_name,
+                argument: validate_logging_argument(&client.argument)?,
                 artifact: artifact_requirement(
                     &format!("{} logging configuration", document.id),
                     &client.file.sha1,
@@ -441,6 +450,21 @@ pub fn plan_version_document(
         libraries,
         launch,
     })
+}
+
+fn validate_logging_argument(argument: &str) -> Result<String, PlanError> {
+    if argument.is_empty()
+        || argument.len() > 1_024
+        || argument.contains('\0')
+        || argument.matches("${path}").count() != 1
+    {
+        return Err(PlanError::ArtifactInvalid {
+            source: "logging configuration".to_owned(),
+            reason: "the logging argument must be one bounded argument containing exactly one '${path}' placeholder"
+                .to_owned(),
+        });
+    }
+    Ok(argument.to_owned())
 }
 
 /// Validates an official logging-configuration file id as a single safe
@@ -1097,6 +1121,7 @@ mod tests {
         let logging = plan.logging().expect("the requirement must be planned");
 
         assert_eq!(logging.file_name(), "client-1.21.2.xml");
+        assert_eq!(logging.argument(), "-Dlog4j.configurationFile=${path}");
         assert_eq!(
             logging.artifact().sha1().as_hex(),
             "39384bd14c0606d812afec88d8aff595b2587dd9"
@@ -1129,6 +1154,25 @@ mod tests {
             assert!(
                 validate_logging_file_name(broken).is_err(),
                 "{broken:?} must be rejected as a logging file name"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_argument_must_contain_exactly_one_path_placeholder() {
+        assert_eq!(
+            validate_logging_argument("-Dlog4j.configurationFile=${path}").unwrap(),
+            "-Dlog4j.configurationFile=${path}"
+        );
+        for broken in [
+            "-Dlog4j.configurationFile=client.xml",
+            "${path}${path}",
+            "-Dlog=${other}",
+            "-Dlog=${path}\0",
+        ] {
+            assert!(
+                validate_logging_argument(broken).is_err(),
+                "{broken:?} must be rejected as a logging argument"
             );
         }
     }

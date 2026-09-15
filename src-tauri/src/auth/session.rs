@@ -1,8 +1,8 @@
 //! The in-memory authenticated Minecraft session.
 //!
 //! A session is Rust-owned: the Minecraft access token it holds is exposed
-//! only within the native authentication boundary for future launch
-//! assembly, never through frontend DTOs, events, or persisted JSON.
+//! only within the native authentication and launch boundaries, never
+//! through frontend DTOs, events, or persisted JSON.
 //! Sessions are regenerated on demand from the persisted refresh credential;
 //! nothing here is persisted.
 
@@ -84,8 +84,8 @@ impl MinecraftSession {
         Instant::now() + EXPIRY_SKEW < self.expires_at
     }
 
-    /// The Minecraft access token. Native launch assembly (a future phase)
-    /// is the only intended consumer; this is never serialized or emitted.
+    /// The Minecraft access token. Native launch assembly is the only
+    /// non-transport consumer; this is never serialized or emitted.
     pub fn minecraft_access_token(&self) -> &SecretString {
         &self.minecraft_access_token
     }

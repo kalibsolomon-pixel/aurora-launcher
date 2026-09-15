@@ -10,7 +10,7 @@
 //! - `credentials`: the OS-backed credential store holding the only
 //!   persisted secret (the Microsoft refresh credential);
 //! - `accounts`: the versioned, non-secret account summaries and selection;
-//! - `session`: the in-memory Minecraft session for future launch assembly;
+//! - `session`: the in-memory Minecraft session consumed by launch assembly;
 //! - `callback`: the local-only loopback redirect receiver;
 //! - `flow`: the orchestration — sign-in, session restoration, sign-out —
 //!   and the process-local login transaction guard.

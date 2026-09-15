@@ -11,10 +11,12 @@
     getAccounts,
     getInstanceRuntimeStatus,
     getLauncherState,
+    getPlayReadiness,
     installGame,
     listAuroraReleases,
     planFabricInstall,
     planMinecraftInstall,
+    playInstance,
     refreshAccountSession,
     removeAccount,
     renameInstance,
@@ -40,7 +42,10 @@
     type InstanceValidationDto,
     type InstallProgressEvent,
     type LauncherState,
+    type LaunchProcess,
+    type LaunchProgressEvent,
     type MinecraftPlanSummary,
+    type PlayReadiness,
     type RuntimeProgressEvent,
     type RuntimeStatusDto,
   } from "$lib/backend";
@@ -118,6 +123,15 @@
   let accountError = $state<LauncherBackendError | null>(null);
   let accountSessions = $state<Record<string, AccountSession>>({});
 
+  // Production Play surface (Phase 9). Rust owns the readiness decision and
+  // process state; this component only renders the non-secret DTOs.
+  let playReadiness = $state<PlayReadiness | null>(null);
+  let playProcess = $state<LaunchProcess | null>(null);
+  let playProgress = $state<LaunchProgressEvent | null>(null);
+  let playBusy = $state(false);
+  let playReadinessBusy = $state(false);
+  let playError = $state<LauncherBackendError | null>(null);
+
   onMount(async () => {
     try {
       status = await getApplicationStatus();
@@ -157,6 +171,7 @@
 
     try {
       accountsState = await getAccounts();
+      void refreshPlayReadiness();
     } catch (cause: unknown) {
       accountsError =
         cause instanceof LauncherBackendError
@@ -171,6 +186,8 @@
     let unsubscribeInstance: (() => void) | null = null;
     let unsubscribeRuntime: (() => void) | null = null;
     let unsubscribeAuth: (() => void) | null = null;
+    let unsubscribeLaunchProgress: (() => void) | null = null;
+    let unsubscribeLaunchState: (() => void) | null = null;
     listen<InstallProgressEvent>("install-progress", (event) => {
       installProgress = event.payload;
     }).then((stop) => {
@@ -191,11 +208,28 @@
     }).then((stop) => {
       unsubscribeAuth = stop;
     });
+    listen<LaunchProgressEvent>("launch-progress", (event) => {
+      playProgress = event.payload;
+    }).then((stop) => {
+      unsubscribeLaunchProgress = stop;
+    });
+    listen<LaunchProcess>("launch-state", (event) => {
+      playProcess = event.payload;
+      if (event.payload.status === "exited" || event.payload.status === "failed") {
+        playBusy = false;
+        playProgress = null;
+        void refreshPlayReadiness();
+      }
+    }).then((stop) => {
+      unsubscribeLaunchState = stop;
+    });
     return () => {
       unsubscribeInstall?.();
       unsubscribeInstance?.();
       unsubscribeRuntime?.();
       unsubscribeAuth?.();
+      unsubscribeLaunchProgress?.();
+      unsubscribeLaunchState?.();
     };
   });
 
@@ -205,6 +239,49 @@
     } catch {
       // State refresh is best-effort after mutations; load errors surface
       // through the dedicated state card.
+    }
+  }
+
+  async function refreshPlayReadiness() {
+    const instanceId = launcherState?.config.selectedInstanceId;
+    if (!instanceId) {
+      playReadiness = null;
+      return;
+    }
+    playReadinessBusy = true;
+    try {
+      playReadiness = await getPlayReadiness(
+        instanceId,
+        accountsState?.selectedAccountId ?? null,
+      );
+      playError = null;
+    } catch (cause: unknown) {
+      playReadiness = null;
+      playError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Play readiness could not be loaded.");
+    } finally {
+      playReadinessBusy = false;
+    }
+  }
+
+  async function runPlay(instanceId: string) {
+    const accountId = accountsState?.selectedAccountId;
+    if (!accountId || !playReadiness?.ready) return;
+    playBusy = true;
+    playProgress = { phase: "checkingPreconditions" };
+    playError = null;
+    try {
+      playProcess = await playInstance(instanceId, accountId);
+    } catch (cause: unknown) {
+      playError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Minecraft could not be started.");
+      playBusy = false;
+      playProgress = null;
+      void refreshPlayReadiness();
     }
   }
 
@@ -241,6 +318,7 @@
       await refreshState();
       runtimeStatus = null;
       void runRuntimeStatus(id);
+      void refreshPlayReadiness();
     } catch (cause: unknown) {
       instanceError =
         cause instanceof LauncherBackendError
@@ -309,6 +387,7 @@
     runtimeProgress = null;
     try {
       runtimeStatus = await getInstanceRuntimeStatus(id);
+      void refreshPlayReadiness();
     } catch (cause: unknown) {
       runtimeError =
         cause instanceof LauncherBackendError
@@ -325,6 +404,7 @@
     runtimeProgress = null;
     try {
       runtimeStatus = await ensureInstanceRuntime(id);
+      void refreshPlayReadiness();
     } catch (cause: unknown) {
       runtimeError =
         cause instanceof LauncherBackendError
@@ -338,6 +418,7 @@
   async function refreshAccounts() {
     try {
       accountsState = await getAccounts();
+      void refreshPlayReadiness();
     } catch {
       // Account refresh is best-effort after mutations; load errors surface
       // through the dedicated account card.
@@ -621,8 +702,8 @@
         </div>
       </dl>
       <p class="footnote">
-        Instance management lives in the panel below. Installation is supported;
-        launching is not implemented yet. Managed Java is shown for the selected instance.
+        Instance management and Rust-owned Play readiness live below. Aurora starts only from
+        validated content, the exact managed Java runtime, and a usable authenticated session.
       </p>
     {:else if stateError}
       <div class="error-message" role="alert">
@@ -802,6 +883,39 @@
                 <code>{runtimeError.code}</code>
               </div>
             {/if}
+            <div class="instance-meta validation-line" class:damaged={playReadiness && !playReadiness.ready}>
+              Play:
+              {#if playReadinessBusy}
+                checking prerequisites
+              {:else if playProcess?.instanceId === instance.id && playProcess.status === "running"}
+                running
+              {:else if playProcess?.instanceId === instance.id && playProcess.status === "starting"}
+                starting
+              {:else if playReadiness?.instanceId === instance.id}
+                {playReadiness.ready ? "ready" : "blocked"} · Account:
+                {playReadiness.accountName ?? "none selected"}
+                {#each playReadiness.blockers as blocker (blocker.code)}
+                  <div class="instance-meta">{blocker.message}</div>
+                {/each}
+              {:else}
+                not checked
+              {/if}
+            </div>
+            {#if playProgress && playBusy}
+              <div class="instance-meta">Launch: {playProgress.phase}</div>
+            {/if}
+            {#if playProcess?.instanceId === instance.id && playProcess.status === "failed"}
+              <div class="error-message" role="alert">
+                <p>{playProcess.message ?? "Minecraft exited unsuccessfully."}</p>
+                {#if playProcess.exitCode !== null}<code>exit {playProcess.exitCode}</code>{/if}
+              </div>
+            {/if}
+            {#if playError}
+              <div class="error-message" role="alert">
+                <p>{playError.message}</p>
+                <code>{playError.code}</code>
+              </div>
+            {/if}
           {/if}
         </div>
 
@@ -859,6 +973,25 @@
             </button>
             {#if launcherState.config.selectedInstanceId === instance.id && instance.state === "ready"}
               <button
+                class="primary-action"
+                type="button"
+                onclick={() => runPlay(instance.id)}
+                disabled={playBusy || playReadinessBusy || !playReadiness?.ready}
+              >
+                {playProcess?.instanceId === instance.id && playProcess.status === "running"
+                  ? "Running"
+                  : playBusy
+                    ? "Starting…"
+                    : "Play"}
+              </button>
+              <button
+                type="button"
+                onclick={() => refreshPlayReadiness()}
+                disabled={playBusy || playReadinessBusy}
+              >
+                {playReadinessBusy ? "Checking…" : "Check Play"}
+              </button>
+              <button
                 type="button"
                 onclick={() => runRuntimeStatus(instance.id)}
                 disabled={runtimeBusy || instanceBusy === instance.id || createBusy}
@@ -884,8 +1017,8 @@
     <p class="footnote">
       Instances are complete, isolated installations — game, Fabric, and the Aurora client
       artifact — validated before they are reported content-ready. The selected instance can
-      acquire and validate its official shared Mojang Java runtime independently. Game
-      launching and instance deletion are deliberately not implemented.
+      acquire and validate its official shared Mojang Java runtime independently, then launch
+      through the supervised Play pipeline. Instance deletion remains deliberately unimplemented.
     </p>
   </section>
 
@@ -1012,7 +1145,7 @@
     <p class="footnote">
       Sign-in uses your system browser, and only the Microsoft refresh credential is stored —
       in the operating system's credential store, never in plain files. Accounts are separate
-      from instances; Minecraft launching is not implemented yet.
+      from instances and the selected account is supplied to Play without exposing its token.
     </p>
   </section>
 
@@ -1706,6 +1839,12 @@
 
   .instance-actions button:hover:not(:disabled) {
     border-color: #6f5df2;
+  }
+
+  .instance-actions button.primary-action {
+    border-color: #7b6cf5;
+    background: #6f5df2;
+    color: #ffffff;
   }
 
   .instance-actions button:disabled {

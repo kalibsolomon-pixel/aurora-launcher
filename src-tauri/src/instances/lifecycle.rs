@@ -464,6 +464,51 @@ pub async fn resolve_instance_runtime_plan(
     runtime_endpoints: &RuntimeMetadataEndpoints,
     instance_id: &InstanceId,
 ) -> Result<JavaRuntimePlan, InstanceError> {
+    let (_, runtime_plan) = resolve_instance_launch_plans(
+        managed,
+        registry_path,
+        endpoints,
+        runtime_endpoints,
+        instance_id,
+    )
+    .await?;
+    Ok(runtime_plan)
+}
+
+/// Resolves the game and runtime plans through one metadata pass for launch.
+pub async fn resolve_instance_launch_plans(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    runtime_endpoints: &RuntimeMetadataEndpoints,
+    instance_id: &InstanceId,
+) -> Result<(crate::fabric::plan::GameInstallPlan, JavaRuntimePlan), InstanceError> {
+    let game_plan =
+        resolve_instance_game_plan(managed, registry_path, endpoints, instance_id).await?;
+    let runtime_platform = RuntimePlatform::current().map_err(RuntimeMetadataError::Plan)?;
+    let runtime_plan = crate::runtime::metadata::resolve_runtime_plan(
+        managed,
+        runtime_endpoints,
+        game_plan.java().component(),
+        game_plan.java().major_version(),
+        runtime_platform,
+        endpoints.install.download_options(),
+    )
+    .await
+    .map_err(InstanceError::RuntimeMetadata)?;
+    Ok((game_plan, runtime_plan))
+}
+
+/// Re-resolves the normalized game plan for an existing content-ready
+/// instance. The checked-in release fixture supplies the exact pin, while
+/// Mojang and Fabric remain the metadata authorities. No installation state
+/// is changed by this operation.
+pub async fn resolve_instance_game_plan(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    instance_id: &InstanceId,
+) -> Result<crate::fabric::plan::GameInstallPlan, InstanceError> {
     let registry = InstanceRegistry::load(registry_path)?;
     let record = registry
         .find(instance_id)
@@ -503,18 +548,7 @@ pub async fn resolve_instance_runtime_plan(
             channel: record.release().channel(),
             aurora_version: record.release().aurora_version().to_owned(),
         })?;
-    let game_plan = resolve_record_game_plan(endpoints, &record, release).await?;
-    let runtime_platform = RuntimePlatform::current().map_err(RuntimeMetadataError::Plan)?;
-    crate::runtime::metadata::resolve_runtime_plan(
-        managed,
-        runtime_endpoints,
-        game_plan.java().component(),
-        game_plan.java().major_version(),
-        runtime_platform,
-        endpoints.install.download_options(),
-    )
-    .await
-    .map_err(InstanceError::RuntimeMetadata)
+    resolve_record_game_plan(endpoints, &record, release).await
 }
 
 pub async fn validate_instance_runtime(

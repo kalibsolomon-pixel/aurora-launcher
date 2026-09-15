@@ -392,6 +392,19 @@ impl GameLibrary {
             Self::Fabric(library) => library.path(),
         }
     }
+
+    /// Whether this artifact belongs on Java's classpath. Mojang native
+    /// classifier jars are installation/extraction inputs, not classpath
+    /// entries; every Fabric launcherMeta library is an ordinary classpath
+    /// dependency.
+    pub fn is_classpath_entry(&self) -> bool {
+        match self {
+            Self::Minecraft(library) => {
+                library.kind() == crate::minecraft::plan::LibraryKind::PlatformLibrary
+            }
+            Self::Fabric(_) => true,
+        }
+    }
 }
 
 /// The complete, deterministic plan for one Aurora/Fabric installation.

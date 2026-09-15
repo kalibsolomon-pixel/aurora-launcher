@@ -50,7 +50,7 @@ npm run tauri build
 - Do not bypass the trusted artifact layer when acquiring product artifacts, and do not distort it for metadata: the version manifest is bootstrap discovery metadata (HTTPS plus validation, never a "verified artifact"), while version documents are verified against their manifest-provided SHA-1. HTTPS success alone is never treated as artifact verification.
 - Official Mojang digests are SHA-1 and are represented as such; never relabel one as SHA-256, invent a digest, or discard an available official hash. The verified cache remains SHA-256-addressed.
 - Historical metadata shapes (`inheritsFrom`, `minecraftArguments`, `natives`/`classifiers`/`extract`, `old_beta`/`old_alpha`) are rejected deliberately as unsupported; do not add speculative historical compatibility.
-- Launch placeholders (`${auth_player_name}` and friends) stay semantically unresolved; never substitute fake account, session, or token values, and never shell-escape arguments.
+- Launch placeholders (`${auth_player_name}` and friends) stay semantically unresolved inside Minecraft planning; only `launch::resolve` substitutes a real Rust-owned session and managed paths. Never substitute fake production identity values or shell-escape arguments.
 - Rule evaluation stays pure, deterministic, and vocabulary-strict in `minecraft::rules`; do not scatter platform checks across modules or assume the development machine's platform.
 
 ## Fabric metadata and plan composition
@@ -108,6 +108,24 @@ npm run tauri build
 - External authentication DTOs and endpoints stay inside `auth::metadata`; the rest of the domain consumes normalized results. XSTS account conditions are mapped only from evidence-backed `XErr` codes — unknown codes stay generic and are never guessed into specific account conditions.
 - Accounts and instances are separate launcher concepts; account identifiers are the validated Minecraft profile UUID, never usernames, emails, or tokens. Session restoration rotates and immediately persists the replacement refresh credential; revoked credentials transition to explicit reauthentication-required, never to silent deletion of the account record.
 - Authentication never launches Minecraft, never touches instances or managed runtimes, and never extends a session's claimed lifetime beyond what the provider returned. One login transaction per process; cancellation and timeout discard all transient OAuth state.
+
+## Launch assembly and supervision
+
+- Launch only a deeply validated `ready` instance, with a matching validated managed Java executable and a usable authenticated/entitled Rust-owned Minecraft session. Stored flags or frontend state never authorize launch by themselves.
+- Build classpaths only from the exact normalized composed plan plus installed-manifest roles, in deterministic order, with the Minecraft client last. Never scan library directories, never include user mods in the classpath, and never re-resolve Maven coordinates in the process layer.
+- Unknown or unresolved launch placeholders are hard failures. Substitute into individual argument strings and spawn with structured executable/argument APIs; never construct, log, or execute a shell command string.
+- `LaunchSpec` and the Minecraft access token remain Rust-only and non-serializable. Never return argument arrays or tokens to the frontend, persistence, events, diagnostics, or logs. The unavoidable child argument is sensitive and all Debug/output paths must redact it.
+- Derive the game directory, assets, natives, logging configuration, classpath, and Java executable only from validated managed state. Never use `.minecraft`, frontend-provided paths, system Java, `PATH`, or `JAVA_HOME`.
+- The instance root is user/game state during execution. User mods, config, saves, resource packs, screenshots, logs, and future instance-root content remain user-owned; never enumerate them for readiness and never delete, repair, or roll them back because launch failed.
+- Supervise only the exact child handle returned by spawn. Never find or terminate Java by process name. Same-instance `Starting`/`Running` launches are excluded process-locally; do not imply cross-process exclusion exists.
+
+## Repository integrity and deletion protection
+
+- At the beginning of substantial work, record `git status`, current HEAD/history, the tracked-file set, and the presence of root documentation, manifests, lockfiles, frontend package metadata, and native build configuration.
+- Pre-existing modifications and untracked files are user property. Preserve them byte-for-byte unless the request explicitly scopes their modification; never delete, prune, clean, or "normalize" them.
+- Never run `git clean`, broad recursive cleanup, or destructive repository-root commands. Test cleanup is allowed only for exact paths positively created by the current test beneath explicit disposable roots.
+- Treat any unexpected disappearance, truncation, mass rewrite, or rename of a pre-existing file as a stop condition: investigate and restore understanding before continuing.
+- Before commit, inspect name-status and deletion diffs, compare the original tracked-file baseline, confirm critical files still exist, and ensure generated build/game/runtime data is not staged.
 
 ## Verification and Git
 

@@ -1556,9 +1556,464 @@ pub async fn refresh_account_session(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Launch (Phase 9)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchReadinessRequest {
+    instance_id: String,
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayRequest {
+    instance_id: String,
+    account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayBlockerDto {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlayReadinessDto {
+    ready: bool,
+    instance_id: String,
+    account_id: Option<String>,
+    account_name: Option<String>,
+    instance_status: String,
+    runtime_status: String,
+    account_status: String,
+    process_status: String,
+    blockers: Vec<PlayBlockerDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchProcessDto {
+    instance_id: String,
+    status: String,
+    process_id: Option<u32>,
+    started_at_unix_seconds: Option<u64>,
+    exit_code: Option<i32>,
+    message: Option<String>,
+}
+
+impl From<crate::launch::process::ProcessSnapshot> for LaunchProcessDto {
+    fn from(snapshot: crate::launch::process::ProcessSnapshot) -> Self {
+        Self {
+            instance_id: snapshot.instance_id,
+            status: snapshot.status.as_str().to_owned(),
+            process_id: snapshot.process_id,
+            started_at_unix_seconds: snapshot.started_at_unix_seconds,
+            exit_code: snapshot.exit_code,
+            message: snapshot.message,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchProgressEvent {
+    phase: &'static str,
+}
+
+impl From<crate::launch::resolve::LaunchResolveError> for CommandError {
+    fn from(error: crate::launch::resolve::LaunchResolveError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+}
+
+impl From<crate::launch::process::LaunchProcessError> for CommandError {
+    fn from(error: crate::launch::process::LaunchProcessError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+}
+
+fn emit_launch_phase(app: &AppHandle, phase: &'static str) {
+    let _ = app.emit("launch-progress", LaunchProgressEvent { phase });
+}
+
+fn launch_plan_error(error: InstanceError) -> CommandError {
+    match error {
+        InstanceError::NotFound { .. } | InstanceError::NotReady { .. } => {
+            CommandError::new("launch_instance_not_ready", error.to_string())
+        }
+        InstanceError::GameInstallState(_)
+        | InstanceError::ValidationFailed { .. }
+        | InstanceError::GameInstall(_)
+        | InstanceError::Aurora(_) => {
+            CommandError::new("launch_instance_damaged", error.to_string())
+        }
+        InstanceError::RuntimeMetadata(_) | InstanceError::RuntimeInstall(_) => {
+            CommandError::new("launch_runtime_not_ready", error.to_string())
+        }
+        InstanceError::ReleaseInvalid(_)
+        | InstanceError::AuroraReleaseNotFound { .. }
+        | InstanceError::GameResolution(_)
+        | InstanceError::Platform(_) => CommandError::new(
+            "launch_metadata_invalid",
+            "The exact pinned launch metadata could not be resolved.",
+        ),
+        other => CommandError::from(other),
+    }
+}
+
+fn launch_account_status(
+    managed: &ManagedPaths,
+    account_id: Option<&str>,
+) -> Result<(crate::launch::state::LaunchAccountStatus, Option<String>), CommandError> {
+    use crate::auth::credentials::CredentialStore as _;
+    use crate::launch::state::LaunchAccountStatus;
+
+    let Some(account_id) = account_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok((LaunchAccountStatus::Missing, None));
+    };
+    crate::auth::accounts::AccountId::validate(account_id)?;
+    let accounts = crate::auth::accounts::load(&managed.accounts_file())?;
+    let Some(record) = accounts.find(account_id) else {
+        return Ok((LaunchAccountStatus::Missing, None));
+    };
+    let name = Some(record.minecraft_name().to_owned());
+    if crate::auth::session::SessionCache::usable(account_id).is_some() {
+        return Ok((LaunchAccountStatus::Ready, name));
+    }
+    let store = crate::auth::OsCredentialStore;
+    if store
+        .load(account_id)
+        .map_err(|error| CommandError::from(crate::auth::AuthError::CredentialStore(error)))?
+        .is_none()
+    {
+        return Ok((LaunchAccountStatus::ReauthenticationRequired, name));
+    }
+    if crate::auth::flow::production_registration().is_none() {
+        return Ok((LaunchAccountStatus::ConfigurationMissing, name));
+    }
+    Ok((LaunchAccountStatus::Ready, name))
+}
+
+async fn calculate_play_readiness(
+    managed: &ManagedPaths,
+    instance_id: &crate::instances::InstanceId,
+    account_id: Option<&str>,
+) -> Result<PlayReadinessDto, CommandError> {
+    use crate::instances::InstanceState;
+    use crate::launch::state::{LaunchInstanceStatus, LaunchRuntimeStatus, PlayReadiness};
+    use crate::runtime::install::RuntimeValidationStatus;
+
+    let process = crate::launch::process::snapshot(instance_id.as_str());
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+    let (instance, runtime_plan) = match registry.find(instance_id) {
+        None => (LaunchInstanceStatus::Missing, None),
+        Some(record) if record.state() == InstanceState::Installing => {
+            (LaunchInstanceStatus::Installing, None)
+        }
+        Some(_) => {
+            // This one lifecycle call performs deep content validation and,
+            // only after it passes, one exact metadata resolution pass.
+            // Readiness does not hash the instance twice.
+            let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+                .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+            let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
+            match crate::instances::lifecycle::resolve_instance_launch_plans(
+                managed,
+                &managed.instance_registry_file(),
+                &endpoints,
+                &runtime_endpoints,
+                instance_id,
+            )
+            .await
+            {
+                Ok((_, runtime_plan)) => (LaunchInstanceStatus::Ready, Some(runtime_plan)),
+                Err(
+                    InstanceError::NotReady { .. }
+                    | InstanceError::GameInstallState(_)
+                    | InstanceError::ValidationFailed { .. }
+                    | InstanceError::GameInstall(_)
+                    | InstanceError::Aurora(_),
+                ) => (LaunchInstanceStatus::Damaged, None),
+                Err(_) => (LaunchInstanceStatus::Ready, None),
+            }
+        }
+    };
+
+    let runtime = if let Some(plan) = runtime_plan {
+        match crate::runtime::install::validate_runtime(
+            managed,
+            &plan,
+            false,
+            crate::runtime::install::DEFAULT_JAVA_DIAGNOSTIC_TIMEOUT,
+        )
+        .await?
+        .status
+        {
+            RuntimeValidationStatus::Ready => LaunchRuntimeStatus::Ready,
+            RuntimeValidationStatus::Missing => LaunchRuntimeStatus::Missing,
+            RuntimeValidationStatus::Damaged => LaunchRuntimeStatus::Damaged,
+        }
+    } else {
+        LaunchRuntimeStatus::Unresolved
+    };
+
+    let (account, account_name) = launch_account_status(managed, account_id)?;
+    let readiness = PlayReadiness::evaluate(instance, runtime, account, process.status);
+    Ok(PlayReadinessDto {
+        ready: readiness.ready(),
+        instance_id: instance_id.to_string(),
+        account_id: account_id.map(str::to_owned),
+        account_name,
+        instance_status: readiness.instance.as_str().to_owned(),
+        runtime_status: readiness.runtime.as_str().to_owned(),
+        account_status: readiness.account.as_str().to_owned(),
+        process_status: readiness.process.as_str().to_owned(),
+        blockers: readiness
+            .blockers
+            .into_iter()
+            .map(|blocker| PlayBlockerDto {
+                code: blocker.code.to_owned(),
+                message: blocker.message,
+            })
+            .collect(),
+    })
+}
+
+/// Returns the complete Rust-owned, non-secret Play decision for the
+/// selected instance/account pair.
+#[tauri::command]
+pub async fn get_play_readiness(
+    app: AppHandle,
+    request: LaunchReadinessRequest,
+) -> Result<PlayReadinessDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    calculate_play_readiness(&managed, &instance, request.account_id.as_deref()).await
+}
+
+/// Returns process-local state only. It never reconstructs process truth by
+/// name and never claims a process survived a launcher restart.
+#[tauri::command]
+pub fn get_launch_state(
+    request: ValidateInstalledGameRequest,
+) -> Result<LaunchProcessDto, CommandError> {
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    Ok(crate::launch::process::snapshot(instance.as_str()).into())
+}
+
+/// Checks all preconditions, obtains a Rust-only session, assembles the exact
+/// argument vector, and starts supervised Minecraft without a shell.
+#[tauri::command]
+pub async fn play_instance(
+    app: AppHandle,
+    request: PlayRequest,
+) -> Result<LaunchProcessDto, CommandError> {
+    use crate::runtime::install::RuntimeValidationStatus;
+    use std::sync::Arc;
+
+    let managed = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let account_id = request.account_id.trim().to_owned();
+    crate::auth::accounts::AccountId::validate(&account_id)?;
+
+    emit_launch_phase(&app, "checkingPreconditions");
+    if crate::launch::process::snapshot(instance.as_str())
+        .status
+        .blocks_launch()
+    {
+        return Err(CommandError::new(
+            "launch_already_running",
+            "This instance is already starting or running.",
+        ));
+    }
+
+    emit_launch_phase(&app, "resolvingLaunch");
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+    let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
+    let (game_plan, runtime_plan) = crate::instances::lifecycle::resolve_instance_launch_plans(
+        &managed,
+        &managed.instance_registry_file(),
+        &endpoints,
+        &runtime_endpoints,
+        &instance,
+    )
+    .await
+    .map_err(launch_plan_error)?;
+
+    let runtime = crate::runtime::install::validate_runtime(
+        &managed,
+        &runtime_plan,
+        true,
+        crate::runtime::install::DEFAULT_JAVA_DIAGNOSTIC_TIMEOUT,
+    )
+    .await?;
+    if runtime.status != RuntimeValidationStatus::Ready {
+        return Err(CommandError::new(
+            "launch_runtime_not_ready",
+            format!(
+                "The exact managed Java runtime is {}.",
+                runtime.status.as_str()
+            ),
+        ));
+    }
+    let java_executable = runtime.launch_executable.ok_or_else(|| {
+        CommandError::new(
+            "launch_runtime_not_ready",
+            "The validated runtime has no launch executable.",
+        )
+    })?;
+
+    emit_launch_phase(&app, "restoringSession");
+    let session = if let Some(session) = crate::auth::session::SessionCache::usable(&account_id) {
+        session
+    } else {
+        let registration = crate::auth::flow::production_registration().ok_or_else(|| {
+            CommandError::new(
+                "launch_authentication_required",
+                "Aurora's Microsoft application registration is not configured.",
+            )
+        })?;
+        let auth_endpoints = crate::auth::AuthEndpoints::official();
+        let store = crate::auth::OsCredentialStore;
+        let context = crate::auth::flow::AuthContext {
+            endpoints: &auth_endpoints,
+            oauth: registration,
+            credentials: &store,
+            accounts_path: &managed.accounts_file(),
+            options: crate::auth::flow::AuthFlowOptions::default(),
+            browser: &|_url: &str| Ok(()),
+        };
+        crate::auth::flow::ensure_session(&context, &account_id, &mut |phase| {
+            let _ = app.emit(
+                "auth-progress",
+                AuthProgressEvent {
+                    phase: phase.as_str(),
+                },
+            );
+        })
+        .await
+        .map_err(|error| match error {
+            crate::auth::AuthError::ConfigurationMissing
+            | crate::auth::AuthError::ReauthenticationRequired { .. }
+            | crate::auth::AuthError::AccountNotFound { .. } => {
+                CommandError::new("launch_authentication_required", error.to_string())
+            }
+            other => CommandError::new("launch_session_unavailable", other.to_string()),
+        })?
+    };
+
+    emit_launch_phase(&app, "assemblingArguments");
+    let game_root = managed.instance_paths(&instance).game().to_path_buf();
+    let installed = crate::install::state::load_installed_state(&game_root)
+        .map_err(|error| CommandError::new("launch_instance_damaged", error.to_string()))?
+        .ok_or_else(|| {
+            CommandError::new(
+                "launch_instance_not_ready",
+                "The instance has no complete installed-game state.",
+            )
+        })?;
+    let launch_plan = crate::launch::resolve::LaunchPlan::from_game_plan(
+        &game_plan,
+        crate::minecraft::rules::PlatformProfile::current()?,
+    );
+    let spec = crate::launch::resolve::resolve_launch_spec(
+        &managed,
+        &instance,
+        &launch_plan,
+        &installed,
+        &java_executable,
+        &session,
+        &crate::minecraft::rules::FeatureProfile::none(),
+    )?;
+
+    emit_launch_phase(&app, "startingProcess");
+    let listener_app = app.clone();
+    let snapshot = crate::launch::process::spawn_supervised(
+        spec,
+        managed.instance_paths(&instance).logs(),
+        Arc::new(move |snapshot| {
+            let _ = listener_app.emit("launch-state", LaunchProcessDto::from(snapshot));
+        }),
+    )
+    .await?;
+    Ok(snapshot.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_failures_map_to_stable_machine_codes() {
+        let resolve_cases = [
+            (
+                crate::launch::resolve::LaunchResolveError::Metadata("fixture".to_owned()),
+                "launch_metadata_invalid",
+            ),
+            (
+                crate::launch::resolve::LaunchResolveError::Placeholder("fixture".to_owned()),
+                "launch_placeholder_unresolved",
+            ),
+            (
+                crate::launch::resolve::LaunchResolveError::Classpath("fixture".to_owned()),
+                "launch_classpath_invalid",
+            ),
+            (
+                crate::launch::resolve::LaunchResolveError::Natives("fixture".to_owned()),
+                "launch_native_path_invalid",
+            ),
+            (
+                crate::launch::resolve::LaunchResolveError::Logging("fixture".to_owned()),
+                "launch_logging_invalid",
+            ),
+        ];
+        for (error, code) in resolve_cases {
+            assert_eq!(CommandError::from(error).code, code);
+        }
+        assert_eq!(
+            CommandError::from(crate::launch::process::LaunchProcessError::AlreadyRunning {
+                instance_id: "fixture".to_owned(),
+            })
+            .code,
+            "launch_already_running"
+        );
+        assert_eq!(
+            launch_plan_error(InstanceError::NotFound {
+                instance_id: "fixture".to_owned(),
+            })
+            .code,
+            "launch_instance_not_ready"
+        );
+    }
+
+    #[test]
+    fn production_launch_dtos_have_no_secret_or_argument_fields() {
+        let readiness = PlayReadinessDto {
+            ready: false,
+            instance_id: "fixture".to_owned(),
+            account_id: None,
+            account_name: None,
+            instance_status: "ready".to_owned(),
+            runtime_status: "ready".to_owned(),
+            account_status: "missing".to_owned(),
+            process_status: "stopped".to_owned(),
+            blockers: vec![PlayBlockerDto {
+                code: "launch_authentication_required".to_owned(),
+                message: "Select an account.".to_owned(),
+            }],
+        };
+        let json = serde_json::to_string(&readiness).unwrap();
+        assert!(!json.contains("accessToken"));
+        assert!(!json.contains("arguments"));
+        assert!(!json.contains("javaExecutable"));
+        assert!(!json.contains("classpath"));
+    }
 
     #[test]
     fn auth_errors_map_to_stable_machine_codes() {

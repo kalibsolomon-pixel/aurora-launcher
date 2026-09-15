@@ -9,6 +9,7 @@ pub mod fabric;
 pub mod install;
 pub mod instances;
 pub mod integrity;
+pub mod launch;
 pub mod minecraft;
 pub mod paths;
 pub mod runtime;
@@ -42,7 +43,10 @@ pub fn run() {
             application::cancel_microsoft_login,
             application::select_account,
             application::remove_account,
-            application::refresh_account_session
+            application::refresh_account_session,
+            application::get_play_readiness,
+            application::get_launch_state,
+            application::play_instance
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");
