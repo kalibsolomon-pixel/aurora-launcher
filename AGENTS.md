@@ -88,6 +88,17 @@ npm run tauri build
 - Instance deletion is out of scope until a phase owns user-data retention policy; do not add delete buttons or recursive instance removal.
 - `.minecraft` remains off-limits.
 
+## Managed Java runtimes
+
+- The resolved Minecraft/Fabric game plan is the authority for the required Java component and major version. Aurora release metadata may repeat the major as a compatibility assertion, but it must match the resolved game requirement and never become an independent authority.
+- Managed runtimes are shared launcher-owned, reconstructable resources under `runtimes/<component>/<platform>-<manifest-sha1>/`; never copy Java into an instance and never modify system Java, `PATH`, or `JAVA_HOME`.
+- Runtime resolution is exact for component, normalized OS, and architecture. Never silently substitute a different component or fall back from ARM64 to x64 (or between any architectures).
+- Runtime installers consume only the normalized `JavaRuntimePlan`; external Mojang runtime DTOs stay inside `runtime::metadata`. Every metadata path and link target is validated before it can reach managed storage.
+- Mojang runtime manifests and files use their published expected SHA-1 and the existing SHA-1-addressed verified store. Never call HTTPS alone verification and never install directly from network staging.
+- A runtime becomes complete only when `runtime-installed.json` is written last inside staging and the whole staged tree is promoted. Replace only an exact path whose valid state proves launcher ownership; malformed or unknown-schema state is never overwritten.
+- Runtime validation is read-only and network-free once a plan is resolved: verify the complete state against the plan, every recorded file/size/SHA-1, directories, links, executable semantics, and the bounded structured `java -version` diagnostic when requested. Never select or launch with a damaged or unvalidated runtime.
+- Only one install of the same runtime identity may mutate it within a process. Cross-process coordination, runtime garbage collection, system-Java discovery, custom Java paths, JVM tuning, and generalized repair remain out of scope.
+
 ## Verification and Git
 
 Run checks proportional to the change. Native-boundary or startup changes require type checking, Rust format/check/test, a production build, and a real application boot when the host permits it. Keep documentation aligned with implemented behavior. Preserve user changes, inspect `git status`, make focused commits, and never push unless explicitly requested.

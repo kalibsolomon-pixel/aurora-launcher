@@ -183,7 +183,7 @@ The plan records the asset-index requirement: index id, officially described doc
 
 ### Java requirement
 
-The plan records the required runtime component name and major version (for example `java-runtime-epsilon` / 25 for `26.2`, `java-runtime-delta` / 21 for `1.21.11`) for a future Java-management phase. No Java discovery, download, extraction, PATH modification, or executable selection exists.
+The Phase 3 plan records the required runtime component name and major version (for example `java-runtime-epsilon` / 25 for `26.2`, `java-runtime-delta` / 21 for `1.21.11`). Phase 7 now consumes that boundary for managed provisioning; system-Java discovery and PATH modification remain absent.
 
 ### Unresolved launch arguments
 
@@ -442,6 +442,60 @@ The production shell gains one restrained Instances panel: list (name, state, pi
 
 Sequential game installation (~15 minutes cold for a modern version) and per-instance asset duplication remain as Phase 5 left them; instance creation reuses the verified caches so repeated creations of the same release are fast. Bounded download concurrency and hard-link asset sharing remain concrete future optimizations — they are not snuck into this phase.
 
+## Implemented in Phase 7
+
+Phase 7 provisions the reproducible Java runtime that future launching will consume, without launching Minecraft and without retroactively adding Java to the Phase 6 instance transaction. Minecraft/Fabric planning remains the authority for both `javaVersion.component` and the effective major version; the repeated Java major in Aurora's release fixture is now validated as a compatibility assertion and a mismatch fails deliberately.
+
+### Official metadata and component resolution
+
+Runtime discovery uses Mojang's current official product feed at `https://piston-meta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json`. The index is bootstrap metadata trusted through HTTPS plus strict parsing. Resolution selects exactly one entry for the exact Minecraft component and platform key; a missing, empty, or multi-entry component is an error, never a “latest” selection or component substitution. The selected index entry supplies the runtime build name/release date and the expected SHA-1/size/URL of its per-platform file manifest. That verified file manifest stays inside `runtime::metadata`; downstream code sees only `JavaRuntimePlan`.
+
+Live research on 2026-09-15 confirmed `java-runtime-epsilon` for Windows x64 as Microsoft OpenJDK `25.0.1`, with a 152,664-byte manifest describing 82 directories and 411 raw files totaling 105,080,003 bytes. Mojang uses per-file delivery rather than an archive. Linux and macOS manifests additionally describe relative symbolic links; current Windows manifests contain none.
+
+### Explicit platform mapping
+
+The resolver accepts `RuntimePlatform { os, architecture }`; host detection occurs only at the application/lifecycle edge. Aurora maps normalized targets narrowly:
+
+| Aurora target | Mojang key |
+| --- | --- |
+| Windows x86_64 / ARM64 / x86 | `windows-x64` / `windows-arm64` / `windows-x86` |
+| Linux x86_64 / x86 | `linux` / `linux-i386` |
+| macOS x86_64 / ARM64 | `mac-os` / `mac-os-arm64` |
+
+Unmapped pairs (including Linux ARM64 and macOS x86 in the current feed vocabulary) fail before lookup. Availability is then checked independently, so a mapped platform with an empty component still fails. There is no architecture fallback.
+
+### Runtime plan, integrity, and executable semantics
+
+`JavaRuntimePlan` records the exact component, required major, platform and Mojang key, runtime build/release identity, manifest SHA-1, every normalized directory/file/link entry, and deterministic launch/diagnostic executable paths. Windows launching uses `bin/javaw.exe` and diagnostics use `bin/java.exe`; Linux uses `bin/java`; macOS uses `jre.bundle/Contents/Home/bin/java`. These paths must be executable file entries in the official manifest—no recursive filename search occurs.
+
+Mojang publishes SHA-1 for the file manifest and every raw runtime file, plus exact sizes. Both flow through the existing SHA-1 acquisition/store and are `ExpectedDigestVerified(SHA-1)` facts; no SHA-256 is invented and HTTPS is not relabeled as content verification. LZMA alternatives in current metadata are deliberately not used: the raw entries already carry expected SHA-1 and avoid a new decompression dependency or trust path.
+
+### Shared layout and transaction
+
+One exact runtime is shared by every compatible instance:
+
+```text
+<managed-root>/runtimes/<component>/<mojang-platform>-<manifest-sha1>/
+├── ... official runtime tree ...
+└── runtime-installed.json
+```
+
+The installer validates any exact existing runtime before acquisition and reuses it with no runtime-file network request when valid. Otherwise it sequentially acquires files into the shared SHA-1 store (bounded concurrency of one), materializes only verified cache objects under the exact derived `.installing-<identity>/runtime` tree, preserves Unix executable bits, creates validated relative Unix links, validates the staged tree, writes `runtime-installed.json` last, and promotes by directory rename. Current Windows metadata has no links; encountering one on Windows fails rather than requiring developer mode/admin or guessing file-versus-directory semantics.
+
+Stale exact staging is safely rebuilt. A valid state matching the exact final path proves a damaged runtime is launcher-owned and permits transactional replacement (old tree moved inside staging, restored if promotion fails). A final tree with no state, malformed state, an unknown schema, or mismatched identity is a hard conflict and is never overwritten. No garbage collection is implemented.
+
+### Runtime state and validation
+
+`runtime-installed.json` schema 1 records identity, component, required major, normalized OS/architecture and Mojang key, runtime build/release, manifest SHA-1, relative launch/diagnostic executables, and every managed directory/file/link with the minimum integrity metadata needed offline. Loading is strict; unknown schemas and malformed paths, digests, duplicates, or entry-kind combinations fail deliberately.
+
+Validation is read-only and network-free once the plan is resolved. It proves the state describes the complete exact plan (an edited subset cannot pass), re-hashes every file by SHA-1 with size checks, verifies directories and link targets without following them, checks executable semantics, and optionally invokes the absolute managed `java` path with the single `-version` argument. The process receives a cleared/minimal environment, has a ten-second timeout with kill-on-drop, captures bounded sanitized output, requires successful exit, and confirms the reported modern/legacy-style major matches the plan. No shell or Minecraft process is involved.
+
+### Instance relationship, UI, and concurrency
+
+`ensure_instance_runtime(instance_id)` first requires Phase 6 content validation to be ready, resolves the instance's pinned release back through official Minecraft/Fabric planning, checks the release fixture's repeated Java major, resolves the exact runtime, reuses or installs it, validates and executes it, then returns a typed summary. Runtime absence/damage never mutates the instance registry and never makes otherwise valid instance content “damaged.” The production UI displays the selected instance as “content ready” with an independent Java `missing`/`damaged`/`ready` status and offers only Check/Install/Repair Java actions—no paths, JVM flags, memory settings, or system-Java picker.
+
+One async mutex per runtime identity prevents concurrent mutation within this launcher process; a competing ensure fails immediately. Cross-process coordination remains deferred, matching the existing instance-install limitation.
+
 ## Frontend/native boundary
 
 Svelte is a presentation layer. Security-sensitive state and all future Minecraft/Aurora installation, authentication, download, integrity, Java/runtime, filesystem mutation, and process-launch logic stay behind native Rust commands or events. Commands should be narrow and use explicit request/response DTOs. Frontend code must not infer structured state by parsing strings.
@@ -450,7 +504,7 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 
 ## Current native modules
 
-- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`, `plan_fabric_install`, `install_game`, `validate_installed_game`, `list_aurora_releases`, `create_instance`, `retry_instance_install`, `rename_instance`, `select_instance`, `validate_instance`).
+- `application`: constructs typed frontend DTOs, maps internal failures to the command error contract, and exposes the Tauri commands, including managed-runtime status and ensure operations.
 - `paths`: validates and represents the platform-resolved application-local data root and derives managed locations without touching the filesystem.
 - `config`: the versioned launcher-configuration model and its atomic JSON persistence.
 - `instances`: validated instance identifiers (plus UUIDv4 generation), instance records with lifecycle state and concrete release pins, the writable atomic-persisted instance registry, and `lifecycle` (creation, retry, rename, selection, and complete read-only instance validation).
@@ -462,8 +516,9 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 - `minecraft`: official-metadata resolution and install planning — `metadata` (discovery, external DTOs including the asset-index document and logging blocks, the SHA-1-verified fetch boundary), `rules` (pure platform/feature rule evaluation), `plan` (normalization into `MinecraftInstallPlan`), and the `resolve_install_plan` composition.
 - `fabric`: Fabric Meta resolution and composition — `metadata` (loader discovery, external DTOs, the fetch boundary), `maven` (validated coordinates, repositories, and deterministic artifact-URL derivation), `plan` (the normalized `FabricPlan`, the composed `GameInstallPlan`, and the collision policy), and the `resolve_fabric_plan`/`resolve_game_plan` compositions.
 - `install`: installation execution — `state` (the versioned installed-state manifest), `assets` (asset-object enumeration and official URL derivation), `natives` (defensive ZIP extraction), and the `install_game`/`validate_installed_game` executor with staging, validation, atomic commit, per-instance exclusion, and progress.
+- `runtime`: official Java provisioning — `metadata` (external Mojang DTOs and verified manifest resolution), `plan` (explicit platform mapping and normalized file/link/executable requirements), `install` (shared staged materialization, validation, diagnostic execution, reuse, and per-runtime exclusion), and `state` (schema-versioned offline validation facts).
 
-Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, empty module trees, and generic mod-loader abstractions — Aurora uses Fabric, and the Fabric boundary is built directly.
+Future code should add a module when its behavior is implemented. Likely remaining domain boundaries are distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, empty module trees, and generic mod-loader abstractions — Aurora uses Fabric, and the Fabric boundary is built directly.
 
 Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `config_selected_instance_dangling`, `instances_invalid`, `instances_unsupported_schema`, `instance_id_invalid`, `instance_not_found`, `instance_name_invalid`, `instance_registry_write_failure`, `instance_release_invalid`, `instance_not_ready`, `instance_consistency_failure`, `aurora_release_not_found`, `aurora_manifest_invalid`, `aurora_artifact_invalid`, `aurora_installation_invalid`, `aurora_materialization_failure`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, `minecraft_platform_unsupported`, `fabric_loader_version_invalid`, `fabric_metadata_network_failure`, `fabric_metadata_invalid`, `fabric_metadata_unsupported`, `fabric_loader_not_found`, `fabric_combination_unsupported`, `fabric_library_invalid`, `fabric_repository_invalid`, `fabric_plan_conflict`, `fabric_artifact_unverified`, `installation_already_in_progress`, `installation_state_invalid`, `installation_target_conflict`, `minecraft_asset_index_invalid`, `minecraft_asset_invalid`, `native_archive_invalid`, `native_extraction_failure`, `artifact_materialization_failure`, `installation_validation_failure`, and `installation_commit_failure`. Codes are compatibility contracts; keep them stable and user messages readable.
 
@@ -476,7 +531,8 @@ The implemented layout is:
 ```text
 <managed-data-root>/
 ├── launcher/       # versioned non-secret launcher configuration and state (config.json materialized; instances.json read when present)
-├── runtimes/       # launcher-managed Java runtimes (derived, not created yet)
+├── runtimes/       # shared launcher-managed Java runtimes
+│   └── <component>/<platform>-<manifest-sha1>/  # runtime tree + runtime-installed.json
 ├── cache/          # re-downloadable, safe-to-delete launcher data
 │   ├── artifacts/
 │   │   ├── sha256/<digest>              # verified against a pre-known expected SHA-256
@@ -556,7 +612,7 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - `rustls` with the `ring` crypto provider (added in Phase 2) is installed as reqwest's process crypto provider. reqwest 0.13's default provider (aws-lc-rs) requires CMake/NASM tooling on some hosts; `ring` builds with a plain C compiler everywhere, which keeps launcher builds hermetic. Certificate verification uses the platform verifier reqwest selects by default (the OS certificate store).
 - `sha2` (added in Phase 2) is the RustCrypto SHA-256 implementation matching the release manifest's artifact digest representation. It was already resolved in the dependency tree; no multi-hash abstraction exists.
 - `sha1` (added in Phase 3, RustCrypto) implements the digest algorithm official Mojang metadata actually publishes. It exists next to `sha2` so official SHA-1 expectations are represented and verified accurately — never faked as SHA-256 and never used for verified-cache identity. No other hash algorithm or generic digest framework was introduced.
-- `tokio` (added in Phase 2, `fs` + `io-util` features only) is used for async staging-file I/O. Tauri already runs commands on its tokio async runtime and enables these exact features, so the direct dependency adds no new packages; tests additionally enable `rt` + `macros` as a dev-dependency for `#[tokio::test]`, and Phase 5 enabled `sync` for the per-instance installation exclusion mutex (still no new packages).
+- `tokio` (added in Phase 2) is used for async staging-file I/O and narrow mutexes. Phase 7 enables its focused `process` and `time` features for bounded structured `java -version` execution; no process framework is introduced. The resulting `errno` and `signal-hook-registry` lockfile entries are Tokio's cross-platform transitive support, not direct launcher dependencies.
 - `url` (added in Phase 2) parses artifact URLs so scheme and loopback-host enforcement is robust. It was already resolved in Tauri's dependency tree.
 - `uuid` (added in Phase 6, `v4` feature) generates opaque instance identifiers — the simplest mature solution to collision-resistant, name-independent, timestamp-independent IDs; the canonical simple form fits the identifier rules by construction. A custom identifier scheme would have been invented complexity.
 - `zip` (added in Phase 5, version 8.6, `deflate` feature only, default features off) implements the one archive format Minecraft native artifacts actually are — ZIP/JAR — for extraction only. It is the focused, actively maintained zip-rs implementation (stable 8.6.0, April 2026); its reader is wrapped by the launcher's own strict path-safety validation rather than trusted for it. No TAR support, no generic archive abstraction, no extra compression codecs.
@@ -640,10 +696,21 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - Registry mutations are serialized by a process-wide mutex held only across read-modify-write windows; installations run outside it under Phase 5's per-instance exclusion.
 - Sequential installation speed and per-instance asset duplication are deliberately untouched; they are documented, measured realities with concrete future optimization paths (bounded concurrency, hard links), not things to smuggle into a lifecycle phase.
 
+## Major Phase 7 decisions
+
+- Current official runtime metadata remains publicly usable and matches the component-based model, but delivery is a per-file tree rather than an archive. The implementation mirrors directories/files/links directly and keeps sequential acquisition as the simplest bounded strategy.
+- Runtime identity is the official platform key plus the SHA-1-addressed file manifest beneath the validated component. Java major alone is never treated as interchangeable identity.
+- The raw runtime entries use Mojang's exact SHA-1 and size through the existing verified store. Optional LZMA representations are not used, avoiding an unnecessary decompressor and second materialization path.
+- Runtime state is committed last in staging and the directory is promoted atomically/rollback-safely. Valid exact state proves replaceable ownership; unknown or malformed trees remain untouched.
+- Readiness is two-dimensional: Phase 6 instance content can remain ready while the exact managed runtime is missing or damaged. Java provisioning is an explicit post-creation operation and instances never contain absolute runtime paths.
+- The release manifest's Java major is retained for backward compatibility only as an assertion against the official resolved game-plan major; Minecraft's component and effective Minecraft/Fabric major are authoritative.
+- Diagnostic execution is deliberately only `java -version`, with an absolute managed executable, argument array, minimal cleared environment, captured bounded output, a ten-second timeout, and major-version confirmation. This is runtime validation, not game launching.
+- Runtime exclusion is process-local and exact-identity-scoped. Cross-process locking, system Java, custom paths, runtime garbage collection, generalized repair, download concurrency, and launch configuration remain deferred.
+
 ## Explicitly deferred
 
-Authentication and token storage; Java runtime discovery, download, extraction, and management; production Aurora release infrastructure (manifest endpoint, artifact repository, signing) — today's source is the checked-in development fixture; instance deletion (user-data retention policy deserves its own design); generic mod management; a full user-facing trust/pinning policy for transport-observed artifacts; repair and automatic repair of damaged instances and installations (complete validation and the installed-state records exist to enable it); Aurora version updates and channel movement; launch-argument substitution, the final JVM logging argument, native launch-path selection, classpath command construction, and JVM/game process launching and supervision; pause/resume and cancellation of installations; download parallelism, retry, resume, bandwidth controls, and generalized queues; hard-link asset sharing and cache eviction/size policy; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
+Authentication and token storage; system-Java discovery or custom Java selection; Java-path/JVM-flag/memory configuration; runtime garbage collection and cross-process installation locks; production Aurora release infrastructure (manifest endpoint, artifact repository, signing) — today's source is the checked-in development fixture; instance deletion (user-data retention policy deserves its own design); generic mod management; a full user-facing trust/pinning policy for transport-observed artifacts; generalized repair and automatic repair of damaged instances/installations (exact managed-runtime reinstall is the sole narrow exception); Aurora version updates and channel movement; launch-argument substitution, the final JVM logging argument, native launch-path selection, classpath command construction, and JVM/game process launching and supervision; pause/resume and cancellation; download parallelism, retry, resume, bandwidth controls, and generalized queues; hard-link asset sharing and cache eviction/size policy; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
 
 ## Known limitations
 
-The launcher reports native status, persists a minimal configuration, loads the instance registry, acquires verified artifacts into its content-addressed stores, resolves a normalized Minecraft installation plan for an exact modern version from official metadata, composes it with a normalized Fabric plan from official Fabric Meta, installs the complete isolated game (client, libraries, natives, asset index, asset objects, logging configuration) into launcher-managed instance storage with a committed, re-validatable installed-state record, and — as of Phase 6 — creates, names, selects, retries, and completely validates persistent Aurora instances whose Aurora client artifact is SHA-256-verified and launcher-owned. It does not manage Java runtimes, authenticate accounts, launch anything, delete instances, or update Aurora across versions. Aurora releases come from the checked-in development fixture because no production release infrastructure exists; its artifact URLs require a loopback development server, and the UI says so. Minecraft and Fabric metadata are re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported, as are future `launcherMeta` generations and non-log4j2-xml logging types. The loader and intermediary Fabric artifacts have no published digests; they are acquired over secure transport with locally observed identities and TOFU-style consistency checks, which is explicitly weaker than expected-digest verification. Installation is sequential (~15 minutes cold for a modern version; warm cache reuse makes repeat creations fast), one installation per instance at a time within this process (no cross-process locking), with no pause/resume/cancellation; asset objects are copied per instance, doubling that disk usage alongside the shared cache. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. Damaged instances are detected and reported but not repaired. A hand-edited registry or a dangling selected instance id surface as deliberate errors and stay unrepaired until a launcher operation or the user resolves them. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.
+The launcher reports native status, persists configuration and instances, acquires verified artifacts, plans and installs modern Minecraft plus Fabric and Aurora, and provisions the exact shared official Java runtime for a content-ready instance with offline validation and bounded diagnostic execution. It still does not authenticate accounts, launch Minecraft, delete instances, choose arbitrary/system Java, or update Aurora across versions. Aurora releases come from the checked-in development fixture because no production release infrastructure exists. Minecraft, Fabric, and runtime discovery metadata are re-fetched on resolution; selected runtime manifests and files reuse the SHA-1 store. Historical Minecraft shapes and unsupported runtime platform/component pairs fail deliberately. Installation remains sequential (including runtime files), process-local exclusion has no cross-process lock, and there is no pause/resume/cancellation, runtime garbage collection, or generalized repair. Damaged instance content is detected but not repaired; a manifest-proven damaged managed runtime can be deterministically reinstalled. The TypeScript DTOs still mirror Rust manually; generated bindings remain a future evaluation.

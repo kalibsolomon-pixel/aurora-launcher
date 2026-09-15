@@ -10,6 +10,7 @@ pub mod instances;
 pub mod integrity;
 pub mod minecraft;
 pub mod paths;
+pub mod runtime;
 
 #[cfg(test)]
 mod test_support;
@@ -32,7 +33,9 @@ pub fn run() {
             application::retry_instance_install,
             application::rename_instance,
             application::select_instance,
-            application::validate_instance
+            application::validate_instance,
+            application::get_instance_runtime_status,
+            application::ensure_instance_runtime
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");

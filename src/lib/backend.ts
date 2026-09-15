@@ -427,3 +427,61 @@ export async function validateInstance(instanceId: string): Promise<InstanceVali
     );
   }
 }
+
+export type RuntimeStatus = "missing" | "ready" | "damaged";
+
+export interface RuntimeStatusDto {
+  instanceId: string;
+  contentStatus: "ready";
+  status: RuntimeStatus;
+  component: string;
+  requiredMajorVersion: number;
+  runtimeVersion: string | null;
+  runtimeRoot: string;
+  launchExecutable: string | null;
+  checkedFiles: number;
+  verifiedBytes: number;
+  reportedMajorVersion: number | null;
+  diagnosticSummary: string | null;
+  problems: string[];
+  reused: boolean | null;
+}
+
+export interface RuntimeProgressEvent {
+  phase: "acquiring" | "materializing" | "validating" | "executing" | "committing";
+  completedItems: number;
+  totalItems: number;
+  currentItem: string | null;
+}
+
+export async function getInstanceRuntimeStatus(instanceId: string): Promise<RuntimeStatusDto> {
+  try {
+    return await invoke<RuntimeStatusDto>("get_instance_runtime_status", {
+      request: { instanceId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The managed Java status could not be loaded.",
+    );
+  }
+}
+
+export async function ensureInstanceRuntime(instanceId: string): Promise<RuntimeStatusDto> {
+  try {
+    return await invoke<RuntimeStatusDto>("ensure_instance_runtime", {
+      request: { instanceId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The managed Java runtime could not be installed.",
+    );
+  }
+}

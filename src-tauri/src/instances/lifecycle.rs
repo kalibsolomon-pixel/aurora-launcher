@@ -51,6 +51,11 @@ use crate::instances::{
 use crate::minecraft::metadata::MetadataEndpoints;
 use crate::minecraft::rules::PlatformProfile;
 use crate::paths::ManagedPaths;
+use crate::runtime::install::{
+    InstallRuntimeProgress, InstalledRuntime, RuntimeInstallError, RuntimeValidation,
+};
+use crate::runtime::metadata::{RuntimeMetadataEndpoints, RuntimeMetadataError};
+use crate::runtime::plan::{JavaRuntimePlan, RuntimePlatform};
 
 /// Everything instance orchestration resolves from: the Aurora release
 /// manifest (today the checked-in development fixture or a test manifest),
@@ -337,22 +342,7 @@ async fn install_instance_components(
         })?;
 
     progress(report(InstancePhase::ResolvingGame, None));
-    let game_version =
-        crate::minecraft::metadata::MinecraftVersionId::new(release.minecraft_version())
-            .map_err(|error| InstanceError::ReleaseInvalid(error.to_string()))?;
-    let loader_version =
-        crate::fabric::metadata::LoaderVersionId::new(release.fabric_loader_version())
-            .map_err(|error| InstanceError::ReleaseInvalid(error.to_string()))?;
-    let platform = PlatformProfile::current().map_err(InstanceError::Platform)?;
-    let plan = crate::fabric::resolve_game_plan(
-        &endpoints.minecraft,
-        &endpoints.fabric,
-        &game_version,
-        &loader_version,
-        platform,
-        endpoints.install.download_options(),
-    )
-    .await?;
+    let plan = resolve_record_game_plan(endpoints, record, release).await?;
 
     progress(report(InstancePhase::InstallingGame, None));
     execute_game_install(
@@ -416,6 +406,168 @@ async fn install_instance_components(
     }
 
     Ok(())
+}
+
+async fn resolve_record_game_plan(
+    endpoints: &InstanceEndpoints,
+    record: &InstanceRecord,
+    release: &crate::distribution::AuroraRelease,
+) -> Result<crate::fabric::plan::GameInstallPlan, InstanceError> {
+    let pin = record.release();
+    if release.minecraft_version() != pin.minecraft_version()
+        || release.fabric_loader_version() != pin.fabric_loader_version()
+    {
+        return Err(InstanceError::ReleaseInvalid(
+            "the resolved release no longer matches the instance's concrete Minecraft/Fabric pin"
+                .to_owned(),
+        ));
+    }
+    let game_version =
+        crate::minecraft::metadata::MinecraftVersionId::new(release.minecraft_version())
+            .map_err(|error| InstanceError::ReleaseInvalid(error.to_string()))?;
+    let loader_version =
+        crate::fabric::metadata::LoaderVersionId::new(release.fabric_loader_version())
+            .map_err(|error| InstanceError::ReleaseInvalid(error.to_string()))?;
+    let platform = PlatformProfile::current().map_err(InstanceError::Platform)?;
+    let plan = crate::fabric::resolve_game_plan(
+        &endpoints.minecraft,
+        &endpoints.fabric,
+        &game_version,
+        &loader_version,
+        platform,
+        endpoints.install.download_options(),
+    )
+    .await?;
+    validate_release_java_major(release.java().major_version(), plan.java().major_version())?;
+    Ok(plan)
+}
+
+fn validate_release_java_major(
+    release_major: u32,
+    resolved_game_major: u32,
+) -> Result<(), InstanceError> {
+    if release_major != resolved_game_major {
+        return Err(InstanceError::ReleaseInvalid(format!(
+            "the Aurora release declares Java {release_major}, but official Minecraft/Fabric planning requires Java {resolved_game_major}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolves the exact runtime plan for a content-ready instance. Runtime
+/// readiness remains independent: no runtime absence or damage changes the
+/// instance's persisted or content-validation state.
+pub async fn resolve_instance_runtime_plan(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    runtime_endpoints: &RuntimeMetadataEndpoints,
+    instance_id: &InstanceId,
+) -> Result<JavaRuntimePlan, InstanceError> {
+    let registry = InstanceRegistry::load(registry_path)?;
+    let record = registry
+        .find(instance_id)
+        .cloned()
+        .ok_or_else(|| InstanceError::NotFound {
+            instance_id: instance_id.to_string(),
+        })?;
+    if record.state() != InstanceState::Ready {
+        return Err(InstanceError::NotReady {
+            instance_id: instance_id.to_string(),
+            reason: "managed Java can only be prepared after instance content is ready".to_owned(),
+        });
+    }
+    let content = validate_instance(managed, &registry, instance_id)?;
+    if content.status != InstanceStatus::Ready {
+        return Err(InstanceError::NotReady {
+            instance_id: instance_id.to_string(),
+            reason: format!(
+                "instance content validation reported {}: {}",
+                content.status.as_str(),
+                content
+                    .problems
+                    .iter()
+                    .map(|problem| format!("{}: {}", problem.component, problem.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        });
+    }
+    let release = endpoints
+        .release_manifest()
+        .resolve_exact(
+            record.release().aurora_version(),
+            Some(record.release().channel()),
+        )
+        .ok_or_else(|| InstanceError::AuroraReleaseNotFound {
+            channel: record.release().channel(),
+            aurora_version: record.release().aurora_version().to_owned(),
+        })?;
+    let game_plan = resolve_record_game_plan(endpoints, &record, release).await?;
+    let runtime_platform = RuntimePlatform::current().map_err(RuntimeMetadataError::Plan)?;
+    crate::runtime::metadata::resolve_runtime_plan(
+        managed,
+        runtime_endpoints,
+        game_plan.java().component(),
+        game_plan.java().major_version(),
+        runtime_platform,
+        endpoints.install.download_options(),
+    )
+    .await
+    .map_err(InstanceError::RuntimeMetadata)
+}
+
+pub async fn validate_instance_runtime(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    runtime_endpoints: &RuntimeMetadataEndpoints,
+    instance_id: &InstanceId,
+    execute_diagnostic: bool,
+) -> Result<RuntimeValidation, InstanceError> {
+    let plan = resolve_instance_runtime_plan(
+        managed,
+        registry_path,
+        endpoints,
+        runtime_endpoints,
+        instance_id,
+    )
+    .await?;
+    crate::runtime::install::validate_runtime(
+        managed,
+        &plan,
+        execute_diagnostic,
+        crate::runtime::install::DEFAULT_JAVA_DIAGNOSTIC_TIMEOUT,
+    )
+    .await
+    .map_err(InstanceError::RuntimeInstall)
+}
+
+pub async fn ensure_instance_runtime(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    runtime_endpoints: &RuntimeMetadataEndpoints,
+    instance_id: &InstanceId,
+    progress: &mut (dyn FnMut(InstallRuntimeProgress) + Send),
+) -> Result<InstalledRuntime, InstanceError> {
+    let plan = resolve_instance_runtime_plan(
+        managed,
+        registry_path,
+        endpoints,
+        runtime_endpoints,
+        instance_id,
+    )
+    .await?;
+    crate::runtime::install::ensure_runtime(
+        managed,
+        &plan,
+        endpoints.install.download_options(),
+        true,
+        progress,
+    )
+    .await
+    .map_err(InstanceError::RuntimeInstall)
 }
 
 /// Renames an instance's display name. Metadata only: the identifier, all
@@ -665,6 +817,8 @@ pub enum InstanceError {
     /// Reading a game installed-state manifest failed structurally.
     GameInstallState(crate::install::state::InstalledStateError),
     Aurora(AuroraInstallError),
+    RuntimeMetadata(RuntimeMetadataError),
+    RuntimeInstall(RuntimeInstallError),
     ValidationFailed {
         instance_id: String,
         problems: Vec<String>,
@@ -705,6 +859,8 @@ impl fmt::Display for InstanceError {
             Self::GameInstall(error) => write!(formatter, "{error}"),
             Self::GameInstallState(error) => write!(formatter, "{error}"),
             Self::Aurora(error) => write!(formatter, "{error}"),
+            Self::RuntimeMetadata(error) => write!(formatter, "{error}"),
+            Self::RuntimeInstall(error) => write!(formatter, "{error}"),
             Self::ValidationFailed {
                 instance_id,
                 problems,
@@ -755,6 +911,18 @@ impl From<crate::fabric::GameResolutionError> for InstanceError {
     }
 }
 
+impl From<RuntimeMetadataError> for InstanceError {
+    fn from(error: RuntimeMetadataError) -> Self {
+        Self::RuntimeMetadata(error)
+    }
+}
+
+impl From<RuntimeInstallError> for InstanceError {
+    fn from(error: RuntimeInstallError) -> Self {
+        Self::RuntimeInstall(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,6 +935,14 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
+
+    #[test]
+    fn release_java_requirement_must_match_resolved_game_authority() {
+        assert!(validate_release_java_major(25, 25).is_ok());
+        let error = validate_release_java_major(21, 25).unwrap_err();
+        assert!(matches!(error, InstanceError::ReleaseInvalid(_)));
+        assert!(error.to_string().contains("official Minecraft/Fabric"));
+    }
 
     /// A complete synthetic Aurora release + game world served from one
     /// loopback server: the Mojang manifest and version document, every

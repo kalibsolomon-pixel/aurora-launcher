@@ -4,7 +4,9 @@
   import {
     acquireArtifact,
     createInstance,
+    ensureInstanceRuntime,
     getApplicationStatus,
+    getInstanceRuntimeStatus,
     getLauncherState,
     installGame,
     listAuroraReleases,
@@ -29,6 +31,8 @@
     type InstallProgressEvent,
     type LauncherState,
     type MinecraftPlanSummary,
+    type RuntimeProgressEvent,
+    type RuntimeStatusDto,
   } from "$lib/backend";
 
   let status = $state<ApplicationStatus | null>(null);
@@ -88,6 +92,10 @@
   let instanceBusy = $state<string | null>(null);
   let instanceValidations = $state<Record<string, InstanceValidationDto>>({});
   let instanceError = $state<LauncherBackendError | null>(null);
+  let runtimeStatus = $state<RuntimeStatusDto | null>(null);
+  let runtimeBusy = $state(false);
+  let runtimeProgress = $state<RuntimeProgressEvent | null>(null);
+  let runtimeError = $state<LauncherBackendError | null>(null);
 
   onMount(async () => {
     try {
@@ -101,6 +109,10 @@
 
     try {
       launcherState = await getLauncherState();
+      const selected = launcherState.instances.find(
+        (instance) => instance.id === launcherState?.config.selectedInstanceId,
+      );
+      if (selected?.state === "ready") void runRuntimeStatus(selected.id);
     } catch (cause: unknown) {
       stateError =
         cause instanceof LauncherBackendError
@@ -127,6 +139,7 @@
     // Native progress events drive the installation displays.
     let unsubscribeInstall: (() => void) | null = null;
     let unsubscribeInstance: (() => void) | null = null;
+    let unsubscribeRuntime: (() => void) | null = null;
     listen<InstallProgressEvent>("install-progress", (event) => {
       installProgress = event.payload;
     }).then((stop) => {
@@ -137,9 +150,15 @@
     }).then((stop) => {
       unsubscribeInstance = stop;
     });
+    listen<RuntimeProgressEvent>("runtime-progress", (event) => {
+      runtimeProgress = event.payload;
+    }).then((stop) => {
+      unsubscribeRuntime = stop;
+    });
     return () => {
       unsubscribeInstall?.();
       unsubscribeInstance?.();
+      unsubscribeRuntime?.();
     };
   });
 
@@ -183,6 +202,8 @@
     try {
       await selectInstance(id);
       await refreshState();
+      runtimeStatus = null;
+      void runRuntimeStatus(id);
     } catch (cause: unknown) {
       instanceError =
         cause instanceof LauncherBackendError
@@ -242,6 +263,38 @@
           : new LauncherBackendError("unknown_error", "The validation failed.");
     } finally {
       instanceBusy = null;
+    }
+  }
+
+  async function runRuntimeStatus(id: string) {
+    runtimeBusy = true;
+    runtimeError = null;
+    runtimeProgress = null;
+    try {
+      runtimeStatus = await getInstanceRuntimeStatus(id);
+    } catch (cause: unknown) {
+      runtimeError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The managed Java status failed.");
+    } finally {
+      runtimeBusy = false;
+    }
+  }
+
+  async function runEnsureRuntime(id: string) {
+    runtimeBusy = true;
+    runtimeError = null;
+    runtimeProgress = null;
+    try {
+      runtimeStatus = await ensureInstanceRuntime(id);
+    } catch (cause: unknown) {
+      runtimeError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Managed Java installation failed.");
+    } finally {
+      runtimeBusy = false;
     }
   }
 
@@ -444,7 +497,7 @@
       </dl>
       <p class="footnote">
         Instance management lives in the panel below. Installation is supported;
-        launching, Java management, and accounts are not implemented yet.
+        launching and accounts are not implemented yet. Managed Java is shown for the selected instance.
       </p>
     {:else if stateError}
       <div class="error-message" role="alert">
@@ -598,6 +651,33 @@
               {/each}
             </div>
           {/if}
+
+          {#if launcherState.config.selectedInstanceId === instance.id && instance.state === "ready"}
+            <div class="instance-meta validation-line" class:damaged={runtimeStatus?.status === "damaged"}>
+              Content: ready · Java:
+              {#if runtimeBusy}
+                {runtimeProgress
+                  ? `${runtimeProgress.phase} ${runtimeProgress.completedItems}/${runtimeProgress.totalItems}`
+                  : "resolving"}
+              {:else if runtimeStatus?.instanceId === instance.id}
+                {runtimeStatus.status} · {runtimeStatus.component} · required {runtimeStatus.requiredMajorVersion}{#if runtimeStatus.runtimeVersion}
+                  · installed {runtimeStatus.runtimeVersion}
+                {/if}
+                {#if runtimeStatus.reused === true} · reused verified runtime{/if}
+                {#each runtimeStatus.problems as problem}
+                  <div class="instance-meta">Java: {problem}</div>
+                {/each}
+              {:else}
+                not checked
+              {/if}
+            </div>
+            {#if runtimeError}
+              <div class="error-message" role="alert">
+                <p>{runtimeError.message}</p>
+                <code>{runtimeError.code}</code>
+              </div>
+            {/if}
+          {/if}
         </div>
 
         <div class="instance-actions">
@@ -652,6 +732,24 @@
             >
               Validate
             </button>
+            {#if launcherState.config.selectedInstanceId === instance.id && instance.state === "ready"}
+              <button
+                type="button"
+                onclick={() => runRuntimeStatus(instance.id)}
+                disabled={runtimeBusy || instanceBusy === instance.id || createBusy}
+              >
+                Check Java
+              </button>
+              {#if runtimeStatus?.instanceId === instance.id && runtimeStatus.status !== "ready"}
+                <button
+                  type="button"
+                  onclick={() => runEnsureRuntime(instance.id)}
+                  disabled={runtimeBusy || instanceBusy === instance.id || createBusy}
+                >
+                  {runtimeStatus.status === "damaged" ? "Repair Java" : "Install Java"}
+                </button>
+              {/if}
+            {/if}
           {/if}
         </div>
       </div>
@@ -660,9 +758,9 @@
 
     <p class="footnote">
       Instances are complete, isolated installations — game, Fabric, and the Aurora client
-      artifact — validated before they are reported ready. They cannot be launched yet:
-      Java management, accounts, and launching arrive in later phases. Instance deletion
-      is deliberately not implemented.
+      artifact — validated before they are reported content-ready. The selected instance can
+      acquire and validate its official shared Mojang Java runtime independently. Accounts,
+      game launching, and instance deletion are deliberately not implemented.
     </p>
   </section>
 

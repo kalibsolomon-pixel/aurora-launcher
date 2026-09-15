@@ -3,8 +3,9 @@
 //! This module converts a validated version document plus a target platform
 //! into Aurora's own domain representation. The output is a *plan*: it names
 //! every artifact a future installer must acquire (with each artifact's
-//! official URL, SHA-1, and size), the Java runtime component that will be
-//! required, and launch metadata with placeholders deliberately unresolved.
+//! official URL, SHA-1, and size), the Java runtime component consumed by the
+//! managed-runtime domain, and launch metadata with placeholders deliberately
+//! unresolved.
 //!
 //! The plan performs no filesystem mutation, downloads nothing, and never
 //! reparses raw Mojang JSON — installers consume only these types.
@@ -18,8 +19,8 @@ use crate::minecraft::rules::{FeatureFlag, PlanDecision, PlatformProfile, plan_d
 /// The Java runtime a Minecraft version requires.
 ///
 /// The component names Mojang's runtime registry entry (for example
-/// `java-runtime-epsilon`); discovery, download, and selection of an actual
-/// executable belong to a future Java-management phase.
+/// `java-runtime-epsilon`); discovery, download, and exact executable
+/// selection belong to the separate managed-runtime domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JavaRequirement {
     component: String,

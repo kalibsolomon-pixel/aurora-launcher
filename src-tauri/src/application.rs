@@ -27,6 +27,8 @@ use crate::minecraft::plan::PlanError;
 use crate::minecraft::rules::UnsupportedPlatform;
 use crate::minecraft::{MinecraftResolutionError, resolve_install_plan};
 use crate::paths::ManagedPaths;
+use crate::runtime::install::{RuntimeInstallError, RuntimeValidation};
+use crate::runtime::metadata::RuntimeMetadataError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -827,6 +829,8 @@ impl From<InstanceError> for CommandError {
             InstanceError::GameInstall(install) => Self::from(install),
             InstanceError::Aurora(aurora) => Self::from(aurora),
             InstanceError::GameResolution(resolution) => Self::from(resolution),
+            InstanceError::RuntimeMetadata(runtime) => Self::from(runtime),
+            InstanceError::RuntimeInstall(runtime) => Self::from(runtime),
             other => {
                 let code = match &other {
                     InstanceError::NotFound { .. } => "instance_not_found",
@@ -841,13 +845,70 @@ impl From<InstanceError> for CommandError {
                     | InstanceError::Config(_)
                     | InstanceError::GameInstall(_)
                     | InstanceError::Aurora(_)
-                    | InstanceError::GameResolution(_) => {
+                    | InstanceError::GameResolution(_)
+                    | InstanceError::RuntimeMetadata(_)
+                    | InstanceError::RuntimeInstall(_) => {
                         unreachable!("handled by value above")
                     }
                 };
                 Self::new(code, other.to_string())
             }
         }
+    }
+}
+
+impl From<RuntimeMetadataError> for CommandError {
+    fn from(error: RuntimeMetadataError) -> Self {
+        let code = match &error {
+            RuntimeMetadataError::IndexNetwork(_) | RuntimeMetadataError::IndexTooLarge { .. } => {
+                "runtime_metadata_network_failure"
+            }
+            RuntimeMetadataError::PlatformUnavailable { .. } => "runtime_platform_unsupported",
+            RuntimeMetadataError::ComponentUnavailable { .. }
+            | RuntimeMetadataError::AmbiguousComponent { .. } => "runtime_component_unavailable",
+            RuntimeMetadataError::ManifestAcquisition(_) => "runtime_manifest_acquisition_failure",
+            RuntimeMetadataError::ManifestRead(_) => "storage_io_failure",
+            RuntimeMetadataError::IndexInvalid(_)
+            | RuntimeMetadataError::ManifestInvalid(_)
+            | RuntimeMetadataError::Plan(_) => "runtime_metadata_invalid",
+        };
+        let message = match &error {
+            RuntimeMetadataError::IndexNetwork(_) => {
+                "Official Mojang Java runtime metadata could not be reached.".to_owned()
+            }
+            RuntimeMetadataError::ManifestAcquisition(_) => {
+                "The official Java runtime manifest could not be acquired and verified.".to_owned()
+            }
+            _ => error.to_string(),
+        };
+        eprintln!("[aurora-launcher] runtime metadata error ({code}): {error}");
+        Self::new(code, message)
+    }
+}
+
+impl From<RuntimeInstallError> for CommandError {
+    fn from(error: RuntimeInstallError) -> Self {
+        let code = match &error {
+            RuntimeInstallError::AlreadyInProgress { .. } => {
+                "runtime_installation_already_in_progress"
+            }
+            RuntimeInstallError::Plan(_) => "runtime_plan_invalid",
+            RuntimeInstallError::Acquisition(_) => "runtime_artifact_acquisition_failure",
+            RuntimeInstallError::State(_) => "runtime_state_invalid",
+            RuntimeInstallError::TargetConflict { .. } => "runtime_target_conflict",
+            RuntimeInstallError::Materialization { .. } => "runtime_materialization_failure",
+            RuntimeInstallError::Validation(_) => "runtime_validation_failure",
+            RuntimeInstallError::Commit(_) => "runtime_commit_failure",
+            RuntimeInstallError::Storage(_) => "storage_io_failure",
+        };
+        let message = match &error {
+            RuntimeInstallError::Acquisition(_) => {
+                "A managed Java runtime file could not be acquired and verified.".to_owned()
+            }
+            _ => error.to_string(),
+        };
+        eprintln!("[aurora-launcher] runtime install error ({code}): {error}");
+        Self::new(code, message)
     }
 }
 
@@ -1117,6 +1178,146 @@ pub fn validate_instance(
                 reason: problem.reason,
             })
             .collect(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeStatusDto {
+    instance_id: String,
+    content_status: &'static str,
+    status: String,
+    component: String,
+    required_major_version: u32,
+    runtime_version: Option<String>,
+    runtime_root: String,
+    launch_executable: Option<String>,
+    checked_files: u32,
+    verified_bytes: u64,
+    reported_major_version: Option<u32>,
+    diagnostic_summary: Option<String>,
+    problems: Vec<String>,
+    reused: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeProgressEvent {
+    phase: &'static str,
+    completed_items: u32,
+    total_items: u32,
+    current_item: Option<String>,
+}
+
+fn runtime_status_dto(instance_id: &str, validation: RuntimeValidation) -> RuntimeStatusDto {
+    RuntimeStatusDto {
+        instance_id: instance_id.to_owned(),
+        content_status: "ready",
+        status: validation.status.as_str().to_owned(),
+        component: validation.component,
+        required_major_version: validation.required_major_version,
+        runtime_version: validation.runtime_version,
+        runtime_root: validation.root.to_string_lossy().into_owned(),
+        launch_executable: validation
+            .launch_executable
+            .map(|path| path.to_string_lossy().into_owned()),
+        checked_files: validation.checked_files,
+        verified_bytes: validation.verified_bytes,
+        reported_major_version: validation
+            .diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.reported_major_version),
+        diagnostic_summary: validation.diagnostic.map(|diagnostic| diagnostic.summary),
+        problems: validation.problems,
+        reused: None,
+    }
+}
+
+/// Resolves and deeply validates the exact managed runtime for one
+/// content-ready instance. Validation is read-only; runtime absence is
+/// reported independently and never damages the instance's content status.
+#[tauri::command]
+pub async fn get_instance_runtime_status(
+    app: AppHandle,
+    request: ValidateInstalledGameRequest,
+) -> Result<RuntimeStatusDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+    let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
+    let validation = crate::instances::lifecycle::validate_instance_runtime(
+        &managed,
+        &managed.instance_registry_file(),
+        &endpoints,
+        &runtime_endpoints,
+        &instance,
+        true,
+    )
+    .await?;
+    Ok(runtime_status_dto(instance.as_str(), validation))
+}
+
+/// Acquires, installs, validates, and executes the exact official runtime for
+/// one content-ready instance. Shared exact runtimes are reused.
+#[tauri::command]
+pub async fn ensure_instance_runtime(
+    app: AppHandle,
+    request: ValidateInstalledGameRequest,
+) -> Result<RuntimeStatusDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+    let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
+    let installed = crate::instances::lifecycle::ensure_instance_runtime(
+        &managed,
+        &managed.instance_registry_file(),
+        &endpoints,
+        &runtime_endpoints,
+        &instance,
+        &mut |progress| {
+            let _ = app.emit(
+                "runtime-progress",
+                RuntimeProgressEvent {
+                    phase: progress.phase.as_str(),
+                    completed_items: progress.completed_items,
+                    total_items: progress.total_items,
+                    current_item: progress.current_item,
+                },
+            );
+        },
+    )
+    .await?;
+    let state = installed.state();
+    let checked_files = state
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind() == crate::runtime::state::RuntimeStateEntryKind::File)
+        .count() as u32;
+    let verified_bytes = state
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.size_bytes())
+        .sum();
+    Ok(RuntimeStatusDto {
+        instance_id: instance.to_string(),
+        content_status: "ready",
+        status: "ready".to_owned(),
+        component: state.component().to_owned(),
+        required_major_version: state.required_major_version(),
+        runtime_version: Some(state.runtime_version().to_owned()),
+        runtime_root: installed.root().to_string_lossy().into_owned(),
+        launch_executable: Some(installed.launch_executable().to_string_lossy().into_owned()),
+        checked_files,
+        verified_bytes,
+        reported_major_version: Some(state.required_major_version()),
+        diagnostic_summary: Some(format!(
+            "managed Java {} executed successfully",
+            state.runtime_version()
+        )),
+        problems: Vec::new(),
+        reused: Some(installed.reused()),
     })
 }
 
