@@ -9,8 +9,7 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
+# The `_lib` suffix may seem redundant but it is necessary to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "aurora_launcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -39,17 +38,41 @@ rustls = { version = "0.23", default-features = false, features = [
 sha1 = "0.10"
 sha2 = "0.10"
 # Tokio is already Tauri's async runtime. `sync` owns narrow install locks;
-# Phase 7's `process` + `time` bound structured managed-Java diagnostics.
-tokio = { version = "1", default-features = false, features = ["fs", "io-util", "process", "sync", "time"] }
+# Phase 7's `process` + `time` bound structured managed-Java diagnostics;
+# Phase 8's `macros` provides the `select!` used to race the OAuth callback
+# receiver against login cancellation and timeout.
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 url = "2"
 # Instance identifier generation (Phase 6): opaque, collision-resistant UUIDv4
 # in the canonical simple (hyphen-less) lowercase-hex form. Focused and
 # universally maintained; v4 needs the `rng` feature's OS entropy.
 uuid = { version = "1.26", features = ["v4"] }
+# OS entropy for OAuth PKCE verifiers and state (Phase 8): the same crate the
+# `uuid` dependency already reaches for v4 randomness, pinned as a direct
+# dependency because Aurora generates its own challenge material.
+getrandom = "0.3"
+# Unpadded base64url for PKCE S256 challenges and OAuth state (Phase 8).
+# RustCrypto implementation matching the existing sha1/sha2 dependency family.
+base64ct = { version = "1", features = ["alloc"] }
+# System-browser opening for OAuth (Phase 8): the official Tauri 2 opener
+# plugin; only its synchronous free functions are used from Rust, so no
+# frontend capability is granted.
+tauri-plugin-opener = "2"
 # ZIP-only archive support (Phase 5): Minecraft native artifacts are ZIP/JAR
 # files. Focused maintained implementation (zip-rs); `deflate` covers the
 # compression real native jars use, everything else stays off.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+# Windows credential storage (Phase 8): the official Microsoft raw bindings,
+# restricted to the generic Windows Credential Manager API. Linux and macOS
+# builds compile the portable trait only and fail deliberately until their
+# platform phases own a backed store. Version pinned to the copy already in
+# the dependency tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "process", "rt", "time"] }

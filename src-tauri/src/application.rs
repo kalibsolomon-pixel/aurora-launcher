@@ -200,6 +200,24 @@ impl From<InstanceRegistryError> for CommandError {
     }
 }
 
+impl From<crate::auth::AuthError> for CommandError {
+    fn from(error: crate::auth::AuthError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+}
+
+impl From<crate::auth::AccountsError> for CommandError {
+    fn from(error: crate::auth::AccountsError) -> Self {
+        Self::from(crate::auth::AuthError::Accounts(error))
+    }
+}
+
+impl From<crate::auth::accounts::InvalidAccount> for CommandError {
+    fn from(error: crate::auth::accounts::InvalidAccount) -> Self {
+        Self::from(crate::auth::AuthError::InvalidAccountId(error))
+    }
+}
+
 impl From<InvalidArtifactSource> for CommandError {
     fn from(error: InvalidArtifactSource) -> Self {
         Self::new("artifact_source_invalid", error.to_string())
@@ -1321,9 +1339,365 @@ pub async fn ensure_instance_runtime(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Accounts (Phase 8)
+// ---------------------------------------------------------------------------
+
+/// One non-secret account summary for the UI. Status is derived honestly:
+/// `signedIn` means a stored credential exists; whether it still refreshes
+/// is answered by `refresh_account_session`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSummaryDto {
+    account_id: String,
+    minecraft_name: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsStateDto {
+    accounts: Vec<AccountSummaryDto>,
+    selected_account_id: Option<String>,
+}
+
+/// Coarse sign-in progress; never carries data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthProgressEvent {
+    phase: &'static str,
+}
+
+/// The outcome of an on-demand session restoration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSessionDto {
+    account_id: String,
+    minecraft_name: String,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectAccountRequest {
+    account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountIdRequest {
+    account_id: String,
+}
+
+/// Lists the launcher's accounts with derived status and the selection.
+#[tauri::command]
+pub fn get_accounts(app: AppHandle) -> Result<AccountsStateDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let store = crate::auth::OsCredentialStore;
+    let document = crate::auth::accounts::load(&managed.accounts_file())?;
+
+    let accounts = document
+        .accounts()
+        .iter()
+        .map(|record| AccountSummaryDto {
+            account_id: record.account_id().to_owned(),
+            minecraft_name: record.minecraft_name().to_owned(),
+            status: crate::auth::flow::AccountStatus::of(&store, record.account_id())
+                .as_str()
+                .to_owned(),
+        })
+        .collect();
+
+    Ok(AccountsStateDto {
+        accounts,
+        selected_account_id: document.selected_account_id().map(str::to_owned),
+    })
+}
+
+/// Starts Microsoft sign-in in the system browser and completes the whole
+/// authentication chain. The command stays in flight (bounded by the login
+/// timeout) while the user signs in; `cancel_microsoft_login` aborts it.
+///
+/// Requires Aurora's real Microsoft application registration
+/// (`AURORA_MICROSOFT_CLIENT_ID` at build time); without it the command
+/// fails deliberately instead of pretending.
+#[tauri::command]
+pub async fn begin_microsoft_login(app: AppHandle) -> Result<AccountSummaryDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let registration = crate::auth::flow::production_registration()
+        .ok_or_else(|| CommandError::from(crate::auth::AuthError::ConfigurationMissing))?;
+
+    let endpoints = crate::auth::AuthEndpoints::official();
+    let store = crate::auth::OsCredentialStore;
+    let context = crate::auth::flow::AuthContext {
+        endpoints: &endpoints,
+        oauth: registration,
+        credentials: &store,
+        accounts_path: &managed.accounts_file(),
+        options: crate::auth::flow::AuthFlowOptions::default(),
+        browser: &|url: &str| {
+            // The official Tauri opener: the user's default system browser,
+            // exactly the public-client model — no embedded webview.
+            tauri_plugin_opener::open_url(url, None::<&str>)
+                .map_err(|error| crate::auth::flow::BrowserOpenError::new(error.to_string()))
+        },
+    };
+
+    let record = crate::auth::flow::sign_in(&context, &mut |phase| {
+        let _ = app.emit(
+            "auth-progress",
+            AuthProgressEvent {
+                phase: phase.as_str(),
+            },
+        );
+    })
+    .await?;
+
+    Ok(AccountSummaryDto {
+        account_id: record.account_id().to_owned(),
+        minecraft_name: record.minecraft_name().to_owned(),
+        status: "signedIn".to_owned(),
+    })
+}
+
+/// Cancels the active sign-in, if one exists. Idempotent.
+#[tauri::command]
+pub fn cancel_microsoft_login() -> Result<(), CommandError> {
+    crate::auth::flow::cancel_active_login();
+    Ok(())
+}
+
+/// Selects an account. The selection always refers to a known account; a
+/// dangling selection is never written.
+#[tauri::command]
+pub fn select_account(app: AppHandle, request: SelectAccountRequest) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let account_id = request.account_id.trim().to_owned();
+    crate::auth::accounts::AccountId::validate(&account_id)?;
+
+    let mut document = crate::auth::accounts::load(&managed.accounts_file())?;
+    if document.find(&account_id).is_none() {
+        return Err(CommandError::from(
+            crate::auth::AuthError::AccountNotFound { account_id },
+        ));
+    }
+    document
+        .set_selected_account_id(Some(&account_id))
+        .map_err(CommandError::from)?;
+    crate::auth::accounts::save(&managed.accounts_file(), &document)?;
+
+    Ok(())
+}
+
+/// Removes one account from Aurora: deletes the persisted credential,
+/// the non-secret record, and the cached session. Local removal only — the
+/// Microsoft account session itself is not revoked.
+#[tauri::command]
+pub fn remove_account(app: AppHandle, request: AccountIdRequest) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let account_id = request.account_id.trim().to_owned();
+    crate::auth::accounts::AccountId::validate(&account_id)?;
+
+    let endpoints = crate::auth::AuthEndpoints::official();
+    let store = crate::auth::OsCredentialStore;
+    let context = crate::auth::flow::AuthContext {
+        endpoints: &endpoints,
+        oauth: crate::auth::OAuthClientConfig::new("unused-by-sign-out"),
+        credentials: &store,
+        accounts_path: &managed.accounts_file(),
+        options: crate::auth::flow::AuthFlowOptions::default(),
+        browser: &|_url: &str| Ok(()),
+    };
+
+    crate::auth::flow::sign_out(&context, &account_id)?;
+
+    Ok(())
+}
+
+/// Restores or refreshes one account's session on demand and reports the
+/// non-secret outcome. The Minecraft token itself stays in Rust.
+#[tauri::command]
+pub async fn refresh_account_session(
+    app: AppHandle,
+    request: AccountIdRequest,
+) -> Result<AccountSessionDto, CommandError> {
+    let managed = managed_paths(&app)?;
+    let account_id = request.account_id.trim().to_owned();
+    crate::auth::accounts::AccountId::validate(&account_id)?;
+
+    let registration = crate::auth::flow::production_registration()
+        .ok_or_else(|| CommandError::from(crate::auth::AuthError::ConfigurationMissing))?;
+
+    let endpoints = crate::auth::AuthEndpoints::official();
+    let store = crate::auth::OsCredentialStore;
+    let context = crate::auth::flow::AuthContext {
+        endpoints: &endpoints,
+        oauth: registration,
+        credentials: &store,
+        accounts_path: &managed.accounts_file(),
+        options: crate::auth::flow::AuthFlowOptions::default(),
+        browser: &|_url: &str| Ok(()),
+    };
+
+    let session = crate::auth::flow::ensure_session(&context, &account_id, &mut |phase| {
+        let _ = app.emit(
+            "auth-progress",
+            AuthProgressEvent {
+                phase: phase.as_str(),
+            },
+        );
+    })
+    .await?;
+
+    Ok(AccountSessionDto {
+        account_id: session.account_id().to_owned(),
+        minecraft_name: session.profile().name().to_owned(),
+        status: "ready".to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_errors_map_to_stable_machine_codes() {
+        use crate::auth::metadata::{
+            AuthTransportError, EntitlementError, MinecraftExchangeError, TokenExchangeError,
+            XboxExchangeError, XstsExchangeError,
+        };
+
+        let cases: Vec<(crate::auth::AuthError, &str)> = vec![
+            (
+                crate::auth::AuthError::ConfigurationMissing,
+                "auth_configuration_missing",
+            ),
+            (
+                crate::auth::AuthError::LoginInProgress,
+                "auth_login_in_progress",
+            ),
+            (
+                crate::auth::AuthError::LoginCancelled,
+                "auth_login_cancelled",
+            ),
+            (crate::auth::AuthError::LoginTimeout, "auth_login_timeout"),
+            (
+                crate::auth::AuthError::CallbackInvalid,
+                "auth_callback_invalid",
+            ),
+            (
+                crate::auth::AuthError::OAuthFailure {
+                    reason: "access_denied".to_owned(),
+                },
+                "auth_oauth_failure",
+            ),
+            (
+                crate::auth::AuthError::TokenExchange(TokenExchangeError::Malformed),
+                "auth_token_exchange_failure",
+            ),
+            (
+                crate::auth::AuthError::Xbox(XboxExchangeError::Malformed),
+                "auth_xbox_failure",
+            ),
+            (
+                crate::auth::AuthError::Xsts(XstsExchangeError::Malformed),
+                "auth_xsts_failure",
+            ),
+            (
+                crate::auth::AuthError::XstsDenied {
+                    xerr: 2148916238,
+                    reason: "family group".to_owned(),
+                },
+                "auth_xsts_failure",
+            ),
+            (
+                crate::auth::AuthError::MinecraftServices(MinecraftExchangeError::Malformed),
+                "auth_minecraft_services_failure",
+            ),
+            (
+                crate::auth::AuthError::EntitlementCheck(EntitlementError::Malformed),
+                "auth_minecraft_services_failure",
+            ),
+            (
+                crate::auth::AuthError::MinecraftServicesTransport(
+                    AuthTransportError::HttpStatus { status: 503 },
+                ),
+                "auth_minecraft_services_failure",
+            ),
+            (
+                crate::auth::AuthError::EntitlementMissing,
+                "auth_entitlement_missing",
+            ),
+            (
+                crate::auth::AuthError::ProfileMissing,
+                "auth_profile_missing",
+            ),
+            (
+                crate::auth::AuthError::ProfileInvalid,
+                "auth_profile_invalid",
+            ),
+            (
+                crate::auth::AuthError::ReauthenticationRequired {
+                    reason: "revoked".to_owned(),
+                },
+                "auth_reauthentication_required",
+            ),
+            (
+                crate::auth::AuthError::CredentialStore(
+                    crate::auth::CredentialStoreError::UnsupportedPlatform,
+                ),
+                "auth_credential_store_failure",
+            ),
+            (
+                crate::auth::AuthError::Accounts(crate::auth::AccountsError::Malformed(
+                    "broken".to_owned(),
+                )),
+                "accounts_invalid",
+            ),
+            (
+                crate::auth::AuthError::Accounts(crate::auth::AccountsError::UnsupportedSchema {
+                    found: 9,
+                    supported: 1,
+                }),
+                "accounts_unsupported_schema",
+            ),
+            (
+                crate::auth::AuthError::Accounts(crate::auth::AccountsError::SelectedDangling {
+                    account_id: "x".repeat(32),
+                }),
+                "accounts_selected_dangling",
+            ),
+            (
+                crate::auth::AuthError::AccountNotFound {
+                    account_id: "y".repeat(32),
+                },
+                "auth_account_not_found",
+            ),
+            (
+                crate::auth::AuthError::BrowserOpen(crate::auth::flow::BrowserOpenError::new(
+                    "no browser",
+                )),
+                "auth_browser_open_failure",
+            ),
+            (
+                crate::auth::AuthError::CallbackListener("bind failed".to_owned()),
+                "auth_callback_listener_failure",
+            ),
+            (
+                crate::auth::AuthError::EntropyFailure(crate::auth::oauth::OAuthEntropyError),
+                "auth_entropy_failure",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
+    }
 
     #[test]
     fn ready_status_preserves_structured_platform_metadata() {

@@ -1,5 +1,6 @@
 mod application;
 pub mod aurora;
+pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod distribution;
@@ -35,7 +36,13 @@ pub fn run() {
             application::select_instance,
             application::validate_instance,
             application::get_instance_runtime_status,
-            application::ensure_instance_runtime
+            application::ensure_instance_runtime,
+            application::get_accounts,
+            application::begin_microsoft_login,
+            application::cancel_microsoft_login,
+            application::select_account,
+            application::remove_account,
+            application::refresh_account_session
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");

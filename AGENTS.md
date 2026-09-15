@@ -33,7 +33,7 @@ npm run tauri build
 ## Discipline and security
 
 - Add a dependency only with current functionality that needs it; prefer standard-library code and focused maintained packages. Commit lockfiles.
-- Passwords never enter this application. Future auth uses Microsoft OAuth, native handling, and OS-backed credential storage where practical.
+- Passwords never enter this application. Authentication uses Microsoft OAuth in the system browser, and the OS-backed Windows Credential Manager for the refresh credential; see the Authentication section.
 - Treat downloads as untrusted until an expected hash is verified; use temporary files and rollback-safe activation.
 - Never trust a cache object because of its filename: verified cache artifacts are re-validated by hashing before reuse, and a corrupt object is replaced only through a full verified acquisition.
 - Never install, extract, activate, or execute from an unverified staging file; only the verified store under `cache/artifacts/sha256/<digest>` contains trusted artifacts.
@@ -98,6 +98,16 @@ npm run tauri build
 - A runtime becomes complete only when `runtime-installed.json` is written last inside staging and the whole staged tree is promoted. Replace only an exact path whose valid state proves launcher ownership; malformed or unknown-schema state is never overwritten.
 - Runtime validation is read-only and network-free once a plan is resolved: verify the complete state against the plan, every recorded file/size/SHA-1, directories, links, executable semantics, and the bounded structured `java -version` diagnostic when requested. Never select or launch with a damaged or unvalidated runtime.
 - Only one install of the same runtime identity may mutate it within a process. Cross-process coordination, runtime garbage collection, system-Java discovery, custom Java paths, JVM tuning, and generalized repair remain out of scope.
+
+## Authentication
+
+- Never handle, collect, store, or render a Microsoft password. Sign-in happens in the user's system browser; Aurora never embeds an auth webview, scrapes login pages, injects scripts into them, or persists browser cookies.
+- Never embed a client secret and never implement a confidential-client flow: Aurora is a desktop public client using authorization-code + PKCE (S256) with a per-login `state` and a loopback redirect receiver. Never borrow another application's client ID, and never invent or fake a production registration; a missing registration fails as `auth_configuration_missing`.
+- Never log, serialize into ordinary JSON, emit through events/DTOs, or otherwise expose authorization codes, access tokens, refresh tokens, Xbox/XSTS tokens, or Minecraft tokens. Secret-bearing types use redacting `Debug`/`Display`, and auth error messages never quote raw response bodies.
+- The only persisted secret is the Microsoft refresh credential, stored exclusively through the OS-backed `CredentialStore` (Windows Credential Manager; other platforms fail deliberately — never fall back to plaintext token files). Every downstream token is memory-only and regenerated on demand.
+- External authentication DTOs and endpoints stay inside `auth::metadata`; the rest of the domain consumes normalized results. XSTS account conditions are mapped only from evidence-backed `XErr` codes — unknown codes stay generic and are never guessed into specific account conditions.
+- Accounts and instances are separate launcher concepts; account identifiers are the validated Minecraft profile UUID, never usernames, emails, or tokens. Session restoration rotates and immediately persists the replacement refresh credential; revoked credentials transition to explicit reauthentication-required, never to silent deletion of the account record.
+- Authentication never launches Minecraft, never touches instances or managed runtimes, and never extends a session's claimed lifetime beyond what the provider returned. One login transaction per process; cancellation and timeout discard all transient OAuth state.
 
 ## Verification and Git
 

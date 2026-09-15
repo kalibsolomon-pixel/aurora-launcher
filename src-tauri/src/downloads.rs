@@ -40,6 +40,12 @@ pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// The single user agent the launcher presents to artifact hosts.
 const USER_AGENT: &str = concat!("aurora-launcher/", env!("CARGO_PKG_VERSION"));
 
+/// The user agent shared by every launcher transport, including the
+/// authentication client (which otherwise keeps its own redirect policy).
+pub(crate) fn user_agent() -> &'static str {
+    USER_AGENT
+}
+
 /// Validated metadata describing one artifact to acquire.
 ///
 /// Construction is the trust boundary for transport input: the URL must be
@@ -618,7 +624,7 @@ pub(crate) fn build_client(options: &DownloadOptions) -> reqwest::Client {
 /// compiler everywhere, unlike the default aws-lc-rs provider which needs
 /// CMake/NASM on some hosts. Installation is idempotent; a provider already
 /// installed by another component is left in place.
-fn ensure_rustls_crypto_provider() {
+pub(crate) fn ensure_rustls_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 

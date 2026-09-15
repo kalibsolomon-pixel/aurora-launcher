@@ -40,6 +40,12 @@ impl ManagedPaths {
         self.launcher_dir().join("instances.json")
     }
 
+    /// Non-secret account summaries and the account selection. The matching
+    /// secret lives in the OS-backed credential store, never in this file.
+    pub fn accounts_file(&self) -> PathBuf {
+        self.launcher_dir().join("accounts.json")
+    }
+
     /// Re-downloadable metadata and temporary artifacts.
     pub fn cache_dir(&self) -> PathBuf {
         self.data_root.join("cache")
@@ -214,6 +220,10 @@ mod tests {
         assert_eq!(
             managed.instance_registry_file(),
             managed.launcher_dir().join("instances.json")
+        );
+        assert_eq!(
+            managed.accounts_file(),
+            managed.launcher_dir().join("accounts.json")
         );
     }
 

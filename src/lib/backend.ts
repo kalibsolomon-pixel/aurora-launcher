@@ -485,3 +485,124 @@ export async function ensureInstanceRuntime(instanceId: string): Promise<Runtime
     );
   }
 }
+
+export type AccountStatus = "signedIn" | "reauthenticationRequired";
+
+/** One non-secret account summary; tokens never cross this boundary. */
+export interface AccountSummary {
+  accountId: string;
+  minecraftName: string;
+  status: AccountStatus;
+}
+
+export interface AccountsState {
+  accounts: AccountSummary[];
+  selectedAccountId: string | null;
+}
+
+/** Coarse sign-in progress phase; never carries credentials. */
+export interface AuthProgressEvent {
+  phase:
+    | "waitingForMicrosoft"
+    | "exchangingMicrosoftToken"
+    | "authenticatingWithXbox"
+    | "authorizingXsts"
+    | "authenticatingMinecraft"
+    | "checkingEntitlement"
+    | "fetchingProfile"
+    | "savingAccount"
+    | "restoringSession";
+}
+
+export async function getAccounts(): Promise<AccountsState> {
+  try {
+    return await invoke<AccountsState>("get_accounts");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The account list could not be loaded.",
+    );
+  }
+}
+
+export async function beginMicrosoftLogin(): Promise<AccountSummary> {
+  try {
+    return await invoke<AccountSummary>("begin_microsoft_login");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "Microsoft sign-in could not be started.",
+    );
+  }
+}
+
+export async function cancelMicrosoftLogin(): Promise<void> {
+  try {
+    await invoke<void>("cancel_microsoft_login");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The sign-in could not be cancelled.",
+    );
+  }
+}
+
+export async function selectAccount(accountId: string): Promise<void> {
+  try {
+    await invoke<void>("select_account", { request: { accountId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The account could not be selected.",
+    );
+  }
+}
+
+export async function removeAccount(accountId: string): Promise<void> {
+  try {
+    await invoke<void>("remove_account", { request: { accountId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The account could not be removed.",
+    );
+  }
+}
+
+/** Outcome of an on-demand session restoration; the token stays in Rust. */
+export interface AccountSession {
+  accountId: string;
+  minecraftName: string;
+  status: "ready";
+}
+
+export async function refreshAccountSession(accountId: string): Promise<AccountSession> {
+  try {
+    return await invoke<AccountSession>("refresh_account_session", {
+      request: { accountId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The account session could not be restored.",
+    );
+  }
+}

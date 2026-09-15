@@ -15,7 +15,11 @@ use std::time::Duration;
 /// A scripted request received by a [`TestServer`].
 #[derive(Debug, Clone)]
 pub struct TestRequest {
+    /// The request method (`GET`, `POST`, …).
+    pub method: String,
     pub path: String,
+    /// The request body as sent (`Content-Length` framing only).
+    pub body: Vec<u8>,
     /// `http://127.0.0.1:<port>` for the server handling this request.
     pub base_url: String,
 }
@@ -52,6 +56,12 @@ impl TestResponse {
             status,
             ..Self::ok(&[])
         }
+    }
+
+    /// Overrides the status on any response builder.
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = status;
+        self
     }
 
     /// `302 Found` redirecting to an absolute URL.
@@ -158,14 +168,17 @@ fn serve_connection(
     write_response(&mut stream, &response)
 }
 
-/// Reads one request head. Only the request line is interpreted; test
-/// downloads never send bodies.
+/// Reads one request head plus its body when `Content-Length` declares one.
+///
+/// Only the request line and the `Content-Length` header are interpreted;
+/// body-receiving requests (authentication token exchanges) work alongside
+/// bodyless downloads.
 fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<TestRequest> {
     let base_url = format!("http://{}", stream.local_addr()?.to_string());
 
     let mut buffer = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
-    loop {
+    let head_end = loop {
         let read = stream.read(&mut chunk)?;
         if read == 0 {
             return Err(std::io::Error::new(
@@ -174,8 +187,8 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<TestRequest
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
         }
         if buffer.len() > 64 * 1024 {
             return Err(std::io::Error::new(
@@ -183,14 +196,41 @@ fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<TestRequest
                 "request head too large",
             ));
         }
-    }
+    };
 
-    let head = String::from_utf8_lossy(&buffer);
+    let head = String::from_utf8_lossy(&buffer[..head_end]);
     let mut parts = head.split_whitespace();
-    let _method = parts.next().unwrap_or_default();
+    let method = parts.next().unwrap_or_default().to_owned();
     let path = parts.next().unwrap_or_default().to_owned();
 
-    Ok(TestRequest { path, base_url })
+    let content_length = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    });
+    let content_length = content_length
+        .map(|length| length.min(1024 * 1024))
+        .unwrap_or(0);
+
+    let mut body = buffer[head_end..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    body.truncate(content_length);
+
+    Ok(TestRequest {
+        method,
+        path,
+        body,
+        base_url,
+    })
 }
 
 fn write_response(
@@ -200,8 +240,12 @@ fn write_response(
     let reason = match response.status {
         200 => "OK",
         302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
-        _ => "Response",
+        429 => "Too Many Requests",
+        500 | _ => "Response",
     };
 
     let mut head = format!("HTTP/1.1 {} {}\r\n", response.status, reason);

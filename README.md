@@ -4,9 +4,13 @@ Aurora Launcher is a standalone launcher for the Aurora client mod for Minecraft
 
 ## Development status
 
-This repository contains the launcher foundation through Phase 7: Tauri/Svelte desktop boundaries and versioned state; verified SHA-256, official SHA-1, and transport-observed artifact stores; official Minecraft and Fabric planning; safe staged game installation; persistent isolated Aurora instances; and launcher-managed Java runtime provisioning. An exact Minecraft Java component and major version now resolves through Mojang's official per-platform runtime feed into a normalized plan, installs once in shared launcher storage through the existing SHA-1 cache, commits versioned state last, validates every managed entry, and runs a bounded `java -version` compatibility check. Aurora releases still come from a checked-in development fixture because no production release infrastructure exists.
+This repository contains the launcher foundation through Phase 8: Tauri/Svelte desktop boundaries and versioned state; verified SHA-256, official SHA-1, and transport-observed artifact stores; official Minecraft and Fabric planning; safe staged game installation; persistent isolated Aurora instances; launcher-managed Java runtime provisioning; and Microsoft → Xbox → Minecraft authentication. Signing in uses the system browser with public-client OAuth (authorization code + PKCE), verifies Minecraft ownership and profile, stores only the Microsoft refresh credential in the operating system's credential store (the real Windows Credential Manager; Linux/macOS persistence is not implemented yet and fails deliberately), restores sessions with refresh-token rotation, and supports explicit sign-out. Accounts are separate from instances; Minecraft launching is deliberately not implemented.
 
-Instances can be created, selected, renamed, retried, and completely validated. The selected content-ready instance can install, validate, and reuse its official managed Java runtime. Minecraft launching, Microsoft/Minecraft authentication, custom/system Java selection, instance deletion, Aurora updates, and real Aurora release distribution are **not implemented**.
+**Aurora has no Microsoft application registration yet.** Until a real client ID is provided to the build (`AURORA_MICROSOFT_CLIENT_ID`) and Microsoft approves the registration for Minecraft Services, the Sign in button reports `auth_configuration_missing` and live end-to-end login remains unverified; everything else is covered by deterministic offline tests.
+
+Aurora releases still come from a checked-in development fixture because no production release infrastructure exists.
+
+Instances can be created, selected, renamed, retried, and completely validated. The selected content-ready instance can install, validate, and reuse its official managed Java runtime. Minecraft launching, custom/system Java selection, instance deletion, Aurora updates, and real Aurora release distribution are **not implemented**.
 
 ## Prerequisites
 

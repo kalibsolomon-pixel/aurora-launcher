@@ -3,25 +3,35 @@
   import { listen } from "@tauri-apps/api/event";
   import {
     acquireArtifact,
+    beginMicrosoftLogin,
+    cancelMicrosoftLogin,
     createInstance,
     ensureInstanceRuntime,
     getApplicationStatus,
+    getAccounts,
     getInstanceRuntimeStatus,
     getLauncherState,
     installGame,
     listAuroraReleases,
     planFabricInstall,
     planMinecraftInstall,
+    refreshAccountSession,
+    removeAccount,
     renameInstance,
     retryInstanceInstall,
+    selectAccount,
     selectInstance,
     validateInstance,
     validateInstalledGame,
     LauncherBackendError,
     type AcquiredArtifact,
+    type AccountSession,
+    type AccountSummary,
+    type AccountsState,
     type ApplicationStatus,
     type AuroraReleaseSummary,
     type AuroraChannel,
+    type AuthProgressEvent,
     type FabricPlanSummary,
     type InstalledGameSummary,
     type InstalledGameValidation,
@@ -97,6 +107,17 @@
   let runtimeProgress = $state<RuntimeProgressEvent | null>(null);
   let runtimeError = $state<LauncherBackendError | null>(null);
 
+  // Production account surface (Phase 8). All state comes from Rust; the
+  // UI never sees tokens.
+  let accountsState = $state<AccountsState | null>(null);
+  let accountsError = $state<LauncherBackendError | null>(null);
+  let signInBusy = $state(false);
+  let signInProgress = $state<AuthProgressEvent | null>(null);
+  let signInError = $state<LauncherBackendError | null>(null);
+  let accountBusy = $state<string | null>(null);
+  let accountError = $state<LauncherBackendError | null>(null);
+  let accountSessions = $state<Record<string, AccountSession>>({});
+
   onMount(async () => {
     try {
       status = await getApplicationStatus();
@@ -133,6 +154,15 @@
           ? cause
           : new LauncherBackendError("unknown_error", "The Aurora release list failed.");
     }
+
+    try {
+      accountsState = await getAccounts();
+    } catch (cause: unknown) {
+      accountsError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The account list could not be loaded.");
+    }
   });
 
   onMount(() => {
@@ -140,6 +170,7 @@
     let unsubscribeInstall: (() => void) | null = null;
     let unsubscribeInstance: (() => void) | null = null;
     let unsubscribeRuntime: (() => void) | null = null;
+    let unsubscribeAuth: (() => void) | null = null;
     listen<InstallProgressEvent>("install-progress", (event) => {
       installProgress = event.payload;
     }).then((stop) => {
@@ -155,10 +186,16 @@
     }).then((stop) => {
       unsubscribeRuntime = stop;
     });
+    listen<AuthProgressEvent>("auth-progress", (event) => {
+      signInProgress = event.payload;
+    }).then((stop) => {
+      unsubscribeAuth = stop;
+    });
     return () => {
       unsubscribeInstall?.();
       unsubscribeInstance?.();
       unsubscribeRuntime?.();
+      unsubscribeAuth?.();
     };
   });
 
@@ -295,6 +332,94 @@
           : new LauncherBackendError("unknown_error", "Managed Java installation failed.");
     } finally {
       runtimeBusy = false;
+    }
+  }
+
+  async function refreshAccounts() {
+    try {
+      accountsState = await getAccounts();
+    } catch {
+      // Account refresh is best-effort after mutations; load errors surface
+      // through the dedicated account card.
+    }
+  }
+
+  async function runSignIn(event: SubmitEvent) {
+    event.preventDefault();
+    signInBusy = true;
+    signInProgress = null;
+    signInError = null;
+    try {
+      await beginMicrosoftLogin();
+      await refreshAccounts();
+    } catch (cause: unknown) {
+      signInError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Microsoft sign-in failed.");
+      await refreshAccounts();
+    } finally {
+      signInBusy = false;
+      signInProgress = null;
+    }
+  }
+
+  async function runCancelSignIn(event: SubmitEvent) {
+    event.preventDefault();
+    try {
+      await cancelMicrosoftLogin();
+    } catch {
+      // Cancellation is best-effort; the flow itself reports its outcome.
+    }
+  }
+
+  async function runSelectAccount(id: string) {
+    accountBusy = id;
+    accountError = null;
+    try {
+      await selectAccount(id);
+      await refreshAccounts();
+    } catch (cause: unknown) {
+      accountError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The account selection failed.");
+    } finally {
+      accountBusy = null;
+    }
+  }
+
+  async function runRemoveAccount(id: string) {
+    accountBusy = id;
+    accountError = null;
+    try {
+      await removeAccount(id);
+      delete accountSessions[id];
+      await refreshAccounts();
+    } catch (cause: unknown) {
+      accountError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Removing the account failed.");
+    } finally {
+      accountBusy = null;
+    }
+  }
+
+  async function runRefreshAccountSession(id: string) {
+    accountBusy = id;
+    accountError = null;
+    try {
+      accountSessions[id] = await refreshAccountSession(id);
+      await refreshAccounts();
+    } catch (cause: unknown) {
+      accountError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "Restoring the account session failed.");
+      await refreshAccounts();
+    } finally {
+      accountBusy = null;
     }
   }
 
@@ -450,7 +575,7 @@
           <dd>{status.managedDataRoot}</dd>
         </div>
       </dl>
-      <p class="footnote">No Minecraft installation or account data is accessed in this phase.</p>
+      <p class="footnote">No Minecraft installation data is accessed in this phase.</p>
     {:else if statusError}
       <div class="error-message" role="alert">
         <p>{statusError.message}</p>
@@ -497,7 +622,7 @@
       </dl>
       <p class="footnote">
         Instance management lives in the panel below. Installation is supported;
-        launching and accounts are not implemented yet. Managed Java is shown for the selected instance.
+        launching is not implemented yet. Managed Java is shown for the selected instance.
       </p>
     {:else if stateError}
       <div class="error-message" role="alert">
@@ -759,8 +884,135 @@
     <p class="footnote">
       Instances are complete, isolated installations — game, Fabric, and the Aurora client
       artifact — validated before they are reported content-ready. The selected instance can
-      acquire and validate its official shared Mojang Java runtime independently. Accounts,
-      game launching, and instance deletion are deliberately not implemented.
+      acquire and validate its official shared Mojang Java runtime independently. Game
+      launching and instance deletion are deliberately not implemented.
+    </p>
+  </section>
+
+  <section class="status-card" aria-labelledby="accounts-title" aria-live="polite">
+    <div class="status-heading">
+      <div>
+        <p class="eyebrow">Microsoft &amp; Minecraft authentication</p>
+        <h2 id="accounts-title">Account</h2>
+      </div>
+
+      {#if signInBusy}
+        <span class="badge loading"><span aria-hidden="true"></span
+          >{signInProgress ? signInProgress.phase : "Waiting for Microsoft"}</span
+        >
+      {:else if accountsState && accountsState.accounts.length > 0}
+        <span class="badge ready"><span aria-hidden="true"></span>Signed in</span>
+      {:else if accountsError}
+        <span class="badge error"><span aria-hidden="true"></span>Unavailable</span>
+      {:else}
+        <span class="badge loading"><span aria-hidden="true"></span>Not signed in</span>
+      {/if}
+    </div>
+
+    {#if accountsError}
+      <div class="error-message" role="alert">
+        <p>{accountsError.message}</p>
+        <code>{accountsError.code}</code>
+      </div>
+    {/if}
+
+    {#if signInBusy}
+      <dl>
+        <div>
+          <dt>Sign-in</dt>
+          <dd>
+            Complete the Microsoft sign-in in your browser, then return here.
+            {#if signInProgress}Current step: {signInProgress.phase}{/if}
+          </dd>
+        </div>
+      </dl>
+      <form class="acquire-form" onsubmit={runCancelSignIn}>
+        <button type="submit">Cancel sign-in</button>
+      </form>
+    {:else}
+      <form class="acquire-form" onsubmit={runSignIn}>
+        <button type="submit" disabled={accountsState === null}>
+          {accountsState && accountsState.accounts.length > 0
+            ? "Add another account"
+            : "Sign in with Microsoft"}
+        </button>
+      </form>
+    {/if}
+
+    {#if signInError}
+      <div class="error-message" role="alert">
+        <p>{signInError.message}</p>
+        <code>{signInError.code}</code>
+      </div>
+    {/if}
+
+    {#if accountError}
+      <div class="error-message" role="alert">
+        <p>{accountError.message}</p>
+        <code>{accountError.code}</code>
+      </div>
+    {/if}
+
+    {#if accountsState && accountsState.accounts.length === 0 && !signInBusy}
+      <p class="footnote">Not signed in.</p>
+    {/if}
+
+    {#if accountsState}
+      {#each accountsState.accounts as account (account.accountId)}
+      <div class="instance-row">
+        <div class="instance-main">
+          <div class="instance-title">
+            <strong>{account.minecraftName}</strong>
+            {#if accountsState.selectedAccountId === account.accountId}
+              <span class="badge ready"><span aria-hidden="true"></span>Selected</span>
+            {/if}
+            {#if account.status === "reauthenticationRequired"}
+              <span class="badge error"><span aria-hidden="true"></span>Sign-in required</span>
+            {:else}
+              <span class="badge ready"><span aria-hidden="true"></span>Signed in</span>
+            {/if}
+          </div>
+          <div class="instance-meta instance-id">id: {account.accountId}</div>
+          {#if accountSessions[account.accountId]}
+            <div class="instance-meta validation-line">
+              Session: ready
+            </div>
+          {/if}
+        </div>
+
+        <div class="instance-actions">
+          {#if accountsState.selectedAccountId !== account.accountId}
+            <button
+              type="button"
+              onclick={() => runSelectAccount(account.accountId)}
+              disabled={accountBusy === account.accountId || signInBusy}
+            >
+              Select
+            </button>
+          {/if}
+          <button
+            type="button"
+            onclick={() => runRefreshAccountSession(account.accountId)}
+            disabled={accountBusy === account.accountId || signInBusy}
+          >
+            Check session
+          </button>
+          <button
+            type="button"
+            onclick={() => runRemoveAccount(account.accountId)}
+            disabled={accountBusy === account.accountId || signInBusy}
+          >
+            Remove account
+          </button>
+        </div>
+      </div>
+      {/each}
+    {/if}
+
+    <p class="footnote">
+      Sign-in uses your system browser, and only the Microsoft refresh credential is stored —
+      in the operating system's credential store, never in plain files. Accounts are separate
+      from instances; Minecraft launching is not implemented yet.
     </p>
   </section>
 
