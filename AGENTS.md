@@ -43,6 +43,16 @@ npm run tauri build
 - Validate path containment before destructive operations. Distinguish managed paths from user-selected external paths.
 - Do not casually change the Tauri identifier (`com.aurora.launcher`), managed-data semantics, command DTOs, error codes, or isolation model; they become compatibility contracts.
 
+## Minecraft metadata and install planning
+
+- Minecraft version resolution comes from first-party official Mojang metadata (the pinned piston-meta manifest endpoint and the URLs it provides), never third-party launcher APIs, scraped websites, or frontend-supplied URLs.
+- Installers consume the normalized `MinecraftInstallPlan`; they never traverse or reparse raw Mojang JSON. External metadata DTOs stay inside `minecraft::metadata` and never become the launcher's domain model.
+- Do not bypass the trusted artifact layer when acquiring product artifacts, and do not distort it for metadata: the version manifest is bootstrap discovery metadata (HTTPS plus validation, never a "verified artifact"), while version documents are verified against their manifest-provided SHA-1. HTTPS success alone is never treated as artifact verification.
+- Official Mojang digests are SHA-1 and are represented as such; never relabel one as SHA-256, invent a digest, or discard an available official hash. The verified cache remains SHA-256-addressed.
+- Historical metadata shapes (`inheritsFrom`, `minecraftArguments`, `natives`/`classifiers`/`extract`, `old_beta`/`old_alpha`) are rejected deliberately as unsupported; do not add speculative historical compatibility.
+- Launch placeholders (`${auth_player_name}` and friends) stay semantically unresolved; never substitute fake account, session, or token values, and never shell-escape arguments.
+- Rule evaluation stays pure, deterministic, and vocabulary-strict in `minecraft::rules`; do not scatter platform checks across modules or assume the development machine's platform.
+
 ## Verification and Git
 
 Run checks proportional to the change. Native-boundary or startup changes require type checking, Rust format/check/test, a production build, and a real application boot when the host permits it. Keep documentation aligned with implemented behavior. Preserve user changes, inspect `git status`, make focused commits, and never push unless explicitly requested.

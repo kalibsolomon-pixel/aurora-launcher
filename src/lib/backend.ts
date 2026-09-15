@@ -116,3 +116,40 @@ export async function acquireArtifact(
     );
   }
 }
+
+export interface PlanMinecraftInstallRequest {
+  version: string;
+}
+
+/** Concise summary of a resolved Minecraft installation plan. */
+export interface MinecraftPlanSummary {
+  minecraftVersion: string;
+  versionType: string;
+  javaComponent: string;
+  javaMajorVersion: number;
+  clientSha1: string;
+  clientSizeBytes: number;
+  assetIndexId: string;
+  libraryCount: number;
+  nativeLibraryCount: number;
+  mainClass: string;
+  gameArgumentCount: number;
+  jvmArgumentCount: number;
+}
+
+export async function planMinecraftInstall(
+  request: PlanMinecraftInstallRequest,
+): Promise<MinecraftPlanSummary> {
+  try {
+    return await invoke<MinecraftPlanSummary>("plan_minecraft_install", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The Minecraft installation plan could not be resolved.",
+    );
+  }
+}

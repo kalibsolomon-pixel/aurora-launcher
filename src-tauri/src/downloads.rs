@@ -174,7 +174,7 @@ enum HostPolicy {
 }
 
 /// Whether the URL host is an explicit loopback address.
-fn is_loopback_host(url: &Url) -> bool {
+pub(crate) fn is_loopback_host(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         Some(url::Host::Ipv4(address)) => address == std::net::Ipv4Addr::LOCALHOST,
@@ -303,7 +303,12 @@ async fn stream_response(
     Ok(())
 }
 
-fn build_client(options: &DownloadOptions) -> reqwest::Client {
+/// Builds the launcher's HTTP client with the documented transport policy
+/// (user agent, timeouts, redirect rules, rustls provider).
+///
+/// Shared by the artifact transport and the Minecraft metadata fetch so every
+/// outbound request obeys one policy; it confers no trust by itself.
+pub(crate) fn build_client(options: &DownloadOptions) -> reqwest::Client {
     ensure_rustls_crypto_provider();
 
     reqwest::Client::builder()

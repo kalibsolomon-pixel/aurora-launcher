@@ -5,6 +5,7 @@ pub mod distribution;
 pub mod downloads;
 pub mod instances;
 pub mod integrity;
+pub mod minecraft;
 pub mod paths;
 
 #[cfg(test)]
@@ -18,7 +19,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             application::get_application_status,
             application::get_launcher_state,
-            application::acquire_artifact
+            application::acquire_artifact,
+            application::plan_minecraft_install
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");

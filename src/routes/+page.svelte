@@ -4,10 +4,12 @@
     acquireArtifact,
     getApplicationStatus,
     getLauncherState,
+    planMinecraftInstall,
     LauncherBackendError,
     type AcquiredArtifact,
     type ApplicationStatus,
     type LauncherState,
+    type MinecraftPlanSummary,
   } from "$lib/backend";
 
   let status = $state<ApplicationStatus | null>(null);
@@ -24,6 +26,13 @@
   let acquisitionBusy = $state(false);
   let acquisition = $state<AcquiredArtifact | null>(null);
   let acquisitionError = $state<LauncherBackendError | null>(null);
+
+  // Development proof of the Minecraft metadata-resolution layer; stripped
+  // from production builds.
+  let minecraftVersion = $state("");
+  let planningBusy = $state(false);
+  let planSummary = $state<MinecraftPlanSummary | null>(null);
+  let planningError = $state<LauncherBackendError | null>(null);
 
   onMount(async () => {
     try {
@@ -65,6 +74,24 @@
           : new LauncherBackendError("unknown_error", "The artifact acquisition failed.");
     } finally {
       acquisitionBusy = false;
+    }
+  }
+
+  async function runPlanning(event: SubmitEvent) {
+    event.preventDefault();
+    planningBusy = true;
+    planSummary = null;
+    planningError = null;
+
+    try {
+      planSummary = await planMinecraftInstall({ version: minecraftVersion.trim() });
+    } catch (cause: unknown) {
+      planningError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The installation plan failed.");
+    } finally {
+      planningBusy = false;
     }
   }
 </script>
@@ -258,6 +285,88 @@
       <p class="footnote">
         Development-only proof of the native download, verification, and promotion
         pipeline. Installation features are not implemented in this phase.
+      </p>
+    </section>
+
+    <section class="status-card" aria-labelledby="plan-title" aria-live="polite">
+      <div class="status-heading">
+        <div>
+          <p class="eyebrow">Native resolution proof</p>
+          <h2 id="plan-title">Minecraft install planning</h2>
+        </div>
+
+        {#if planningBusy}
+          <span class="badge loading"><span aria-hidden="true"></span>Resolving</span>
+        {:else if planSummary}
+          <span class="badge ready"><span aria-hidden="true"></span>Planned</span>
+        {:else if planningError}
+          <span class="badge error"><span aria-hidden="true"></span>Rejected</span>
+        {/if}
+      </div>
+
+      <form class="acquire-form" onsubmit={runPlanning}>
+        <label>
+          <span>Exact Minecraft version</span>
+          <input
+            type="text"
+            bind:value={minecraftVersion}
+            placeholder="e.g. 1.21.11 or 26.2"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <button type="submit" disabled={planningBusy}>
+          {planningBusy ? "Resolving…" : "Resolve installation plan"}
+        </button>
+      </form>
+
+      {#if planSummary}
+        <dl>
+          <div>
+            <dt>Minecraft</dt>
+            <dd>{planSummary.minecraftVersion} ({planSummary.versionType})</dd>
+          </div>
+          <div>
+            <dt>Java</dt>
+            <dd>{planSummary.javaComponent} (major {planSummary.javaMajorVersion})</dd>
+          </div>
+          <div>
+            <dt>Libraries</dt>
+            <dd>
+              {planSummary.libraryCount} applicable · {planSummary.nativeLibraryCount} native
+              artifacts
+            </dd>
+          </div>
+          <div>
+            <dt>Asset index</dt>
+            <dd>resolved ({planSummary.assetIndexId})</dd>
+          </div>
+          <div>
+            <dt>Client</dt>
+            <dd>resolved ({planSummary.clientSizeBytes.toLocaleString()} bytes)</dd>
+          </div>
+          <div>
+            <dt>Main class</dt>
+            <dd>{planSummary.mainClass}</dd>
+          </div>
+          <div>
+            <dt>Launch arguments</dt>
+            <dd>
+              {planSummary.gameArgumentCount} game · {planSummary.jvmArgumentCount} JVM
+            </dd>
+          </div>
+        </dl>
+      {:else if planningError}
+        <div class="error-message" role="alert">
+          <p>{planningError.message}</p>
+          <code>{planningError.code}</code>
+        </div>
+      {/if}
+
+      <p class="footnote">
+        Development-only proof of the native metadata-resolution layer: official
+        discovery, a SHA-1-verified version document, and platform-aware planning.
+        Nothing is installed and no game artifact is downloaded.
       </p>
     </section>
   {/if}

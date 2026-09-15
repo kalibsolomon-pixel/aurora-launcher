@@ -7,6 +7,12 @@ use crate::config::{ConfigError, ConfigLoad};
 use crate::distribution::ReleaseChannel;
 use crate::downloads::{ArtifactSource, DownloadError, InvalidArtifactSource};
 use crate::instances::{InstanceRecord, InstanceRegistry, InstanceRegistryError};
+use crate::minecraft::metadata::{
+    InvalidMinecraftVersion, MetadataEndpoints, MetadataError, MinecraftVersionId,
+};
+use crate::minecraft::plan::PlanError;
+use crate::minecraft::rules::UnsupportedPlatform;
+use crate::minecraft::{MinecraftResolutionError, resolve_install_plan};
 use crate::paths::ManagedPaths;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -147,6 +153,41 @@ impl From<InstanceRegistryError> for CommandError {
 impl From<InvalidArtifactSource> for CommandError {
     fn from(error: InvalidArtifactSource) -> Self {
         Self::new("artifact_source_invalid", error.to_string())
+    }
+}
+
+impl From<InvalidMinecraftVersion> for CommandError {
+    fn from(error: InvalidMinecraftVersion) -> Self {
+        Self::new("minecraft_version_invalid", error.to_string())
+    }
+}
+
+impl From<UnsupportedPlatform> for CommandError {
+    fn from(error: UnsupportedPlatform) -> Self {
+        Self::new("minecraft_platform_unsupported", error.to_string())
+    }
+}
+
+impl From<MinecraftResolutionError> for CommandError {
+    fn from(error: MinecraftResolutionError) -> Self {
+        let code = match &error {
+            MinecraftResolutionError::Metadata(metadata) => match metadata {
+                MetadataError::VersionNotFound { .. } => "minecraft_version_not_found",
+                MetadataError::Network(_) | MetadataError::ResponseTooLarge { .. } => {
+                    "minecraft_metadata_network_failure"
+                }
+                MetadataError::ManifestInvalid { .. } => "minecraft_manifest_invalid",
+                MetadataError::DocumentInvalid { .. } => "minecraft_version_metadata_invalid",
+                MetadataError::Integrity { .. } => "minecraft_metadata_integrity_failure",
+                MetadataError::Unsupported(_) => "minecraft_version_unsupported",
+            },
+            MinecraftResolutionError::Planning(planning) => match planning {
+                PlanError::LibraryInvalid { .. } => "minecraft_library_invalid",
+                PlanError::ArtifactInvalid { .. } => "minecraft_artifact_invalid",
+                PlanError::Unsupported { .. } => "minecraft_version_unsupported",
+            },
+        };
+        Self::new(code, error.to_string())
     }
 }
 
@@ -296,6 +337,84 @@ pub async fn acquire_artifact(
     })
 }
 
+/// Typed request accepted by the Minecraft planning command.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanMinecraftInstallRequest {
+    version: String,
+}
+
+/// A concise summary of one resolved Minecraft installation plan.
+///
+/// The full normalized plan stays native; the proof UI only needs counts and
+/// key requirements, never hundreds of library rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftPlanSummary {
+    minecraft_version: String,
+    version_type: String,
+    java_component: String,
+    java_major_version: u32,
+    client_sha1: String,
+    client_size_bytes: u64,
+    asset_index_id: String,
+    library_count: usize,
+    native_library_count: usize,
+    main_class: String,
+    game_argument_count: usize,
+    jvm_argument_count: usize,
+}
+
+/// Resolves one exact Minecraft version into a normalized install plan for
+/// the current platform and returns a concise summary.
+///
+/// This is the development-facing proof of the Phase 3 metadata-resolution
+/// layer: it performs real discovery, SHA-1-verified version-document
+/// fetching, parsing, and platform-aware planning in Rust, and installs
+/// nothing — no client jar, library, native, asset, or runtime is downloaded.
+#[tauri::command]
+pub async fn plan_minecraft_install(
+    request: PlanMinecraftInstallRequest,
+) -> Result<MinecraftPlanSummary, CommandError> {
+    let version = MinecraftVersionId::new(request.version.trim())?;
+    let platform = crate::minecraft::rules::PlatformProfile::current()?;
+
+    let plan = resolve_install_plan(
+        &MetadataEndpoints::official(),
+        &version,
+        platform,
+        &crate::downloads::DownloadOptions::default(),
+    )
+    .await?;
+
+    eprintln!(
+        "[aurora-launcher] planned Minecraft {} for {}-{}: {} libraries ({} native), Java {} ({}), asset index {}",
+        plan.minecraft_version(),
+        platform.os(),
+        platform.arch(),
+        plan.libraries().len(),
+        plan.native_library_count(),
+        plan.java().component(),
+        plan.java().major_version(),
+        plan.asset_index().id(),
+    );
+
+    Ok(MinecraftPlanSummary {
+        minecraft_version: plan.minecraft_version().to_owned(),
+        version_type: plan.version_type().to_string(),
+        java_component: plan.java().component().to_owned(),
+        java_major_version: plan.java().major_version(),
+        client_sha1: plan.client().sha1().as_hex(),
+        client_size_bytes: plan.client().size_bytes(),
+        asset_index_id: plan.asset_index().id().to_owned(),
+        library_count: plan.libraries().len(),
+        native_library_count: plan.native_library_count(),
+        main_class: plan.launch().main_class().to_owned(),
+        game_argument_count: plan.launch().game_arguments().len(),
+        jvm_argument_count: plan.launch().jvm_arguments().len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +483,93 @@ mod tests {
         );
         assert_eq!(insecure.code, "artifact_source_invalid");
         assert!(insecure.message.contains("HTTPS"));
+    }
+
+    #[test]
+    fn invalid_minecraft_versions_map_to_a_stable_machine_code() {
+        let error = CommandError::from(
+            MinecraftVersionId::new("../evil").expect_err("traversal ids are invalid"),
+        );
+        assert_eq!(error.code, "minecraft_version_invalid");
+    }
+
+    #[test]
+    fn minecraft_resolution_errors_map_to_stable_machine_codes() {
+        let cases: Vec<(MinecraftResolutionError, &str)> = vec![
+            (
+                MinecraftResolutionError::Metadata(MetadataError::VersionNotFound {
+                    requested: "9.9.9".to_owned(),
+                }),
+                "minecraft_version_not_found",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::ManifestInvalid {
+                    reason: "broken".to_owned(),
+                }),
+                "minecraft_manifest_invalid",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::DocumentInvalid {
+                    reason: "broken".to_owned(),
+                }),
+                "minecraft_version_metadata_invalid",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::Integrity {
+                    context: "Minecraft version document '26.2'".to_owned(),
+                    expected: "a".repeat(40),
+                    actual: "b".repeat(40),
+                }),
+                "minecraft_metadata_integrity_failure",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::Network(
+                    DownloadError::HttpStatus { status: 503 },
+                )),
+                "minecraft_metadata_network_failure",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::ResponseTooLarge {
+                    limit_bytes: 8 * 1024 * 1024,
+                }),
+                "minecraft_metadata_network_failure",
+            ),
+            (
+                MinecraftResolutionError::Metadata(MetadataError::Unsupported(
+                    "historical".to_owned(),
+                )),
+                "minecraft_version_unsupported",
+            ),
+            (
+                MinecraftResolutionError::Planning(PlanError::LibraryInvalid {
+                    name: "broken".to_owned(),
+                    reason: "no artifact".to_owned(),
+                }),
+                "minecraft_library_invalid",
+            ),
+            (
+                MinecraftResolutionError::Planning(PlanError::ArtifactInvalid {
+                    source: "client".to_owned(),
+                    reason: "not HTTPS".to_owned(),
+                }),
+                "minecraft_artifact_invalid",
+            ),
+            (
+                MinecraftResolutionError::Planning(PlanError::Unsupported {
+                    reason: "feature-conditioned library".to_owned(),
+                }),
+                "minecraft_version_unsupported",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
     }
 
     #[test]

@@ -4,14 +4,23 @@
 //! verified artifact when its exact byte size (when expected) and its SHA-256
 //! digest match the values provided by trusted metadata. Hashing here is
 //! streaming, so artifacts are never buffered into memory for verification.
+//!
+//! SHA-1 exists here strictly as the digest algorithm of official Minecraft
+//! metadata (Mojang publishes SHA-1 values, not SHA-256). Aurora's own
+//! artifacts and the verified cache remain SHA-256-addressed; a SHA-1 value
+//! can never masquerade as a cache identity or an Aurora artifact digest.
 
 use std::fmt;
 use std::path::Path;
 
-use sha2::{Digest as _, Sha256};
+use sha1::{Digest as _, Sha1};
+use sha2::Sha256;
 
 /// The SHA-256 digest is represented as exactly 64 hexadecimal characters.
 pub const SHA256_HEX_LENGTH: usize = 64;
+
+/// The SHA-1 digest is represented as exactly 40 hexadecimal characters.
+pub const SHA1_HEX_LENGTH: usize = 40;
 
 /// Read/write chunk size used when streaming files for hashing.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -98,6 +107,95 @@ impl fmt::Display for InvalidDigest {
 }
 
 impl std::error::Error for InvalidDigest {}
+
+/// A canonical SHA-1 digest as published by official Minecraft metadata.
+///
+/// Like [`ArtifactDigest`], parsing accepts any hexadecimal casing and stores
+/// one canonical lowercase form, so comparisons are exact byte comparisons of
+/// canonical data. SHA-1 values represent official Mojang expectations only;
+/// they are weaker than SHA-256 and never become verified-cache identities.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha1Digest([u8; 20]);
+
+impl Sha1Digest {
+    /// Creates a digest from raw SHA-1 output.
+    pub fn from_sha1(raw: [u8; 20]) -> Self {
+        Self(raw)
+    }
+
+    /// Parses a hexadecimal SHA-1 digest. Both cases are accepted; the
+    /// canonical lowercase form is stored.
+    pub fn parse(hex: &str) -> Result<Self, InvalidSha1Digest> {
+        if hex.len() != SHA1_HEX_LENGTH {
+            return Err(InvalidSha1Digest::InvalidLength(hex.len()));
+        }
+
+        let mut raw = [0u8; 20];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_value(pair[0]).map_err(InvalidSha1Digest::InvalidCharacter)?;
+            let low = hex_value(pair[1]).map_err(InvalidSha1Digest::InvalidCharacter)?;
+            raw[index] = (high << 4) | low;
+        }
+
+        Ok(Self(raw))
+    }
+
+    /// Computes the SHA-1 digest of a small in-memory document.
+    ///
+    /// Official metadata documents are the only users: they are fetched in
+    /// memory and bounded in size, so a one-shot hash is appropriate here
+    /// (product artifacts keep using the streaming verifier).
+    pub fn compute(bytes: &[u8]) -> Self {
+        Self(Sha1::digest(bytes).into())
+    }
+
+    /// The canonical lowercase hexadecimal representation.
+    pub fn as_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hex = String::with_capacity(SHA1_HEX_LENGTH);
+        for byte in &self.0 {
+            hex.push(HEX[(byte >> 4) as usize] as char);
+            hex.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        hex
+    }
+}
+
+impl fmt::Display for Sha1Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.as_hex())
+    }
+}
+
+impl fmt::Debug for Sha1Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Sha1Digest({})", self.as_hex())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidSha1Digest {
+    InvalidLength(usize),
+    InvalidCharacter(u8),
+}
+
+impl fmt::Display for InvalidSha1Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength(length) => write!(
+                formatter,
+                "official metadata SHA-1 digest must be exactly {SHA1_HEX_LENGTH} hexadecimal characters, but is {length} characters"
+            ),
+            Self::InvalidCharacter(byte) => write!(
+                formatter,
+                "official metadata SHA-1 digest must contain only hexadecimal characters, but contains '{}'",
+                char::from(*byte).escape_default()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InvalidSha1Digest {}
 
 fn hex_value(byte: u8) -> Result<u8, u8> {
     match byte {
@@ -258,12 +356,39 @@ mod tests {
     use super::*;
 
     const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const ABC_SHA1: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
 
     #[test]
     fn digest_matches_the_reference_sha256_vector() {
         let digest = digest_of(b"abc");
 
         assert_eq!(digest.as_hex(), ABC_SHA256);
+    }
+
+    #[test]
+    fn sha1_digests_match_the_reference_vector_and_any_casing_parses_canonically() {
+        assert_eq!(Sha1Digest::compute(b"abc").as_hex(), ABC_SHA1);
+        assert_eq!(
+            Sha1Digest::parse(ABC_SHA1).unwrap(),
+            Sha1Digest::parse(&ABC_SHA1.to_uppercase()).unwrap()
+        );
+        assert_eq!(
+            Sha1Digest::parse(ABC_SHA1).unwrap().as_hex(),
+            ABC_SHA1,
+            "the canonical form is lowercase"
+        );
+    }
+
+    #[test]
+    fn sha1_digest_parsing_rejects_wrong_lengths_and_non_hexadecimal_characters() {
+        assert_eq!(
+            Sha1Digest::parse("abcd"),
+            Err(InvalidSha1Digest::InvalidLength(4))
+        );
+        assert_eq!(
+            Sha1Digest::parse(&"g".repeat(40)),
+            Err(InvalidSha1Digest::InvalidCharacter(b'g'))
+        );
     }
 
     #[test]

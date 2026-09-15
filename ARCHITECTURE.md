@@ -111,6 +111,93 @@ verified cache object <managed-root>/cache/artifacts/sha256/<digest>
 - Connection setup is bounded (15 s) and reads are bounded by an idle timeout (30 s between body chunks), which suits large artifacts on slow links without imposing an overall deadline. There is no retry policy in this phase; each acquisition is one attempt.
 - The HTTP client presents `aurora-launcher/<version>` as its user agent and honors system proxy configuration.
 
+## Implemented in Phase 3
+
+Phase 3 adds the Minecraft metadata-resolution layer: the launcher can resolve one exact Minecraft version from current official Mojang metadata into a deterministic, platform-aware `MinecraftInstallPlan`. It plans only — no client JAR, library, native, asset, runtime, Fabric, or Aurora artifact is downloaded, and nothing is installed, extracted, or executed.
+
+### Resolution pipeline
+
+```text
+official version manifest (HTTPS discovery, no prior digest)
+        ↓ exact version lookup (no fuzzy search, no aliases)
+version document (manifest-provided URL, verified against manifest-provided SHA-1)
+        ↓ parse + validate (external DTOs, `minecraft::metadata`)
+platform-aware rule evaluation (`minecraft::rules`) + normalization (`minecraft::plan`)
+        ↓
+MinecraftInstallPlan (Aurora-owned domain types)
+```
+
+The composition lives in `minecraft::resolve_install_plan`; the plan is pure data with no filesystem mutation. Future installers consume the normalized plan and never traverse raw Mojang JSON.
+
+### Metadata trust model
+
+Official metadata splits into two classes, and the launcher never blurs them:
+
+- **Bootstrap discovery metadata** — the version manifest (`https://piston-meta.mojang.com/mc/game/version_manifest_v2.json`). No prior digest exists before it is fetched; its trust is HTTPS transport plus deliberate parsing and validation. It is never called a verified artifact and never enters the content-addressed store.
+- **Hash-addressable documents** — each manifest entry carries its version document's official SHA-1, so the version document is fetched from the manifest-provided URL and verified against the manifest-provided SHA-1 before parsing. A mismatch is a hard integrity failure.
+
+This reuses Mojang's own integrity data instead of discarding it, without distorting the Phase 2 verified-artifact pipeline: metadata documents are small, buffered in memory under a hard 8 MiB cap, never staged, never promoted, and never persisted (fetch-on-demand only — no metadata cache, no SQLite, no background refresh). The metadata transport shares the artifact transport's client policy (user agent, timeouts, redirect rules, HTTPS-only production sources with loopback HTTP reserved for deterministic tests) but is a separate, narrower boundary because it must accept URLs without a prior SHA-256.
+
+### External DTOs versus normalized plan
+
+External Mojang shapes live in `minecraft::metadata` as DTOs covering only the fields resolution needs (manifest entries; the version document's identity, type, main class, Java requirement, asset index, client artifact, libraries, and modern `arguments`). Irrelevant fields (server jar, `logging`, timestamps, compliance levels, `minimumLauncherVersion`) are ignored. Legacy structures are parsed as detection sentinels and rejected deliberately: `inheritsFrom`, the `minecraftArguments` string, and library `natives`/`extract`/`classifiers` all fail as unsupported rather than being silently half-resolved.
+
+The normalized plan in `minecraft::plan` is Aurora's own domain model:
+
+```text
+MinecraftInstallPlan
+├── minecraft_version + version_type
+├── java: JavaRequirement { component, major_version }
+├── client: ArtifactRequirement { url, sha1, size_bytes }
+├── asset_index: AssetIndexRequirement { id, artifact, total_size }
+├── libraries: [PlannedLibrary { coordinate, path, kind, artifact }]
+└── launch: LaunchMetadata { main_class, game_arguments, jvm_arguments }
+```
+
+A future installer can execute installation from this alone: every artifact carries its official URL, SHA-1, and exact size; every library carries a parsed Maven coordinate (`group:artifact:version[:classifier]`), its repository-relative layout path, and whether it is a platform library or a native artifact.
+
+### Supported-version philosophy
+
+Aurora targets modern Minecraft. The supported metadata is what current release and snapshot documents use: the structured `arguments` object, self-contained documents (no inheritance), and per-platform classifier libraries. Historical shapes — `old_beta`/`old_alpha` types, `minecraftArguments`, version inheritance, native-classifier downloads — are rejected deliberately with a dedicated unsupported error. Nothing is hardcoded to a version scheme: the launcher resolves whatever exact id the manifest lists (verified live against both `1.21.11`, a December 2025 release, and `26.2`, a June 2026 release under Mojang's newer year-based scheme). One documented reality of the official manifest: historical entries exist with spaces in their ids (for example `1.14.2 Pre-Release 4`), so listing-level validation checks presence and length while strict charset validation applies to the version the launcher requests.
+
+### Artifact integrity representation
+
+Mojang publishes SHA-1 values; Aurora's own distribution uses SHA-256. The `integrity` module gained `Sha1Digest` — canonical 40-hex parsing and a one-shot compute for bounded metadata documents — as a narrow extension next to the existing SHA-256 types. A SHA-1 value never masquerades as SHA-256 and never becomes a verified-cache identity: the store remains SHA-256-addressed for product artifacts. In Phase 3, the only cryptographically verified transfer is the version document (SHA-1 against the manifest value); the client/library/asset-index digests are *recorded* in the plan as official expectations for the phase that acquires them.
+
+### Rule evaluation semantics
+
+Rules are evaluated in `minecraft::rules`, pure and isolated from I/O and UI, unit-tested across Windows/Linux/macOS:
+
+- Vocabulary: `os.name` ∈ {windows, linux, osx}, `os.arch` ∈ {x86, x86_64, arm64}, feature flags ∈ the six modern keys (`is_demo_user`, `has_custom_resolution`, `has_quick_plays_support`, `is_quick_play_singleplayer`, `is_quick_play_multiplayer`, `is_quick_play_realms`). Unknown vocabulary fails parsing deliberately.
+- Semantics: last matching rule wins; an item with no rule list applies to everything; a rule list where nothing matches excludes the item.
+- Planning evaluation resolves platform conditions now and keeps feature conditions unresolved (`IncludedIfFeatures`), so launch-time choices stay launch-time. A `disallow` rule carrying feature conditions cannot fire under the default no-features profile and does not decide planning.
+
+Verified against live official metadata: library rules use `os.name` only; JVM argument rules additionally use `os.arch` (`x86`); game argument rules use features only.
+
+### Libraries and natives
+
+Modern metadata has no `natives`/`classifiers`/`extract` structures (verified for `1.21.11` and `26.2`): native artifacts are ordinary libraries whose coordinates carry a `natives-*` classifier and whose rules select the platform. The plan preserves document order (the deterministic classpath order), parses coordinates deliberately (3–4 segments, conservative charset — not a general Maven client), requires the declared repository path to equal the coordinate-derived Maven layout, and validates paths as safe relative forward-slash `.jar` paths before any future installer could place files under them. Platform filtering selects the applicable subset per platform; the native count is surfaced explicitly.
+
+### Asset-index boundary
+
+The plan records the asset-index requirement: index id, officially described document artifact (URL, SHA-1, size), and declared total size. The index itself is not fetched or enumerated in Phase 3 — acquiring the index document and its asset objects belongs to installation execution.
+
+### Java requirement
+
+The plan records the required runtime component name and major version (for example `java-runtime-epsilon` / 25 for `26.2`, `java-runtime-delta` / 21 for `1.21.11`) for a future Java-management phase. No Java discovery, download, extraction, PATH modification, or executable selection exists.
+
+### Unresolved launch arguments
+
+Launch metadata keeps the main class and the ordered game/JVM argument groups for the planned platform with `${placeholder}` tokens verbatim (`${auth_player_name}`, `${auth_access_token}`, `${natives_directory}`, …). Placeholders are semantically unresolved: no fake tokens, no account/session substitution, no command-line construction, no shell escaping. Feature-conditioned arguments (demo mode, custom resolution, quick play) remain in the plan with their feature conditions attached instead of being dropped or forced.
+
+### Error model
+
+New stable command codes, mapped from structured internal errors and never exposing raw reqwest/Serde errors: `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, and `minecraft_platform_unsupported`. Malformed external metadata and network failure are distinct categories.
+
+### Development proof
+
+The `plan_minecraft_install` command accepts one exact version string and returns a concise summary (version, Java requirement, library and native counts, asset-index and client resolution, main class, argument counts). The full plan stays native; the dev-only UI section (stripped from production like the Phase 2 proof) renders only the summary and never implies installation.
+
 ## Frontend/native boundary
 
 Svelte is a presentation layer. Security-sensitive state and all future Minecraft/Aurora installation, authentication, download, integrity, Java/runtime, filesystem mutation, and process-launch logic stay behind native Rust commands or events. Commands should be narrow and use explicit request/response DTOs. Frontend code must not infer structured state by parsing strings.
@@ -119,18 +206,19 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 
 ## Current native modules
 
-- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`).
+- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`).
 - `paths`: validates and represents the platform-resolved application-local data root and derives managed locations without touching the filesystem.
 - `config`: the versioned launcher-configuration model and its atomic JSON persistence.
 - `instances`: validated instance identifiers, instance records, and the read-only instance-registry loader.
 - `distribution`: the typed, validated Aurora release-manifest data model (local representation only).
-- `downloads`: transport for trusted artifact acquisition (HTTPS enforcement, redirect policy, timeouts, streamed transfer with inline verification).
-- `integrity`: canonical SHA-256 digests and streaming size/hash verification.
+- `downloads`: transport for trusted artifact acquisition (HTTPS enforcement, redirect policy, timeouts, streamed transfer with inline verification); also builds the shared HTTP client the metadata transport reuses.
+- `integrity`: canonical SHA-256 digests, official-metadata SHA-1 digests, and streaming size/hash verification.
 - `cache`: the content-addressed verified-artifact store, untrusted staging, cache-hit validation, and promotion.
+- `minecraft`: official-metadata resolution and install planning — `metadata` (discovery, external DTOs, the SHA-1-verified fetch boundary), `rules` (pure platform/feature rule evaluation), `plan` (normalization into `MinecraftInstallPlan`), and the `resolve_install_plan` composition.
 
-Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Minecraft metadata/installations, Fabric, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, or empty module trees.
+Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Minecraft installation execution, Fabric, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, or empty module trees.
 
-Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `instances_invalid`, `instances_unsupported_schema`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, and `artifact_promotion_failure`. Codes are compatibility contracts; keep them stable and user messages readable.
+Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `instances_invalid`, `instances_unsupported_schema`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, and `minecraft_platform_unsupported`. Codes are compatibility contracts; keep them stable and user messages readable.
 
 ## Managed filesystem model
 
@@ -214,7 +302,8 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - `serde_json` (added in Phase 1) implements the human-inspectable JSON persistence of the launcher configuration and instance registry, and the release-manifest model's parse/validate tests. It is the focused Serde-native JSON crate; no other persistence dependency is justified.
 - `reqwest` (added in Phase 2, `rustls-no-provider` + `system-proxy` features, default features off) implements the artifact transport: a mature, focused HTTP client that already exists in Tauri's ecosystem. `Response::chunk()` streams the body without pulling a futures-combinator dependency; no archive, retry, queue, or download-manager crates are included.
 - `rustls` with the `ring` crypto provider (added in Phase 2) is installed as reqwest's process crypto provider. reqwest 0.13's default provider (aws-lc-rs) requires CMake/NASM tooling on some hosts; `ring` builds with a plain C compiler everywhere, which keeps launcher builds hermetic. Certificate verification uses the platform verifier reqwest selects by default (the OS certificate store).
-- `sha2` (added in Phase 2) is the RustCrypto SHA-256 implementation matching the release manifest's artifact digest representation. It was already resolved in the dependency tree; no other hash algorithm or multi-hash abstraction exists.
+- `sha2` (added in Phase 2) is the RustCrypto SHA-256 implementation matching the release manifest's artifact digest representation. It was already resolved in the dependency tree; no multi-hash abstraction exists.
+- `sha1` (added in Phase 3, RustCrypto) implements the digest algorithm official Mojang metadata actually publishes. It exists next to `sha2` so official SHA-1 expectations are represented and verified accurately — never faked as SHA-256 and never used for verified-cache identity. No other hash algorithm or generic digest framework was introduced.
 - `tokio` (added in Phase 2, `fs` + `io-util` features only) is used for async staging-file I/O. Tauri already runs commands on its tokio async runtime and enables these exact features, so the direct dependency adds no new packages; tests additionally enable `rt` + `macros` as a dev-dependency for `#[tokio::test]`.
 - `url` (added in Phase 2) parses artifact URLs so scheme and loopback-host enforcement is robust. It was already resolved in Tauri's dependency tree.
 - Svelte and TypeScript implement the typed presentation layer; SvelteKit's static adapter is retained from the official Tauri Svelte template to produce a serverless SPA.
@@ -248,10 +337,21 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - Promotion is a single rename of a fully verified file (Windows `MoveFileExW` semantics replace the destination), with explicit recovery branches for the races that matter: concurrent same-digest completions and corrupt destination replacement. Unexpected errors never silently destroy a previously valid cache object.
 - The development-facing `acquire_artifact` command exists to prove the pipeline through real IPC. It accepts typed artifact metadata only and is shown in the shell solely in dev builds; product download flows will wrap this pipeline in later phases.
 
+## Major Phase 3 decisions
+
+- Official metadata is resolved from the pinned Mojang manifest endpoint over HTTPS, never from third-party launcher APIs, and never from frontend-provided URLs: the only URLs the metadata transport follows are the pinned manifest URL and the version-document URLs the parsed manifest itself provides.
+- The trust split is explicit: the manifest is bootstrap discovery metadata (HTTPS plus validation, never a "verified artifact"), while version documents are hash-addressable — fetched from the manifest URL and verified against the manifest SHA-1 before parsing. "HTTPS succeeded" is never equated with Phase 2 artifact verification.
+- SHA-1 was added narrowly (a `Sha1Digest` type plus the `sha1` crate) because Mojang's integrity data is SHA-1; the verified cache stays SHA-256-addressed, so official digests and Aurora digests can never be confused.
+- External Mojang DTOs stop at `minecraft::metadata`; everything downstream consumes the normalized plan. Legacy shapes (`inheritsFrom`, `minecraftArguments`, `natives`/`classifiers`/`extract`, historical version types) are detected and rejected deliberately rather than half-resolved.
+- Rule evaluation is pure and vocabulary-strict: unknown os/arch/feature names fail parsing, defaults are documented (no rules = applicable; unmatched rule list = excluded; last match wins), and feature conditions stay unresolved in the plan.
+- Library identity is structured (parsed Maven coordinate plus validated repository path that must agree with the coordinate layout), so no future phase parses file names to reconstruct identity or ordering.
+- Metadata is fetch-on-demand with no persistence: no second cache system, no expiration logic, no background refresh — the smallest honest behavior for this phase.
+- The dev-only `plan_minecraft_install` proof returns a summary DTO only; the full plan never crosses the IPC boundary and the UI never implies installation.
+
 ## Explicitly deferred
 
-Authentication and token storage; Minecraft, Fabric, Java, and Aurora acquisition as product features (the Phase 2 pipeline is generic infrastructure — nothing selects or downloads a real product artifact yet); manifest fetching and signature verification; archive extraction; instance/profile/mod/resource-pack/shader creation and management (the Phase 1 registry and path model only represent them); JVM argument construction; game launch and supervision; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
+Authentication and token storage; Minecraft installation execution and every product-artifact download (client JAR, libraries, natives, asset objects, Java runtimes — Phase 3 records their official requirements in the plan only); acquiring or enumerating the asset index; the official `logging` (log4j) configuration resolution; Fabric metadata resolution and installation; Aurora installation as a product feature; manifest fetching and signature verification for Aurora distribution; archive extraction; Java discovery, download, and management; instance/profile/mod/resource-pack/shader creation and management (the Phase 1 registry and path model only represent them); launch-argument substitution and JVM command construction; game launch and supervision; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
 
 ## Known limitations
 
-The launcher reports native status, persists a minimal configuration, loads the instance registry read-only, and can acquire a verified artifact into its cache when given valid artifact metadata. It does not create or validate a managed directory tree beyond the launcher configuration and cache, create instances, fetch or verify manifests, install or repair artifacts, authenticate accounts, or launch a process. Cache eviction and cache-size policy are unimplemented. There is no download retry, resume, queue, or progress reporting. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. A hand-edited `selectedInstanceId` is validated as an identifier shape but not checked against the registry until instance management exists. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.
+The launcher reports native status, persists a minimal configuration, loads the instance registry read-only, acquires a verified artifact into its cache when given valid artifact metadata, and resolves a normalized Minecraft installation plan for an exact modern version from official metadata. It does not create or validate a managed directory tree beyond the launcher configuration and cache, create instances, install or repair artifacts, download any Minecraft product artifact, persist resolved metadata, authenticate accounts, or launch a process. Minecraft metadata is re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported. Cache eviction and cache-size policy are unimplemented. There is no download retry, resume, queue, or progress reporting. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. A hand-edited `selectedInstanceId` is validated as an identifier shape but not checked against the registry until instance management exists. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.
