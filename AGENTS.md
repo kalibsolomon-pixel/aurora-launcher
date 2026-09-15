@@ -53,6 +53,16 @@ npm run tauri build
 - Launch placeholders (`${auth_player_name}` and friends) stay semantically unresolved; never substitute fake account, session, or token values, and never shell-escape arguments.
 - Rule evaluation stays pure, deterministic, and vocabulary-strict in `minecraft::rules`; do not scatter platform checks across modules or assume the development machine's platform.
 
+## Fabric metadata and plan composition
+
+- Fabric resolution consumes only the official Fabric Meta API from its pinned root (`https://meta.fabricmc.net/v2/`), never third-party launcher APIs, scraped web pages, or frontend-supplied URLs.
+- Loader selection is exact: verify the requested Fabric Loader version exists, verify the Minecraft/Loader combination is supported, and reject unsupported combinations deliberately. Never silently substitute a newer loader, select "latest", or introduce automatic upgrades; Aurora release metadata, not Fabric Meta, is the intended policy source for required loader versions.
+- Installers consume the normalized `FabricPlan` and composed `GameInstallPlan`; they never parse raw Fabric Meta JSON. External Fabric DTOs stay inside `fabric::metadata` and never become the launcher's domain model.
+- Preserve the vanilla `MinecraftInstallPlan` as a meaningful, independently testable boundary; never mutate it into a Fabric-modified shape. Composition stays explicit so Mojang and Fabric requirements remain distinguishable.
+- Never fabricate a digest for a Fabric artifact: record official Fabric SHA-256 digests where published, represent digest-less artifacts (the loader and intermediary) honestly as digest-less, and never treat an HTTPS-only Fabric artifact as cryptographically verified. Mojang SHA-1 and Aurora SHA-256 semantics remain unchanged.
+- Do not introduce generic mod-loader abstractions, loader plugin systems, service containers, Maven frameworks, or dependency resolvers without a real implemented requirement; Aurora uses Fabric, so build the Fabric boundary directly.
+- Do not solve deferred installation concerns (SHA-1 cache storage, natives extraction, log4j configuration, metadata persistence) inside Fabric work unless Fabric composition genuinely requires the domain adjustment.
+
 ## Verification and Git
 
 Run checks proportional to the change. Native-boundary or startup changes require type checking, Rust format/check/test, a production build, and a real application boot when the host permits it. Keep documentation aligned with implemented behavior. Preserve user changes, inspect `git status`, make focused commits, and never push unless explicitly requested.

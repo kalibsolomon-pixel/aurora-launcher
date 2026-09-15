@@ -153,3 +153,39 @@ export async function planMinecraftInstall(
     );
   }
 }
+
+export interface PlanFabricInstallRequest {
+  minecraftVersion: string;
+  loaderVersion: string;
+}
+
+/** Concise summary of a composed Minecraft + Fabric Loader game plan. */
+export interface FabricPlanSummary {
+  minecraftVersion: string;
+  loaderVersion: string;
+  vanillaLibraryCount: number;
+  fabricLibraryCount: number;
+  finalLibraryCount: number;
+  fabricDigestedLibraryCount: number;
+  javaComponent: string;
+  javaMajorVersion: number;
+  javaRaisedByLoader: boolean;
+  finalMainClass: string;
+}
+
+export async function planFabricInstall(
+  request: PlanFabricInstallRequest,
+): Promise<FabricPlanSummary> {
+  try {
+    return await invoke<FabricPlanSummary>("plan_fabric_install", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The Fabric installation plan could not be resolved.",
+    );
+  }
+}

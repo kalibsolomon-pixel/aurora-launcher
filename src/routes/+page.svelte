@@ -4,10 +4,12 @@
     acquireArtifact,
     getApplicationStatus,
     getLauncherState,
+    planFabricInstall,
     planMinecraftInstall,
     LauncherBackendError,
     type AcquiredArtifact,
     type ApplicationStatus,
+    type FabricPlanSummary,
     type LauncherState,
     type MinecraftPlanSummary,
   } from "$lib/backend";
@@ -33,6 +35,14 @@
   let planningBusy = $state(false);
   let planSummary = $state<MinecraftPlanSummary | null>(null);
   let planningError = $state<LauncherBackendError | null>(null);
+
+  // Development proof of the Fabric resolution and composition layer;
+  // stripped from production builds.
+  let fabricMinecraftVersion = $state("");
+  let fabricLoaderVersion = $state("");
+  let fabricPlanningBusy = $state(false);
+  let fabricPlanSummary = $state<FabricPlanSummary | null>(null);
+  let fabricPlanningError = $state<LauncherBackendError | null>(null);
 
   onMount(async () => {
     try {
@@ -92,6 +102,27 @@
           : new LauncherBackendError("unknown_error", "The installation plan failed.");
     } finally {
       planningBusy = false;
+    }
+  }
+
+  async function runFabricPlanning(event: SubmitEvent) {
+    event.preventDefault();
+    fabricPlanningBusy = true;
+    fabricPlanSummary = null;
+    fabricPlanningError = null;
+
+    try {
+      fabricPlanSummary = await planFabricInstall({
+        minecraftVersion: fabricMinecraftVersion.trim(),
+        loaderVersion: fabricLoaderVersion.trim(),
+      });
+    } catch (cause: unknown) {
+      fabricPlanningError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The composed plan failed.");
+    } finally {
+      fabricPlanningBusy = false;
     }
   }
 </script>
@@ -367,6 +398,99 @@
         Development-only proof of the native metadata-resolution layer: official
         discovery, a SHA-1-verified version document, and platform-aware planning.
         Nothing is installed and no game artifact is downloaded.
+      </p>
+    </section>
+
+    <section class="status-card" aria-labelledby="fabric-plan-title" aria-live="polite">
+      <div class="status-heading">
+        <div>
+          <p class="eyebrow">Native composition proof</p>
+          <h2 id="fabric-plan-title">Fabric install planning</h2>
+        </div>
+
+        {#if fabricPlanningBusy}
+          <span class="badge loading"><span aria-hidden="true"></span>Composing</span>
+        {:else if fabricPlanSummary}
+          <span class="badge ready"><span aria-hidden="true"></span>Planned</span>
+        {:else if fabricPlanningError}
+          <span class="badge error"><span aria-hidden="true"></span>Rejected</span>
+        {/if}
+      </div>
+
+      <form class="acquire-form" onsubmit={runFabricPlanning}>
+        <label>
+          <span>Exact Minecraft version</span>
+          <input
+            type="text"
+            bind:value={fabricMinecraftVersion}
+            placeholder="e.g. 26.2 or 1.21.11"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          <span>Exact Fabric Loader version</span>
+          <input
+            type="text"
+            bind:value={fabricLoaderVersion}
+            placeholder="e.g. 0.19.5"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <button type="submit" disabled={fabricPlanningBusy}>
+          {fabricPlanningBusy ? "Composing…" : "Compose game plan"}
+        </button>
+      </form>
+
+      {#if fabricPlanSummary}
+        <dl>
+          <div>
+            <dt>Minecraft</dt>
+            <dd>{fabricPlanSummary.minecraftVersion}</dd>
+          </div>
+          <div>
+            <dt>Fabric Loader</dt>
+            <dd>{fabricPlanSummary.loaderVersion}</dd>
+          </div>
+          <div>
+            <dt>Vanilla libraries</dt>
+            <dd>{fabricPlanSummary.vanillaLibraryCount}</dd>
+          </div>
+          <div>
+            <dt>Fabric libraries</dt>
+            <dd>
+              {fabricPlanSummary.fabricLibraryCount}
+              ({fabricPlanSummary.fabricDigestedLibraryCount} with official digests)
+            </dd>
+          </div>
+          <div>
+            <dt>Final libraries</dt>
+            <dd>{fabricPlanSummary.finalLibraryCount}</dd>
+          </div>
+          <div>
+            <dt>Java</dt>
+            <dd>
+              {fabricPlanSummary.javaComponent} (major {fabricPlanSummary.javaMajorVersion}){#if fabricPlanSummary.javaRaisedByLoader}
+                — raised by the loader{/if}
+            </dd>
+          </div>
+          <div>
+            <dt>Final main class</dt>
+            <dd>{fabricPlanSummary.finalMainClass}</dd>
+          </div>
+        </dl>
+      {:else if fabricPlanningError}
+        <div class="error-message" role="alert">
+          <p>{fabricPlanningError.message}</p>
+          <code>{fabricPlanningError.code}</code>
+        </div>
+      {/if}
+
+      <p class="footnote">
+        Development-only proof of the native Fabric layer: official loader discovery,
+        exact profile resolution, and composition with the vanilla plan. Nothing is
+        installed and no Minecraft or Fabric artifact is downloaded.
       </p>
     </section>
   {/if}

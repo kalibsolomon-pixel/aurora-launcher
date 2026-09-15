@@ -198,6 +198,82 @@ New stable command codes, mapped from structured internal errors and never expos
 
 The `plan_minecraft_install` command accepts one exact version string and returns a concise summary (version, Java requirement, library and native counts, asset-index and client resolution, main class, argument counts). The full plan stays native; the dev-only UI section (stripped from production like the Phase 2 proof) renders only the summary and never implies installation.
 
+## Implemented in Phase 4
+
+Phase 4 adds Fabric metadata resolution and install-plan composition: an exact Minecraft version + Fabric Loader version combination resolves from official Fabric Meta into a normalized `FabricPlan`, which composes with the vanilla `MinecraftInstallPlan` into a `GameInstallPlan`. It plans only — no Minecraft or Fabric library, client jar, intermediary, or loader artifact is downloaded, and nothing is installed, extracted, or launched.
+
+### Resolution pipeline
+
+```text
+exact Minecraft version + exact Fabric Loader version
+        ↓ loader version list (HTTPS discovery, no prior digest)
+exact loader lookup (no "latest", no substitution)
+        ↓ loader profile document (HTTPS, official Fabric Meta)
+parse + validate (external DTOs, `fabric::metadata`)
+normalization (`fabric::plan`)
+        ↓
+FabricPlan
+        ↓ composition with MinecraftInstallPlan (`compose_game_plan`)
+GameInstallPlan
+```
+
+The composition lives in `fabric::resolve_game_plan`, which chains the Phase 3 vanilla resolution, the Fabric resolution, and composition. The vanilla `MinecraftInstallPlan` is never mutated into a Fabric-modified shape: it remains an independently meaningful part of the composed plan, and composition is explicit containment (`GameInstallPlan` holds both plans plus derived views), so provenance survives for future diagnostics and repair.
+
+### Official metadata and loader selection
+
+Resolution consumes the current official Fabric Meta API (`https://meta.fabricmc.net/v2/`, verified live in September 2026): the loader version list (`/versions/loader`) and the per-combination profile document (`/versions/loader/:game/:loader`). Loader selection is exact by policy: the requested Loader version must exist in the official list (`fabric_loader_not_found` otherwise), and the Minecraft/Loader combination must be supported by official metadata — Fabric Meta answers HTTP 400 for an unsupported game version, which maps to `fabric_combination_unsupported`. Nothing substitutes a newer loader, selects "latest", or upgrades automatically; Aurora's future release manifest, not Fabric Meta, decides which Loader version Aurora requires.
+
+The profile document embeds the loader's own launcher metadata (`launcherMeta`, published by the fabric-loader distribution on maven.fabricmc.net and served verbatim). External DTOs stay inside `fabric::metadata` and never become domain types; the pinned `launcherMeta` generation is 2, and a different generation is a deliberate unsupported error rather than a partial parse.
+
+### Metadata trust model
+
+Fabric Meta documents are bootstrap discovery metadata — the same trust class as Mojang's version manifest: no prior digest exists before the fetch, so trust is HTTPS transport plus deliberate parsing and validation, and the documents never enter the content-addressed store. The transport reuses the shared client policy (timeouts, bounded redirects, HTTPS-only production roots, loopback HTTP reserved for deterministic tests) through a separate narrow fetch boundary with the same 8 MiB buffering cap. Metadata is fetch-on-demand with no persistence, no cache, no background refresh.
+
+### Normalized Fabric plan
+
+```text
+FabricPlan
+├── minecraft_version + loader_version
+├── main_class (the Fabric client entry point, KnotClient today)
+├── libraries: [FabricLibrary { coordinate, repository, role, artifact }]
+│   └── FabricArtifact { url, sha256?, size_bytes? }
+└── min_java_major_version (the loader's declared floor)
+```
+
+Library order follows the official composition semantics, verified against fabric-meta's own profile builder and its `/profile/json` output: the loader's `common` libraries in document order, then the intermediary artifact (present only for obfuscated Minecraft versions — official metadata marks unobfuscated versions with the no-op placeholder `net.fabricmc:intermediary:0.0.0`, which contributes no library), then the Fabric Loader artifact itself, then the `client`-side group (empty in current metadata). Each entry records its role (`Common`/`Intermediary`/`Loader`/`ClientSide`), its parsed Maven coordinate, its validated repository base, and its derived artifact URL. The `development` and `server` library groups are deliberately ignored. The loader's `launcherMeta` contributes no launch arguments in the raw endpoint consumed here; the cosmetic `-DFabricMcEmu=…` JVM argument that the `/profile/json` endpoint synthesizes for the vanilla launcher is not composed into Aurora's plan.
+
+### Maven artifact resolution (`fabric::maven`)
+
+Fabric metadata names artifacts by Maven coordinate plus repository base rather than by fully described artifact URLs. The deterministic mapping is validated coordinate (`group:artifact:version[:classifier]`, conservative charset that includes the `+` official Fabric versions use, traversal-shaped segments rejected) plus validated repository base (HTTPS-only production, loopback HTTP for tests, clean directory URL) → repository-relative Maven layout path → artifact URL. This is a pure function over validated inputs — not a Maven client: no POM parsing, no dependency-graph traversal, no repository search.
+
+### Artifact trust model
+
+The trust difference between Mojang and Fabric artifacts is explicit. The loader's own libraries (the `common`/`client` groups) publish official digests — SHA-256, SHA-1, MD5, and SHA-512 with sizes — inside `launcherMeta`; Aurora records the SHA-256 (the strongest published digest, and the algorithm the verified cache is addressed by) and the size as pre-known expectations. The two artifacts Fabric Meta adds to every profile — the loader itself and the intermediary — carry no digest in the resolution metadata, and the plan represents them honestly as digest-less (`sha256: None`) rather than fabricating a value or borrowing another artifact's. A later installer must make a deliberate acquisition decision for digest-less Fabric artifacts (for example, pinning the SHA-256 computed on first verified acquisition); HTTPS success alone still never means verified. Mojang SHA-1 expectations and the SHA-256-addressed verified cache are unchanged, and no Fabric artifact is treated as a Phase 2 verified artifact by planning alone.
+
+### Composed game plan
+
+```text
+GameInstallPlan
+├── minecraft: MinecraftInstallPlan (unchanged vanilla requirements)
+├── loader: FabricPlan (unchanged Fabric requirements)
+├── libraries: [GameLibrary] (Mojang(…) | Fabric(…), deterministic order)
+├── java: GameJavaRequirement
+└── main_class: the final entry point
+```
+
+- **Main class**: the composed plan exposes the Fabric client entry point as the final main class while the vanilla plan retains Mojang's `net.minecraft.client.main.Main`; launch arguments, placeholders, and feature conditions remain exactly as Phase 3 resolved them (semantically unresolved).
+- **Library order and collisions**: Mojang libraries in official document order, then Fabric libraries in official composition order. An exact duplicate coordinate collapses to one requirement (the earlier, Mojang-sourced entry wins). The same group, artifact, and classifier at different versions is a hard composition conflict (`fabric_plan_conflict`) — Aurora silently picks no winner. Different classifiers of one group and artifact coexist, which is how Mojang publishes platform natives.
+- **Java**: Minecraft's runtime component and major version govern; the loader's declared floor is recorded, and the unobserved case of a loader floor above Mojang's requirement would normalize to the stricter major version with `raised_by_loader` set. No Java discovery, download, or selection exists.
+- **Assets and client**: preserved unchanged through the vanilla half of the composed plan.
+
+### Error model
+
+New stable command codes, mapped from structured internal errors and never exposing raw reqwest/Serde errors: `fabric_loader_version_invalid`, `fabric_metadata_network_failure`, `fabric_metadata_invalid`, `fabric_metadata_unsupported`, `fabric_loader_not_found`, `fabric_combination_unsupported`, `fabric_library_invalid`, `fabric_repository_invalid`, and `fabric_plan_conflict`. Network failure, malformed external metadata, unsupported metadata semantics, unsupported combinations, invalid coordinates/repositories, and composition conflicts are distinct categories.
+
+### Development proof
+
+The `plan_fabric_install` command accepts one exact Minecraft version and one exact Fabric Loader version and returns a concise summary (both versions, vanilla/Fabric/final library counts, how many Fabric libraries carry official digests, the Java requirement and whether the loader raised it, and the final main class). The full composed plan stays native; the dev-only UI section renders only the summary and never implies installation.
+
 ## Frontend/native boundary
 
 Svelte is a presentation layer. Security-sensitive state and all future Minecraft/Aurora installation, authentication, download, integrity, Java/runtime, filesystem mutation, and process-launch logic stay behind native Rust commands or events. Commands should be narrow and use explicit request/response DTOs. Frontend code must not infer structured state by parsing strings.
@@ -206,19 +282,20 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 
 ## Current native modules
 
-- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`).
+- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`, `plan_fabric_install`).
 - `paths`: validates and represents the platform-resolved application-local data root and derives managed locations without touching the filesystem.
 - `config`: the versioned launcher-configuration model and its atomic JSON persistence.
 - `instances`: validated instance identifiers, instance records, and the read-only instance-registry loader.
 - `distribution`: the typed, validated Aurora release-manifest data model (local representation only).
-- `downloads`: transport for trusted artifact acquisition (HTTPS enforcement, redirect policy, timeouts, streamed transfer with inline verification); also builds the shared HTTP client the metadata transport reuses.
+- `downloads`: transport for trusted artifact acquisition (HTTPS enforcement, redirect policy, timeouts, streamed transfer with inline verification); also builds the shared HTTP client the metadata transports reuse.
 - `integrity`: canonical SHA-256 digests, official-metadata SHA-1 digests, and streaming size/hash verification.
 - `cache`: the content-addressed verified-artifact store, untrusted staging, cache-hit validation, and promotion.
 - `minecraft`: official-metadata resolution and install planning — `metadata` (discovery, external DTOs, the SHA-1-verified fetch boundary), `rules` (pure platform/feature rule evaluation), `plan` (normalization into `MinecraftInstallPlan`), and the `resolve_install_plan` composition.
+- `fabric`: Fabric Meta resolution and composition — `metadata` (loader discovery, external DTOs, the fetch boundary), `maven` (validated coordinates, repositories, and deterministic artifact-URL derivation), `plan` (the normalized `FabricPlan`, the composed `GameInstallPlan`, and the collision policy), and the `resolve_fabric_plan`/`resolve_game_plan` compositions.
 
-Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Minecraft installation execution, Fabric, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, or empty module trees.
+Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Minecraft installation execution, Fabric installation execution, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, empty module trees, and generic mod-loader abstractions — Aurora uses Fabric, and the Fabric boundary is built directly.
 
-Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `instances_invalid`, `instances_unsupported_schema`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, and `minecraft_platform_unsupported`. Codes are compatibility contracts; keep them stable and user messages readable.
+Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `instances_invalid`, `instances_unsupported_schema`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, `minecraft_platform_unsupported`, `fabric_loader_version_invalid`, `fabric_metadata_network_failure`, `fabric_metadata_invalid`, `fabric_metadata_unsupported`, `fabric_loader_not_found`, `fabric_combination_unsupported`, `fabric_library_invalid`, `fabric_repository_invalid`, and `fabric_plan_conflict`. Codes are compatibility contracts; keep them stable and user messages readable.
 
 ## Managed filesystem model
 
@@ -308,6 +385,7 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - `url` (added in Phase 2) parses artifact URLs so scheme and loopback-host enforcement is robust. It was already resolved in Tauri's dependency tree.
 - Svelte and TypeScript implement the typed presentation layer; SvelteKit's static adapter is retained from the official Tauri Svelte template to produce a serverless SPA.
 - Vite supplies fast development and production asset builds; `svelte-check` provides compiler-aware type checking.
+- Phase 4 added no dependency: Fabric Meta documents are JSON over the existing reqwest transport, and Maven artifact-path derivation is string construction over validated parts — no Maven client, XML/POM parser, archive crate, installer framework, database, generic mod-loader library, Java-management crate, or auth library was needed or added.
 - No opener, authentication, keyring, archive, updater, UUID, error-derivation, logging, retry, or download-queue package is included: no implemented behavior needs one.
 
 ## Major Phase 0 decisions
@@ -348,10 +426,21 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - Metadata is fetch-on-demand with no persistence: no second cache system, no expiration logic, no background refresh — the smallest honest behavior for this phase.
 - The dev-only `plan_minecraft_install` proof returns a summary DTO only; the full plan never crosses the IPC boundary and the UI never implies installation.
 
+## Major Phase 4 decisions
+
+- Fabric resolution consumes only the official Fabric Meta API from its pinned root; loader selection is exact (existence in the official list, then combination support), with no "latest", no substitution, and no automatic upgrades. Aurora's future release manifest remains the intended policy source for which loader version a release requires.
+- The vanilla `MinecraftInstallPlan` is never mutated into a Fabric-modified shape. Composition is explicit containment: `GameInstallPlan` holds both unchanged plans plus derived views, so Mojang and Fabric requirements stay distinguishable for diagnostics and repair, and a future installer never needs to know Fabric Meta JSON semantics.
+- The pinned `launcherMeta` generation is 2; a different generation fails deliberately instead of half-parsing. Library composition order mirrors fabric-meta's own profile builder (`common`, intermediary-when-not-placeholder, loader, then the client group), verified against the live `/profile/json` output rather than assumed.
+- Fabric's coordinate charset deliberately includes `+` (official versions like `0.17.4+mixin.0.8.7` use it) in a fabric-owned `MavenCoordinate` type; the Mojang coordinate type in `minecraft::plan` is untouched, and the two never blur into a generic Maven framework — no POM parsing, no dependency resolution, no repository client.
+- The trust difference is represented, not erased: Fabric's published SHA-256 digests are recorded where they exist; the loader and intermediary artifacts are represented as digest-less because official resolution metadata provides none for them. No digest is invented, HTTPS is never called verification, and the Phase 2 trust model is unchanged.
+- Collisions are deliberate policy, never silent: exact duplicates collapse (Mojang first), same-identity-different-version is a hard `fabric_plan_conflict`, and classifier coexistence follows Mojang's own native-library practice.
+- No new dependency was required: Fabric metadata is JSON over the existing transport, and Maven path derivation is string construction over validated parts.
+- Metadata remains fetch-on-demand and memory-only; the dev-only `plan_fabric_install` proof returns a summary DTO, the full composed plan stays native, and the UI never implies installation.
+
 ## Explicitly deferred
 
-Authentication and token storage; Minecraft installation execution and every product-artifact download (client JAR, libraries, natives, asset objects, Java runtimes — Phase 3 records their official requirements in the plan only); acquiring or enumerating the asset index; the official `logging` (log4j) configuration resolution; Fabric metadata resolution and installation; Aurora installation as a product feature; manifest fetching and signature verification for Aurora distribution; archive extraction; Java discovery, download, and management; instance/profile/mod/resource-pack/shader creation and management (the Phase 1 registry and path model only represent them); launch-argument substitution and JVM command construction; game launch and supervision; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
+Authentication and token storage; Minecraft installation execution and every product-artifact download (client JAR, libraries, natives, asset objects, Java runtimes — the plans record their official requirements only); acquiring or enumerating the asset index; the official `logging` (log4j) configuration resolution; Fabric installation execution and every Fabric library, intermediary, and loader artifact download (Phase 4 records their official requirements, including which artifacts lack pre-known digests); the acquisition-trust decision for digest-less Fabric artifacts; Aurora installation as a product feature; manifest fetching and signature verification for Aurora distribution; archive extraction; Java discovery, download, and management; instance/profile/mod/resource-pack/shader creation and management (the Phase 1 registry and path model only represent them); launch-argument substitution and JVM command construction; game launch and supervision; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
 
 ## Known limitations
 
-The launcher reports native status, persists a minimal configuration, loads the instance registry read-only, acquires a verified artifact into its cache when given valid artifact metadata, and resolves a normalized Minecraft installation plan for an exact modern version from official metadata. It does not create or validate a managed directory tree beyond the launcher configuration and cache, create instances, install or repair artifacts, download any Minecraft product artifact, persist resolved metadata, authenticate accounts, or launch a process. Minecraft metadata is re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported. Cache eviction and cache-size policy are unimplemented. There is no download retry, resume, queue, or progress reporting. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. A hand-edited `selectedInstanceId` is validated as an identifier shape but not checked against the registry until instance management exists. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.
+The launcher reports native status, persists a minimal configuration, loads the instance registry read-only, acquires a verified artifact into its cache when given valid artifact metadata, resolves a normalized Minecraft installation plan for an exact modern version from official metadata, and composes it with a normalized Fabric plan for an exact Minecraft + Fabric Loader combination from official Fabric Meta. It does not create or validate a managed directory tree beyond the launcher configuration and cache, create instances, install or repair artifacts, download any Minecraft or Fabric product artifact, persist resolved metadata, authenticate accounts, or launch a process. Minecraft and Fabric metadata are re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported, as are future `launcherMeta` generations. The loader and intermediary Fabric artifacts have no pre-known digests and are planned as such. Cache eviction and cache-size policy are unimplemented. There is no download retry, resume, queue, or progress reporting. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. A hand-edited `selectedInstanceId` is validated as an identifier shape but not checked against the registry until instance management exists. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.

@@ -6,6 +6,8 @@ use crate::cache::{AcquisitionError, ArtifactCache, ArtifactOrigin};
 use crate::config::{ConfigError, ConfigLoad};
 use crate::distribution::ReleaseChannel;
 use crate::downloads::{ArtifactSource, DownloadError, InvalidArtifactSource};
+use crate::fabric::metadata::{FabricMetadataError, InvalidLoaderVersion, LoaderVersionId};
+use crate::fabric::{FabricResolutionError, GameResolutionError, resolve_game_plan};
 use crate::instances::{InstanceRecord, InstanceRegistry, InstanceRegistryError};
 use crate::minecraft::metadata::{
     InvalidMinecraftVersion, MetadataEndpoints, MetadataError, MinecraftVersionId,
@@ -162,9 +164,58 @@ impl From<InvalidMinecraftVersion> for CommandError {
     }
 }
 
+impl From<InvalidLoaderVersion> for CommandError {
+    fn from(error: InvalidLoaderVersion) -> Self {
+        Self::new("fabric_loader_version_invalid", error.to_string())
+    }
+}
+
 impl From<UnsupportedPlatform> for CommandError {
     fn from(error: UnsupportedPlatform) -> Self {
         Self::new("minecraft_platform_unsupported", error.to_string())
+    }
+}
+
+impl From<FabricResolutionError> for CommandError {
+    fn from(error: FabricResolutionError) -> Self {
+        let code = match &error {
+            FabricResolutionError::Metadata(metadata) => match metadata {
+                FabricMetadataError::Network(_) | FabricMetadataError::ResponseTooLarge { .. } => {
+                    "fabric_metadata_network_failure"
+                }
+                FabricMetadataError::HttpStatus { .. } => "fabric_metadata_network_failure",
+                FabricMetadataError::Malformed { .. } => "fabric_metadata_invalid",
+                FabricMetadataError::Unsupported { .. } => "fabric_metadata_unsupported",
+            },
+            FabricResolutionError::LoaderNotFound { .. } => "fabric_loader_not_found",
+            FabricResolutionError::CombinationUnsupported { .. } => {
+                "fabric_combination_unsupported"
+            }
+            FabricResolutionError::Planning(planning) => match planning {
+                crate::fabric::plan::FabricPlanError::LibraryInvalid { .. } => {
+                    "fabric_library_invalid"
+                }
+                crate::fabric::plan::FabricPlanError::RepositoryInvalid { .. } => {
+                    "fabric_repository_invalid"
+                }
+                crate::fabric::plan::FabricPlanError::ArtifactInvalid { .. } => {
+                    "fabric_library_invalid"
+                }
+            },
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
+impl From<GameResolutionError> for CommandError {
+    fn from(error: GameResolutionError) -> Self {
+        match error {
+            GameResolutionError::Minecraft(error) => error.into(),
+            GameResolutionError::Fabric(error) => error.into(),
+            GameResolutionError::Composition(error) => {
+                Self::new("fabric_plan_conflict", error.to_string())
+            }
+        }
     }
 }
 
@@ -415,6 +466,72 @@ pub async fn plan_minecraft_install(
     })
 }
 
+/// Typed request accepted by the Fabric planning command.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanFabricInstallRequest {
+    minecraft_version: String,
+    loader_version: String,
+}
+
+/// A concise summary of one composed game installation plan.
+///
+/// As with the Minecraft summary, the full composed plan stays native; the
+/// proof UI only needs the composed counts and key requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricPlanSummary {
+    minecraft_version: String,
+    loader_version: String,
+    vanilla_library_count: usize,
+    fabric_library_count: usize,
+    final_library_count: usize,
+    fabric_digested_library_count: usize,
+    java_component: String,
+    java_major_version: u32,
+    java_raised_by_loader: bool,
+    final_main_class: String,
+}
+
+/// Resolves one exact Minecraft + Fabric Loader combination into the composed
+/// game install plan for the current platform and returns a concise summary.
+///
+/// This is the development-facing proof of the Phase 4 Fabric resolution and
+/// composition layer: it performs real loader discovery, exact profile
+/// resolution, Mojang planning, and composition in Rust, and installs
+/// nothing — no Minecraft or Fabric artifact is downloaded.
+#[tauri::command]
+pub async fn plan_fabric_install(
+    request: PlanFabricInstallRequest,
+) -> Result<FabricPlanSummary, CommandError> {
+    let version = MinecraftVersionId::new(request.minecraft_version.trim())?;
+    let loader = LoaderVersionId::new(request.loader_version.trim())?;
+    let platform = crate::minecraft::rules::PlatformProfile::current()?;
+
+    let plan = resolve_game_plan(
+        &MetadataEndpoints::official(),
+        &crate::fabric::metadata::FabricMetaEndpoints::official(),
+        &version,
+        &loader,
+        platform,
+        &crate::downloads::DownloadOptions::default(),
+    )
+    .await?;
+
+    Ok(FabricPlanSummary {
+        minecraft_version: plan.minecraft().minecraft_version().to_owned(),
+        loader_version: plan.loader().loader_version().to_owned(),
+        vanilla_library_count: plan.vanilla_library_count(),
+        fabric_library_count: plan.fabric_library_count(),
+        final_library_count: plan.libraries().len(),
+        fabric_digested_library_count: plan.loader().digested_library_count(),
+        java_component: plan.java().component().to_owned(),
+        java_major_version: plan.java().major_version(),
+        java_raised_by_loader: plan.java().raised_by_loader(),
+        final_main_class: plan.main_class().to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +608,119 @@ mod tests {
             MinecraftVersionId::new("../evil").expect_err("traversal ids are invalid"),
         );
         assert_eq!(error.code, "minecraft_version_invalid");
+    }
+
+    #[test]
+    fn invalid_loader_versions_map_to_a_stable_machine_code() {
+        let error = CommandError::from(
+            LoaderVersionId::new("../evil").expect_err("traversal ids are invalid"),
+        );
+        assert_eq!(error.code, "fabric_loader_version_invalid");
+    }
+
+    #[test]
+    fn fabric_resolution_errors_map_to_stable_machine_codes() {
+        use crate::fabric::plan::FabricPlanError;
+
+        let cases: Vec<(FabricResolutionError, &str)> = vec![
+            (
+                FabricResolutionError::Metadata(FabricMetadataError::Network(
+                    DownloadError::HttpStatus { status: 503 },
+                )),
+                "fabric_metadata_network_failure",
+            ),
+            (
+                FabricResolutionError::Metadata(FabricMetadataError::HttpStatus { status: 500 }),
+                "fabric_metadata_network_failure",
+            ),
+            (
+                FabricResolutionError::Metadata(FabricMetadataError::ResponseTooLarge {
+                    limit_bytes: 8 * 1024 * 1024,
+                }),
+                "fabric_metadata_network_failure",
+            ),
+            (
+                FabricResolutionError::Metadata(FabricMetadataError::Malformed {
+                    reason: "broken".to_owned(),
+                }),
+                "fabric_metadata_invalid",
+            ),
+            (
+                FabricResolutionError::Metadata(FabricMetadataError::Unsupported {
+                    reason: "launcherMeta generation 3".to_owned(),
+                }),
+                "fabric_metadata_unsupported",
+            ),
+            (
+                FabricResolutionError::LoaderNotFound {
+                    requested: "0.99.0".to_owned(),
+                },
+                "fabric_loader_not_found",
+            ),
+            (
+                FabricResolutionError::CombinationUnsupported {
+                    game: "9.9.9".to_owned(),
+                    loader: "0.19.5".to_owned(),
+                },
+                "fabric_combination_unsupported",
+            ),
+            (
+                FabricResolutionError::Planning(FabricPlanError::LibraryInvalid {
+                    name: "broken".to_owned(),
+                    reason: "not a coordinate".to_owned(),
+                }),
+                "fabric_library_invalid",
+            ),
+            (
+                FabricResolutionError::Planning(FabricPlanError::RepositoryInvalid {
+                    url: "http://maven.example.invalid/".to_owned(),
+                    reason: "must use HTTPS".to_owned(),
+                }),
+                "fabric_repository_invalid",
+            ),
+            (
+                FabricResolutionError::Planning(FabricPlanError::ArtifactInvalid {
+                    source: "org.ow2.asm:asm:9.10.1".to_owned(),
+                    reason: "bad digest".to_owned(),
+                }),
+                "fabric_library_invalid",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
+    }
+
+    #[test]
+    fn game_resolution_errors_map_to_stable_machine_codes() {
+        use crate::fabric::plan::CompositionError;
+
+        let conflict = GameResolutionError::Composition(CompositionError::LibraryConflict {
+            existing: "org.ow2.asm:asm:9.9.9".to_owned(),
+            conflicting: "org.ow2.asm:asm:9.10.1".to_owned(),
+        });
+        assert_eq!(CommandError::from(conflict).code, "fabric_plan_conflict");
+
+        let minecraft = GameResolutionError::Minecraft(MinecraftResolutionError::Metadata(
+            MetadataError::VersionNotFound {
+                requested: "9.9.9".to_owned(),
+            },
+        ));
+        assert_eq!(
+            CommandError::from(minecraft).code,
+            "minecraft_version_not_found"
+        );
+
+        let fabric = GameResolutionError::Fabric(FabricResolutionError::LoaderNotFound {
+            requested: "0.99.0".to_owned(),
+        });
+        assert_eq!(CommandError::from(fabric).code, "fabric_loader_not_found");
     }
 
     #[test]
