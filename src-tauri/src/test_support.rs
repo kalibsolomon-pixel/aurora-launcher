@@ -98,7 +98,18 @@ pub struct TestServer {
 impl TestServer {
     /// Starts a server that answers every connection by calling `handler`.
     pub fn spawn(handler: Arc<Handler>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind must succeed");
+        Self::spawn_on_ephemeral(handler, "127.0.0.1:0")
+    }
+
+    /// Starts a server on one explicit fixed loopback address (used when a
+    /// checked-in fixture pins an exact URL, such as the development
+    /// release fixture's `http://127.0.0.1:8765/...`).
+    pub fn spawn_on(handler: Arc<Handler>, address: &str) -> Self {
+        Self::spawn_on_ephemeral(handler, address)
+    }
+
+    fn spawn_on_ephemeral(handler: Arc<Handler>, bind_address: &str) -> Self {
+        let listener = TcpListener::bind(bind_address).expect("loopback bind must succeed");
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(AtomicUsize::new(0));
 

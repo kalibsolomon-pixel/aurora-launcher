@@ -1,20 +1,34 @@
 //! Instance domain model: validated instance identifiers, instance records,
-//! and the persisted instance registry.
+//! the persisted (now writable) instance registry, and identifier generation.
 //!
-//! Instances are represented but not created, installed, or deleted in this
-//! phase. The registry is therefore read-only: it loads persisted instance
-//! records when present and reports an empty registry when the file does not
-//! exist yet.
+//! The registry is a versioned JSON document at
+//! `<managed-data-root>/launcher/instances.json`. Malformed or
+//! unsupported-schema files are deliberate errors that are never silently
+//! repaired or overwritten; writes are atomic (sibling temporary file plus
+//! rename). Display names are user-facing text only and never influence the
+//! filesystem; the identifier alone derives paths.
+//!
+//! Instance lifecycle orchestration (create/retry/rename/select/validate)
+//! lives in [`lifecycle`]; Aurora's own installed state lives in
+//! [`crate::aurora`]. Deletion remains unimplemented by design.
+
+pub mod lifecycle;
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::distribution::ReleaseChannel;
 
 /// The only instance-registry schema version this launcher understands.
-pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 added the per-record lifecycle state and the concrete release
+/// pin (every instance now records exactly which Aurora release it targets,
+/// including its Minecraft and Fabric Loader versions). Version 1 files —
+/// from before any code could write the registry — fail deliberately as
+/// unsupported rather than being migrated.
+pub const INSTANCE_REGISTRY_SCHEMA_VERSION: u32 = 2;
 
 const MAX_INSTANCE_ID_LENGTH: usize = 64;
 const MAX_INSTANCE_DISPLAY_NAME_LENGTH: usize = 80;
@@ -67,29 +81,118 @@ impl TryFrom<String> for InstanceId {
     }
 }
 
-/// A persisted instance record.
+/// The persisted instance record.
 ///
 /// `display_name` is user-facing text only; it is never used to derive paths.
-/// `release` pins the Aurora channel and, optionally, an exact Aurora version;
-/// a `None` version means "newest release of the channel", resolved at
-/// install time in a later phase.
+/// `state` is the record's lifecycle state — a creation that has not yet
+/// completed stays `Installing` and is never reported ready. `release` pins
+/// the concrete Aurora release the instance targets; "channel only" pins are
+/// deliberately unrepresentable because channels drift over time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceRecord {
     id: InstanceId,
     display_name: String,
-    release: ReleasePin,
+    state: InstanceState,
+    release: PinnedRelease,
+}
+
+/// The lifecycle state of a persisted instance.
+///
+/// Deliberately minimal: `Installing` means creation or retry has not yet
+/// completed validation; `Ready` means it did. "Damaged" is not a stored
+/// state — it is computed on demand by complete-instance validation, which
+/// can discover damage at any later time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceState {
+    Installing,
+    Ready,
+}
+
+impl InstanceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Installing => "installing",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+impl fmt::Display for InstanceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The concrete Aurora release an instance is pinned to.
+///
+/// Every field is a required fact of the resolved release — the pin never
+/// says merely "stable", because what "stable" means changes over time.
+/// Artifact provenance (URL, digest) intentionally does not live here; it
+/// lives in the instance's Aurora installed-state record next to the
+/// materialized artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinnedRelease {
+    channel: ReleaseChannel,
+    aurora_version: String,
+    minecraft_version: String,
+    fabric_loader_version: String,
+}
+
+impl PinnedRelease {
+    pub fn new(
+        channel: ReleaseChannel,
+        aurora_version: impl Into<String>,
+        minecraft_version: impl Into<String>,
+        fabric_loader_version: impl Into<String>,
+    ) -> Result<Self, InvalidInstanceRecord> {
+        let pin = Self {
+            channel,
+            aurora_version: aurora_version.into(),
+            minecraft_version: minecraft_version.into(),
+            fabric_loader_version: fabric_loader_version.into(),
+        };
+        pin.validate()?;
+        Ok(pin)
+    }
+
+    pub fn channel(&self) -> ReleaseChannel {
+        self.channel
+    }
+
+    pub fn aurora_version(&self) -> &str {
+        &self.aurora_version
+    }
+
+    pub fn minecraft_version(&self) -> &str {
+        &self.minecraft_version
+    }
+
+    pub fn fabric_loader_version(&self) -> &str {
+        &self.fabric_loader_version
+    }
+
+    fn validate(&self) -> Result<(), InvalidInstanceRecord> {
+        validate_pinned_version("Aurora", &self.aurora_version)?;
+        validate_pinned_version("Minecraft", &self.minecraft_version)?;
+        validate_pinned_version("Fabric Loader", &self.fabric_loader_version)?;
+        Ok(())
+    }
 }
 
 impl InstanceRecord {
     pub fn new(
         id: InstanceId,
         display_name: impl Into<String>,
-        release: ReleasePin,
+        state: InstanceState,
+        release: PinnedRelease,
     ) -> Result<Self, InvalidInstanceRecord> {
         let record = Self {
             id,
             display_name: display_name.into(),
+            state,
             release,
         };
         record.validate_content()?;
@@ -104,56 +207,43 @@ impl InstanceRecord {
         &self.display_name
     }
 
-    pub fn release(&self) -> &ReleasePin {
+    pub fn state(&self) -> InstanceState {
+        self.state
+    }
+
+    pub fn release(&self) -> &PinnedRelease {
         &self.release
+    }
+
+    /// Sets the lifecycle state (used only by lifecycle orchestration when
+    /// a record genuinely transitions).
+    pub fn set_state(&mut self, state: InstanceState) {
+        self.state = state;
+    }
+
+    /// Renames the instance's display name. This changes metadata only: the
+    /// identifier, and therefore every filesystem path, is untouched.
+    pub fn set_display_name(
+        &mut self,
+        display_name: impl Into<String>,
+    ) -> Result<(), InvalidInstanceRecord> {
+        self.display_name = display_name.into();
+        self.validate_content()
     }
 
     /// Validates the parts serde cannot enforce by type.
     fn validate_content(&self) -> Result<(), InvalidInstanceRecord> {
         validate_display_name(&self.display_name)?;
-        if let Some(version) = &self.release.aurora_version {
-            validate_pinned_version(version)?;
-        }
-        Ok(())
-    }
-}
-
-/// The Aurora release an instance tracks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReleasePin {
-    channel: ReleaseChannel,
-    aurora_version: Option<String>,
-}
-
-impl ReleasePin {
-    pub fn new(
-        channel: ReleaseChannel,
-        aurora_version: Option<String>,
-    ) -> Result<Self, InvalidInstanceRecord> {
-        if let Some(version) = &aurora_version {
-            validate_pinned_version(version)?;
-        }
-        Ok(Self {
-            channel,
-            aurora_version,
-        })
-    }
-
-    pub fn channel(&self) -> ReleaseChannel {
-        self.channel
-    }
-
-    pub fn aurora_version(&self) -> Option<&str> {
-        self.aurora_version.as_deref()
+        self.release.validate()
     }
 }
 
 /// The persisted list of known instances.
 ///
-/// Stored as JSON by the launcher; this phase only loads it. A missing file is
-/// an empty registry, while malformed or unsupported data is a deliberate
-/// error that is never silently repaired or overwritten.
+/// Stored as versioned JSON. A missing file loads as an empty registry;
+/// malformed or unsupported data is a deliberate error that is never
+/// silently repaired or overwritten. Saves are atomic: sibling temporary
+/// file plus rename, so a partially written registry can never be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceRegistry {
@@ -174,6 +264,18 @@ impl InstanceRegistry {
 
     pub fn instances(&self) -> &[InstanceRecord] {
         &self.instances
+    }
+
+    pub fn instances_mut(&mut self) -> &mut Vec<InstanceRecord> {
+        &mut self.instances
+    }
+
+    pub fn find(&self, id: &InstanceId) -> Option<&InstanceRecord> {
+        self.instances.iter().find(|record| record.id() == id)
+    }
+
+    pub fn find_mut(&mut self, id: &InstanceId) -> Option<&mut InstanceRecord> {
+        self.instances.iter_mut().find(|record| record.id() == id)
     }
 
     /// Loads the registry from disk. A missing file loads as empty.
@@ -218,6 +320,56 @@ impl InstanceRegistry {
 
         Ok(registry)
     }
+
+    /// Persists the registry atomically: write to a sibling temporary file,
+    /// then rename over the target. Duplicate identifiers are rejected
+    /// before anything touches disk.
+    pub fn save(&self, path: &Path) -> Result<(), InstanceRegistryError> {
+        if let Some(duplicate) = find_duplicate_id(&self.instances) {
+            return Err(InstanceRegistryError::Malformed(format!(
+                "instance identifier '{duplicate}' is registered more than once"
+            )));
+        }
+
+        let mut json = serde_json::to_string_pretty(self)
+            .expect("instance registry serialization cannot fail");
+        json.push('\n');
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(InstanceRegistryError::Write)?;
+        }
+        let temporary_path = temporary_sibling(path);
+        std::fs::write(&temporary_path, json).map_err(|error| {
+            let _ = std::fs::remove_file(&temporary_path);
+            InstanceRegistryError::Write(error)
+        })?;
+        match std::fs::rename(&temporary_path, path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temporary_path);
+                Err(InstanceRegistryError::Write(error))
+            }
+        }
+    }
+}
+
+/// Generates a fresh instance identifier: an opaque UUIDv4 in the canonical
+/// simple (hyphen-less) lowercase-hex form.
+///
+/// Thirty-two hexadecimal characters satisfy the identifier rules by
+/// construction (lowercase, alphanumeric boundaries, no reserved names), are
+/// filesystem-safe on every supported platform, and are independent of the
+/// display name and of timestamps alone. Uniqueness is re-checked against
+/// the registry by the caller; collisions are practically impossible.
+pub fn generate_instance_id() -> InstanceId {
+    let simple = uuid::Uuid::new_v4().simple().to_string();
+    InstanceId::new(simple).expect("a UUIDv4 in simple form is always a valid identifier")
+}
+
+fn temporary_sibling(path: &Path) -> PathBuf {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    PathBuf::from(temporary)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,9 +414,9 @@ pub enum InvalidInstanceRecord {
     DisplayNameTooLong(usize),
     DisplayNameWhitespacePadding,
     DisplayNameControlCharacter,
-    EmptyAuroraVersion,
-    AuroraVersionWhitespacePadding,
-    AuroraVersionControlCharacter,
+    EmptyPinnedVersion(&'static str),
+    PinnedVersionWhitespacePadding(&'static str),
+    PinnedVersionControlCharacter(&'static str),
 }
 
 impl fmt::Display for InvalidInstanceRecord {
@@ -283,16 +435,16 @@ impl fmt::Display for InvalidInstanceRecord {
                 formatter,
                 "instance display name must not contain control characters"
             ),
-            Self::EmptyAuroraVersion => {
-                write!(formatter, "pinned Aurora version must not be empty")
+            Self::EmptyPinnedVersion(field) => {
+                write!(formatter, "pinned {field} version must not be empty")
             }
-            Self::AuroraVersionWhitespacePadding => write!(
+            Self::PinnedVersionWhitespacePadding(field) => write!(
                 formatter,
-                "pinned Aurora version must not have leading or trailing whitespace"
+                "pinned {field} version must not have leading or trailing whitespace"
             ),
-            Self::AuroraVersionControlCharacter => write!(
+            Self::PinnedVersionControlCharacter(field) => write!(
                 formatter,
-                "pinned Aurora version must not contain control characters"
+                "pinned {field} version must not contain control characters"
             ),
         }
     }
@@ -303,8 +455,13 @@ impl std::error::Error for InvalidInstanceRecord {}
 #[derive(Debug)]
 pub enum InstanceRegistryError {
     Read(std::io::Error),
+    /// Saving the registry failed; the previous file was never damaged.
+    Write(std::io::Error),
     Malformed(String),
-    UnsupportedSchema { found: u32, supported: u32 },
+    UnsupportedSchema {
+        found: u32,
+        supported: u32,
+    },
 }
 
 impl fmt::Display for InstanceRegistryError {
@@ -313,6 +470,10 @@ impl fmt::Display for InstanceRegistryError {
             Self::Read(error) => write!(
                 formatter,
                 "the instance registry could not be read: {error}"
+            ),
+            Self::Write(error) => write!(
+                formatter,
+                "the instance registry could not be written: {error}"
             ),
             Self::Malformed(detail) => write!(
                 formatter,
@@ -329,7 +490,7 @@ impl fmt::Display for InstanceRegistryError {
 impl std::error::Error for InstanceRegistryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Read(error) => Some(error),
+            Self::Read(error) | Self::Write(error) => Some(error),
             _ => None,
         }
     }
@@ -395,15 +556,15 @@ fn validate_display_name(value: &str) -> Result<(), InvalidInstanceRecord> {
     Ok(())
 }
 
-fn validate_pinned_version(value: &str) -> Result<(), InvalidInstanceRecord> {
+fn validate_pinned_version(field: &'static str, value: &str) -> Result<(), InvalidInstanceRecord> {
     if value.is_empty() {
-        return Err(InvalidInstanceRecord::EmptyAuroraVersion);
+        return Err(InvalidInstanceRecord::EmptyPinnedVersion(field));
     }
     if value.trim() != value {
-        return Err(InvalidInstanceRecord::AuroraVersionWhitespacePadding);
+        return Err(InvalidInstanceRecord::PinnedVersionWhitespacePadding(field));
     }
     if value.chars().any(char::is_control) {
-        return Err(InvalidInstanceRecord::AuroraVersionControlCharacter);
+        return Err(InvalidInstanceRecord::PinnedVersionControlCharacter(field));
     }
     Ok(())
 }
@@ -425,20 +586,36 @@ mod tests {
     use super::*;
 
     const VALID_REGISTRY: &str = r#"{
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "instances": [
             {
                 "id": "aurora-default",
                 "displayName": "Aurora Default",
-                "release": { "channel": "stable", "auroraVersion": null }
+                "state": "ready",
+                "release": {
+                    "channel": "stable",
+                    "auroraVersion": "0.3.0",
+                    "minecraftVersion": "26.2",
+                    "fabricLoaderVersion": "0.19.5"
+                }
             },
             {
                 "id": "beta_playground",
                 "displayName": "Beta Playground",
-                "release": { "channel": "beta", "auroraVersion": "0.3.1-beta.2" }
+                "state": "installing",
+                "release": {
+                    "channel": "beta",
+                    "auroraVersion": "0.3.1-beta.1",
+                    "minecraftVersion": "26.2",
+                    "fabricLoaderVersion": "0.19.5"
+                }
             }
         ]
     }"#;
+
+    fn sample_pin() -> PinnedRelease {
+        PinnedRelease::new(ReleaseChannel::Stable, "0.3.0", "26.2", "0.19.5").unwrap()
+    }
 
     #[test]
     fn accepts_constrained_identifiers() {
@@ -523,16 +700,32 @@ mod tests {
     }
 
     #[test]
+    fn generated_identifiers_are_valid_unique_and_name_independent() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let id = generate_instance_id();
+            // Valid by construction, but prove it against the validator.
+            assert!(InstanceId::new(id.as_str()).is_ok());
+            assert_eq!(id.as_str().len(), 32);
+            assert!(
+                id.as_str()
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+            seen.insert(id.as_str().to_owned());
+        }
+        assert_eq!(seen.len(), 200, "UUIDv4 identifiers must not collide");
+    }
+
+    #[test]
     fn display_names_are_validated_but_never_used_for_paths() {
         let id = InstanceId::new("default").unwrap();
 
         let valid = InstanceRecord::new(
             id.clone(),
             "My Auröra ✨ Setup",
-            ReleasePin {
-                channel: ReleaseChannel::Stable,
-                aurora_version: None,
-            },
+            InstanceState::Ready,
+            sample_pin(),
         )
         .unwrap();
         assert_eq!(valid.display_name(), "My Auröra ✨ Setup");
@@ -544,14 +737,8 @@ mod tests {
             "a".repeat(81).as_str(),
             "bad\nline",
         ] {
-            let result = InstanceRecord::new(
-                id.clone(),
-                display_name,
-                ReleasePin {
-                    channel: ReleaseChannel::Stable,
-                    aurora_version: None,
-                },
-            );
+            let result =
+                InstanceRecord::new(id.clone(), display_name, InstanceState::Ready, sample_pin());
             assert!(result.is_err(), "'{display_name}' should be rejected");
         }
 
@@ -561,12 +748,22 @@ mod tests {
     }
 
     #[test]
-    fn release_pins_require_non_empty_versions_when_present() {
-        let result = ReleasePin::new(ReleaseChannel::Beta, Some(" 0.3.1".to_owned()));
-
+    fn pinned_releases_require_concrete_valid_versions() {
         assert!(matches!(
-            result,
-            Err(InvalidInstanceRecord::AuroraVersionWhitespacePadding)
+            PinnedRelease::new(ReleaseChannel::Beta, " 0.3.1", "26.2", "0.19.5"),
+            Err(InvalidInstanceRecord::PinnedVersionWhitespacePadding(
+                "Aurora"
+            ))
+        ));
+        assert!(matches!(
+            PinnedRelease::new(ReleaseChannel::Beta, "0.3.1", "", "0.19.5"),
+            Err(InvalidInstanceRecord::EmptyPinnedVersion("Minecraft"))
+        ));
+        assert!(matches!(
+            PinnedRelease::new(ReleaseChannel::Beta, "0.3.1", "26.2", "0.19.5\u{7}"),
+            Err(InvalidInstanceRecord::PinnedVersionControlCharacter(
+                "Fabric Loader"
+            ))
         ));
     }
 
@@ -593,13 +790,66 @@ mod tests {
         let first = &registry.instances()[0];
         assert_eq!(first.id().as_str(), "aurora-default");
         assert_eq!(first.display_name(), "Aurora Default");
+        assert_eq!(first.state(), InstanceState::Ready);
         assert_eq!(first.release().channel(), ReleaseChannel::Stable);
-        assert_eq!(first.release().aurora_version(), None);
+        assert_eq!(first.release().aurora_version(), "0.3.0");
+        assert_eq!(first.release().minecraft_version(), "26.2");
+        assert_eq!(first.release().fabric_loader_version(), "0.19.5");
 
         let second = &registry.instances()[1];
-        assert_eq!(second.id().as_str(), "beta_playground");
-        assert_eq!(second.release().channel(), ReleaseChannel::Beta);
-        assert_eq!(second.release().aurora_version(), Some("0.3.1-beta.2"));
+        assert_eq!(second.state(), InstanceState::Installing);
+        assert_eq!(second.release().aurora_version(), "0.3.1-beta.1");
+
+        assert!(
+            registry
+                .find(&InstanceId::new("aurora-default").unwrap())
+                .is_some()
+        );
+        assert!(registry.find(&InstanceId::new("ghost").unwrap()).is_none());
+    }
+
+    #[test]
+    fn saves_atomically_round_trips_and_rejects_duplicates() {
+        let directory = std::env::temp_dir()
+            .join("aurora-instances-test-save")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("instances.json");
+
+        let mut registry = InstanceRegistry::empty();
+        registry.instances_mut().push(
+            InstanceRecord::new(
+                InstanceId::new("saved-instance").unwrap(),
+                "Saved Instance",
+                InstanceState::Installing,
+                sample_pin(),
+            )
+            .unwrap(),
+        );
+        registry.save(&path).unwrap();
+
+        let reloaded = InstanceRegistry::load(&path).unwrap();
+        assert_eq!(reloaded, registry);
+        assert!(
+            !directory.join("instances.json.tmp").exists(),
+            "no temporary debris"
+        );
+
+        // Duplicate identifiers never reach disk.
+        let mut duplicated = registry.clone();
+        duplicated.instances_mut().push(
+            InstanceRecord::new(
+                InstanceId::new("saved-instance").unwrap(),
+                "Duplicate",
+                InstanceState::Ready,
+                sample_pin(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            duplicated.save(&path),
+            Err(InstanceRegistryError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -608,29 +858,33 @@ mod tests {
             ("{ not json", "malformed"),
             ("{}", "malformed"),
             (
-                r#"{ "schemaVersion": 2, "instances": [] }"#,
-                "schema version 2",
+                r#"{ "schemaVersion": 3, "instances": [] }"#,
+                "schema version 3",
             ),
             (
-                r#"{ "schemaVersion": 1, "instances": [ { "id": "../evil", "displayName": "Evil", "release": { "channel": "stable", "auroraVersion": null } } ] }"#,
+                r#"{ "schemaVersion": 1, "instances": [] }"#,
+                "schema version 1",
+            ),
+            (
+                r#"{ "schemaVersion": 2, "instances": [ { "id": "../evil", "displayName": "Evil", "state": "ready", "release": { "channel": "stable", "auroraVersion": "0.3.0", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } } ] }"#,
                 "only lowercase letters",
             ),
             (
-                r#"{ "schemaVersion": 1, "instances": [ { "id": "ok-id", "displayName": "", "release": { "channel": "stable", "auroraVersion": null } } ] }"#,
+                r#"{ "schemaVersion": 2, "instances": [ { "id": "ok-id", "displayName": "", "state": "ready", "release": { "channel": "stable", "auroraVersion": "0.3.0", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } } ] }"#,
                 "display name must not be empty",
             ),
             (
-                r#"{ "schemaVersion": 1, "instances": [ { "id": "ok-id", "displayName": "Ok", "release": { "channel": "weekly", "auroraVersion": null } } ] }"#,
+                r#"{ "schemaVersion": 2, "instances": [ { "id": "ok-id", "displayName": "Ok", "state": "ready", "release": { "channel": "weekly", "auroraVersion": "0.3.0", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } } ] }"#,
                 "unknown variant",
             ),
             (
-                r#"{ "schemaVersion": 1, "instances": [ { "id": "ok-id", "displayName": "Ok", "release": { "channel": "stable", "auroraVersion": " " } } ] }"#,
+                r#"{ "schemaVersion": 2, "instances": [ { "id": "ok-id", "displayName": "Ok", "state": "ready", "release": { "channel": "stable", "auroraVersion": " ", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } } ] }"#,
                 "pinned Aurora version",
             ),
             (
-                r#"{ "schemaVersion": 1, "instances": [
-                    { "id": "dupe", "displayName": "First", "release": { "channel": "stable", "auroraVersion": null } },
-                    { "id": "dupe", "displayName": "Second", "release": { "channel": "beta", "auroraVersion": null } }
+                r#"{ "schemaVersion": 2, "instances": [
+                    { "id": "dupe", "displayName": "First", "state": "ready", "release": { "channel": "stable", "auroraVersion": "0.3.0", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } },
+                    { "id": "dupe", "displayName": "Second", "state": "ready", "release": { "channel": "beta", "auroraVersion": "0.3.1", "minecraftVersion": "26.2", "fabricLoaderVersion": "0.19.5" } }
                 ] }"#,
                 "more than once",
             ),
@@ -645,6 +899,22 @@ mod tests {
                 "expected '{expected_fragment}' in: {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_malformed_registry_file_is_never_overwritten_by_save() {
+        let directory = std::env::temp_dir()
+            .join("aurora-instances-test-preserve")
+            .join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("instances.json");
+        std::fs::write(&path, "{ damaged").unwrap();
+
+        // Loading fails deliberately; a caller therefore never reaches save,
+        // and the damaged bytes remain exactly as they were.
+        assert!(InstanceRegistry::load(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ damaged");
     }
 
     fn persist_fixture(directory_name: &str, contents: &str) -> std::path::PathBuf {

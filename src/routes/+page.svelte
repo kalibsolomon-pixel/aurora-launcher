@@ -3,18 +3,29 @@
   import { listen } from "@tauri-apps/api/event";
   import {
     acquireArtifact,
+    createInstance,
     getApplicationStatus,
     getLauncherState,
     installGame,
+    listAuroraReleases,
     planFabricInstall,
     planMinecraftInstall,
+    renameInstance,
+    retryInstanceInstall,
+    selectInstance,
+    validateInstance,
     validateInstalledGame,
     LauncherBackendError,
     type AcquiredArtifact,
     type ApplicationStatus,
+    type AuroraReleaseSummary,
+    type AuroraChannel,
     type FabricPlanSummary,
     type InstalledGameSummary,
     type InstalledGameValidation,
+    type InstanceProgressEvent,
+    type InstanceSummary,
+    type InstanceValidationDto,
     type InstallProgressEvent,
     type LauncherState,
     type MinecraftPlanSummary,
@@ -64,6 +75,20 @@
   let validation = $state<InstalledGameValidation | null>(null);
   let validationError = $state<LauncherBackendError | null>(null);
 
+  // Production instance management (Phase 6). All state comes from Rust.
+  let releases = $state<AuroraReleaseSummary[]>([]);
+  let releasesError = $state<LauncherBackendError | null>(null);
+  let createDisplayName = $state("");
+  let createChannel = $state<AuroraChannel>("stable");
+  let createVersion = $state("");
+  let createBusy = $state(false);
+  let createProgress = $state<InstanceProgressEvent | null>(null);
+  let createError = $state<LauncherBackendError | null>(null);
+  let renaming = $state<{ id: string; name: string } | null>(null);
+  let instanceBusy = $state<string | null>(null);
+  let instanceValidations = $state<Record<string, InstanceValidationDto>>({});
+  let instanceError = $state<LauncherBackendError | null>(null);
+
   onMount(async () => {
     try {
       status = await getApplicationStatus();
@@ -82,20 +107,143 @@
           ? cause
           : new LauncherBackendError("unknown_error", "The launcher state could not be loaded.");
     }
+
+    try {
+      releases = await listAuroraReleases();
+      const preferred = releases.find((release) => release.channel === "stable");
+      if (preferred) {
+        createChannel = preferred.channel;
+        createVersion = preferred.auroraVersion;
+      }
+    } catch (cause: unknown) {
+      releasesError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The Aurora release list failed.");
+    }
   });
 
   onMount(() => {
-    // Native progress events drive the installation display.
-    let unsubscribe: (() => void) | null = null;
-    if (devPipelineProof) {
-      listen<InstallProgressEvent>("install-progress", (event) => {
-        installProgress = event.payload;
-      }).then((stop) => {
-        unsubscribe = stop;
-      });
-    }
-    return () => unsubscribe?.();
+    // Native progress events drive the installation displays.
+    let unsubscribeInstall: (() => void) | null = null;
+    let unsubscribeInstance: (() => void) | null = null;
+    listen<InstallProgressEvent>("install-progress", (event) => {
+      installProgress = event.payload;
+    }).then((stop) => {
+      unsubscribeInstall = stop;
+    });
+    listen<InstanceProgressEvent>("instance-progress", (event) => {
+      createProgress = event.payload;
+    }).then((stop) => {
+      unsubscribeInstance = stop;
+    });
+    return () => {
+      unsubscribeInstall?.();
+      unsubscribeInstance?.();
+    };
   });
+
+  async function refreshState() {
+    try {
+      launcherState = await getLauncherState();
+    } catch {
+      // State refresh is best-effort after mutations; load errors surface
+      // through the dedicated state card.
+    }
+  }
+
+  async function runCreateInstance(event: SubmitEvent) {
+    event.preventDefault();
+    createBusy = true;
+    createProgress = null;
+    createError = null;
+
+    try {
+      await createInstance({
+        displayName: createDisplayName.trim(),
+        channel: createChannel,
+        auroraVersion: createVersion,
+      });
+      createDisplayName = "";
+      await refreshState();
+    } catch (cause: unknown) {
+      createError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The instance creation failed.");
+      await refreshState();
+    } finally {
+      createBusy = false;
+    }
+  }
+
+  async function runSelect(id: string) {
+    instanceBusy = id;
+    instanceError = null;
+    try {
+      await selectInstance(id);
+      await refreshState();
+    } catch (cause: unknown) {
+      instanceError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The selection failed.");
+    } finally {
+      instanceBusy = null;
+    }
+  }
+
+  async function runRename(event: SubmitEvent) {
+    event.preventDefault();
+    if (!renaming) return;
+    instanceBusy = renaming.id;
+    instanceError = null;
+    try {
+      await renameInstance(renaming.id, renaming.name.trim());
+      renaming = null;
+      await refreshState();
+    } catch (cause: unknown) {
+      instanceError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The rename failed.");
+    } finally {
+      instanceBusy = null;
+    }
+  }
+
+  async function runRetry(id: string) {
+    instanceBusy = id;
+    instanceError = null;
+    createProgress = null;
+    try {
+      await retryInstanceInstall(id);
+      await refreshState();
+    } catch (cause: unknown) {
+      instanceError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The retry failed.");
+      await refreshState();
+    } finally {
+      instanceBusy = null;
+    }
+  }
+
+  async function runValidate(id: string) {
+    instanceBusy = id;
+    instanceError = null;
+    try {
+      instanceValidations[id] = await validateInstance(id);
+    } catch (cause: unknown) {
+      instanceError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The validation failed.");
+    } finally {
+      instanceBusy = null;
+    }
+  }
 
   async function runAcquisition(event: SubmitEvent) {
     event.preventDefault();
@@ -279,7 +427,7 @@
       {/if}
     </div>
 
-    {#if launcherState}
+      {#if launcherState}
       <dl>
         <div>
           <dt>Config schema version</dt>
@@ -293,19 +441,10 @@
           <dt>Known instances</dt>
           <dd>{launcherState.instances.length}</dd>
         </div>
-        {#each launcherState.instances as instance (instance.id)}
-          <div>
-            <dt>{instance.id}</dt>
-            <dd>
-              {instance.displayName} · {instance.channel}{#if instance.auroraVersion}
-                · Aurora {instance.auroraVersion}
-              {/if}
-            </dd>
-          </div>
-        {/each}
       </dl>
       <p class="footnote">
-        Instances cannot be created yet; instance management arrives in a later phase.
+        Instance management lives in the panel below. Installation is supported;
+        launching, Java management, and accounts are not implemented yet.
       </p>
     {:else if stateError}
       <div class="error-message" role="alert">
@@ -318,6 +457,213 @@
         <p>Loading persisted launcher state…</p>
       </div>
     {/if}
+  </section>
+
+  <section class="status-card" aria-labelledby="instances-title" aria-live="polite">
+    <div class="status-heading">
+      <div>
+        <p class="eyebrow">Persistent instances</p>
+        <h2 id="instances-title">Instances</h2>
+      </div>
+
+      {#if createBusy}
+        <span class="badge loading"><span aria-hidden="true"></span
+          >{createProgress ? createProgress.phase : "Working"}</span
+        >
+      {:else}
+        <span class="badge ready"><span aria-hidden="true"></span
+          >{launcherState?.instances.length ?? 0}</span
+        >
+      {/if}
+    </div>
+
+    <form class="acquire-form" onsubmit={runCreateInstance}>
+      <label>
+        <span>Display name</span>
+        <input
+          type="text"
+          bind:value={createDisplayName}
+          placeholder="e.g. My Aurora Setup"
+          required
+          maxlength="80"
+        />
+      </label>
+      <label>
+        <span>Channel</span>
+        <select bind:value={createChannel}>
+          <option value="stable">stable</option>
+          <option value="beta">beta</option>
+          <option value="nightly">nightly</option>
+        </select>
+      </label>
+      <label>
+        <span>Aurora release</span>
+        <select bind:value={createVersion} required>
+          {#each releases.filter((release) => release.channel === createChannel) as release (release.auroraVersion)}
+            <option value={release.auroraVersion}>
+              Aurora {release.auroraVersion} · Minecraft {release.minecraftVersion} · Fabric
+              {release.fabricLoaderVersion}
+            </option>
+          {/each}
+        </select>
+      </label>
+      <button
+        type="submit"
+        disabled={createBusy || createDisplayName.trim() === "" || createVersion === ""}
+      >
+        {createBusy ? "Creating…" : "Create instance"}
+      </button>
+    </form>
+
+    {#if createBusy && createProgress}
+      <dl>
+        <div>
+          <dt>Progress</dt>
+          <dd>
+            {createProgress.phase}
+            {#if createProgress.game}
+              · {createProgress.game.completedItems}/{createProgress.game.totalItems}
+            {/if}
+          </dd>
+        </div>
+      </dl>
+    {/if}
+
+    {#if createError}
+      <div class="error-message" role="alert">
+        <p>{createError.message}</p>
+        <code>{createError.code}</code>
+      </div>
+    {/if}
+
+    {#if releasesError}
+      <div class="error-message" role="alert">
+        <p>{releasesError.message}</p>
+        <code>{releasesError.code}</code>
+      </div>
+    {:else if releases.length > 0 && releases[0].source === "development-fixture"}
+      <p class="footnote">
+        Aurora releases currently come from the launcher's checked-in development fixture —
+        no production release infrastructure exists yet. Serve
+        <code>src-tauri/development</code> on 127.0.0.1:8765 for artifact downloads.
+      </p>
+    {/if}
+
+    {#if instanceError}
+      <div class="error-message" role="alert">
+        <p>{instanceError.message}</p>
+        <code>{instanceError.code}</code>
+      </div>
+    {/if}
+
+    {#if launcherState && launcherState.instances.length === 0 && !createBusy}
+      <p class="footnote">No instances yet — create the first one above.</p>
+    {/if}
+
+    {#if launcherState}
+      {#each launcherState.instances as instance (instance.id)}
+      <div class="instance-row">
+        <div class="instance-main">
+          <div class="instance-title">
+            <strong>{instance.displayName}</strong>
+            {#if launcherState.config.selectedInstanceId === instance.id}
+              <span class="badge ready"><span aria-hidden="true"></span>Selected</span>
+            {/if}
+            {#if instance.state === "installing"}
+              <span class="badge loading"><span aria-hidden="true"></span>Installing</span>
+            {:else if instanceValidations[instance.id]?.status === "damaged"}
+              <span class="badge error"><span aria-hidden="true"></span>Damaged</span>
+            {:else if instanceValidations[instance.id]?.status === "ready"}
+              <span class="badge ready"><span aria-hidden="true"></span>Verified</span>
+            {:else if instance.state === "ready"}
+              <span class="badge ready"><span aria-hidden="true"></span>Ready</span>
+            {/if}
+          </div>
+          <div class="instance-meta">
+            Aurora {instance.auroraVersion} ({instance.channel}) · Minecraft
+            {instance.minecraftVersion} · Fabric {instance.fabricLoaderVersion}
+          </div>
+          <div class="instance-meta instance-id">id: {instance.id}</div>
+
+          {#if instanceValidations[instance.id]}
+            <div
+              class="instance-meta validation-line"
+              class:damaged={instanceValidations[instance.id].status === "damaged"}
+            >
+              Validation: {instanceValidations[instance.id].status}
+              {#each instanceValidations[instance.id].problems as problem (problem.reason)}
+                <div class="instance-meta">
+                  {problem.component}: {problem.reason}
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <div class="instance-actions">
+          {#if renaming?.id === instance.id}
+            <form class="rename-form" onsubmit={runRename}>
+              <input
+                type="text"
+                bind:value={renaming.name}
+                required
+                maxlength="80"
+                placeholder="New display name"
+              />
+              <button type="submit" disabled={instanceBusy === instance.id}>Save</button>
+              <button
+                type="button"
+                onclick={() => (renaming = null)}
+                disabled={instanceBusy === instance.id}
+              >
+                Cancel
+              </button>
+            </form>
+          {:else}
+            {#if launcherState.config.selectedInstanceId !== instance.id}
+              <button
+                type="button"
+                onclick={() => runSelect(instance.id)}
+                disabled={instanceBusy === instance.id || createBusy}
+              >
+                Select
+              </button>
+            {/if}
+            <button
+              type="button"
+              onclick={() => (renaming = { id: instance.id, name: instance.displayName })}
+              disabled={instanceBusy === instance.id || createBusy}
+            >
+              Rename
+            </button>
+            {#if instance.state === "installing"}
+              <button
+                type="button"
+                onclick={() => runRetry(instance.id)}
+                disabled={instanceBusy === instance.id || createBusy}
+              >
+                Retry install
+              </button>
+            {/if}
+            <button
+              type="button"
+              onclick={() => runValidate(instance.id)}
+              disabled={instanceBusy === instance.id || createBusy}
+            >
+              Validate
+            </button>
+          {/if}
+        </div>
+      </div>
+      {/each}
+    {/if}
+
+    <p class="footnote">
+      Instances are complete, isolated installations — game, Fabric, and the Aurora client
+      artifact — validated before they are reported ready. They cannot be launched yet:
+      Java management, accounts, and launching arrive in later phases. Instance deletion
+      is deliberately not implemented.
+    </p>
   </section>
 
   {#if devPipelineProof}
@@ -940,6 +1286,109 @@
   .acquire-form button:disabled {
     opacity: 0.6;
     cursor: progress;
+  }
+
+  .acquire-form select {
+    width: 100%;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid #2a3149;
+    border-radius: 8px;
+    background: #10141f;
+    color: #e7ecf7;
+    font: inherit;
+    font-size: 0.9rem;
+  }
+
+  .instance-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 1rem 1.5rem;
+    border-bottom: 1px solid #20263a;
+  }
+
+  .instance-main {
+    min-width: 0;
+    flex: 1 1 18rem;
+  }
+
+  .instance-title {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+
+  .instance-meta {
+    margin-top: 0.35rem;
+    color: #818ca4;
+    font-size: 0.84rem;
+    overflow-wrap: anywhere;
+  }
+
+  .instance-meta.instance-id {
+    font-size: 0.76rem;
+  }
+
+  .validation-line.damaged {
+    color: #ff9a9a;
+  }
+
+  .instance-actions {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .instance-actions button {
+    padding: 0.4rem 0.85rem;
+    border: 1px solid #2a3149;
+    border-radius: 8px;
+    background: #1a2032;
+    color: #e7ecf7;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .instance-actions button:hover:not(:disabled) {
+    border-color: #6f5df2;
+  }
+
+  .instance-actions button:disabled {
+    opacity: 0.55;
+    cursor: progress;
+  }
+
+  .rename-form {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .rename-form input {
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #2a3149;
+    border-radius: 8px;
+    background: #10141f;
+    color: #e7ecf7;
+    font: inherit;
+    font-size: 0.85rem;
+  }
+
+  .rename-form button {
+    padding: 0.4rem 0.85rem;
+    border: 1px solid #2a3149;
+    border-radius: 8px;
+    background: #1a2032;
+    color: #e7ecf7;
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
   }
 
   .loading-message {

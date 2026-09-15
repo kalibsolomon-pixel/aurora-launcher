@@ -42,6 +42,10 @@ sha2 = "0.10"
 # `sync` for the per-instance installation exclusion mutex (no new crate).
 tokio = { version = "1", default-features = false, features = ["fs", "io-util", "sync"] }
 url = "2"
+# Instance identifier generation (Phase 6): opaque, collision-resistant UUIDv4
+# in the canonical simple (hyphen-less) lowercase-hex form. Focused and
+# universally maintained; v4 needs the `rng` feature's OS entropy.
+uuid = { version = "1.26", features = ["v4"] }
 # ZIP-only archive support (Phase 5): Minecraft native artifacts are ZIP/JAR
 # files. Focused maintained implementation (zip-rs); `deflate` covers the
 # compression real native jars use, everything else stays off.

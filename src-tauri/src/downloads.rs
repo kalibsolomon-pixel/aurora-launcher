@@ -77,6 +77,17 @@ impl ArtifactSource {
         Self::build(url, sha256, size_bytes, HostPolicy::LoopbackHttpAllowed)
     }
 
+    /// Creates validated metadata accepting the documented transport
+    /// policy: a production HTTPS URL, or an explicit loopback HTTP URL
+    /// (the path the checked-in development release fixture uses).
+    pub fn https_or_loopback(
+        url: &str,
+        sha256: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha256, size_bytes, HostPolicy::LoopbackHttpAllowed)
+    }
+
     fn build(
         url: &str,
         sha256: &str,

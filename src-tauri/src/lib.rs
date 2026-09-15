@@ -1,4 +1,5 @@
 mod application;
+pub mod aurora;
 pub mod cache;
 pub mod config;
 pub mod distribution;
@@ -25,7 +26,13 @@ pub fn run() {
             application::plan_minecraft_install,
             application::plan_fabric_install,
             application::install_game,
-            application::validate_installed_game
+            application::validate_installed_game,
+            application::list_aurora_releases,
+            application::create_instance,
+            application::retry_instance_install,
+            application::rename_instance,
+            application::select_instance,
+            application::validate_instance
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");

@@ -58,13 +58,6 @@ export interface LauncherConfigSummary {
   selectedInstanceId: string | null;
 }
 
-export interface InstanceSummary {
-  id: string;
-  displayName: string;
-  channel: ReleaseChannel;
-  auroraVersion: string | null;
-}
-
 export interface LauncherState {
   config: LauncherConfigSummary;
   instances: InstanceSummary[];
@@ -275,6 +268,162 @@ export async function validateInstalledGame(
     throw new LauncherBackendError(
       "backend_unavailable",
       "The installed game could not be validated.",
+    );
+  }
+}
+
+export type AuroraChannel = "stable" | "beta" | "nightly";
+
+/** One Aurora release offered for instance creation. */
+export interface AuroraReleaseSummary {
+  source: string;
+  auroraVersion: string;
+  channel: AuroraChannel;
+  minecraftVersion: string;
+  fabricLoaderVersion: string;
+  javaMajorVersion: number;
+}
+
+export async function listAuroraReleases(): Promise<AuroraReleaseSummary[]> {
+  try {
+    return await invoke<AuroraReleaseSummary[]>("list_aurora_releases");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The Aurora release list could not be loaded.",
+    );
+  }
+}
+
+export interface InstanceSummary {
+  id: string;
+  displayName: string;
+  state: "installing" | "ready";
+  channel: AuroraChannel;
+  auroraVersion: string;
+  minecraftVersion: string;
+  fabricLoaderVersion: string;
+}
+
+export interface CreateInstanceRequest {
+  displayName: string;
+  channel: AuroraChannel;
+  auroraVersion: string;
+}
+
+/** One lifecycle progress event; game item progress is embedded verbatim. */
+export interface InstanceProgressEvent {
+  phase:
+    | "resolvingRelease"
+    | "resolvingGame"
+    | "installingGame"
+    | "installingAurora"
+    | "validating"
+    | "completing";
+  game: InstallProgressEvent | null;
+}
+
+export async function createInstance(
+  request: CreateInstanceRequest,
+): Promise<InstanceSummary> {
+  try {
+    return await invoke<InstanceSummary>("create_instance", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance could not be created.",
+    );
+  }
+}
+
+export async function retryInstanceInstall(instanceId: string): Promise<InstanceSummary> {
+  try {
+    return await invoke<InstanceSummary>("retry_instance_install", {
+      request: { instanceId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The installation could not be retried.",
+    );
+  }
+}
+
+export async function renameInstance(
+  instanceId: string,
+  newDisplayName: string,
+): Promise<InstanceSummary> {
+  try {
+    return await invoke<InstanceSummary>("rename_instance", {
+      request: { instanceId, newDisplayName },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance could not be renamed.",
+    );
+  }
+}
+
+export async function selectInstance(instanceId: string): Promise<void> {
+  try {
+    await invoke<void>("select_instance", { request: { instanceId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance could not be selected.",
+    );
+  }
+}
+
+export type InstanceValidationStatus = "ready" | "damaged" | "installing" | "notInstalled";
+
+export interface InstanceProblem {
+  component: string;
+  reason: string;
+}
+
+/** Complete read-only validation outcome of one instance. */
+export interface InstanceValidationDto {
+  instanceId: string;
+  displayName: string;
+  status: InstanceValidationStatus;
+  problems: InstanceProblem[];
+}
+
+export async function validateInstance(instanceId: string): Promise<InstanceValidationDto> {
+  try {
+    return await invoke<InstanceValidationDto>("validate_instance", {
+      request: { instanceId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance could not be validated.",
     );
   }
 }

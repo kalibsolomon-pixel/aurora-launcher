@@ -1,15 +1,37 @@
-//! Typed data model for future Aurora release manifests.
+//! Typed data model and resolution for Aurora release manifests.
 //!
-//! This phase only represents and validates release metadata locally.
-//! Fetching manifests, verifying artifact hashes, and installing releases are
-//! deferred; nothing in this module performs I/O.
+//! The model parses and validates release metadata locally; resolution
+//! selects exact releases from a manifest. Aurora release *distribution*
+//! does not exist yet: there is no production manifest endpoint and no
+//! artifact repository, so the only operational source today is the
+//! checked-in development fixture (see `src-tauri/development/`), embedded
+//! via [`development_manifest`]. The resolver consumes any parsed, validated
+//! manifest, so wiring a real HTTPS release source later is an additive
+//! change rather than a redesign; the launcher will not pretend production
+//! release discovery exists until it does.
+//!
+//! Manifest authenticity, honestly stated: a manifest fetched over HTTPS
+//! would be HTTPS-authenticated release metadata, not independently
+//! signature-verified — the SHA-256 values inside it verify downloaded
+//! artifacts against the manifest, and compromise of the manifest origin
+//! could replace both artifact URL and expected digest together. No signing
+//! infrastructure exists, so none is invented.
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
+
+use crate::downloads::is_loopback_host;
 
 /// The only release-manifest schema version this launcher understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+
+/// The checked-in development release fixture (see `src-tauri/development/`).
+///
+/// Development artifact URLs are pinned to a loopback server the developer
+/// runs; production release infrastructure does not exist yet.
+const DEVELOPMENT_MANIFEST_JSON: &str = include_str!("../development/aurora-releases.json");
 
 /// A versioned collection of Aurora releases.
 ///
@@ -62,6 +84,36 @@ impl ReleaseManifest {
     pub fn releases(&self) -> &[AuroraRelease] {
         &self.releases
     }
+
+    /// Resolves one exact release by Aurora version, optionally requiring a
+    /// specific channel.
+    ///
+    /// Selection is exact, mirroring the launcher's version-selection
+    /// policy everywhere: no "latest", no channel fallback, no
+    /// substitution. The first matching release wins; manifests list
+    /// versions uniquely in practice, and a duplicated version with
+    /// disagreeing facts is a manifest authoring error surfaced by the
+    /// exactness of this lookup.
+    pub fn resolve_exact(
+        &self,
+        aurora_version: &str,
+        channel: Option<ReleaseChannel>,
+    ) -> Option<&AuroraRelease> {
+        self.releases.iter().find(|release| {
+            release.aurora_version() == aurora_version
+                && channel.is_none_or(|required| release.channel() == required)
+        })
+    }
+}
+
+/// The operational development release source: the checked-in fixture
+/// manifest, parsed and validated like any other manifest.
+///
+/// This exists because no production Aurora release endpoint exists. It is
+/// development-only by construction (its artifact URLs are loopback), and
+/// the UI labels it as a development source.
+pub fn development_manifest() -> Result<ReleaseManifest, ManifestError> {
+    ReleaseManifest::from_json(DEVELOPMENT_MANIFEST_JSON)
 }
 
 /// A single released Aurora build and its compatibility mapping.
@@ -117,6 +169,22 @@ pub enum ReleaseChannel {
     Stable,
     Beta,
     Nightly,
+}
+
+impl ReleaseChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+impl fmt::Display for ReleaseChannel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// The Java runtime a release requires, identified by major version.
@@ -233,18 +301,22 @@ fn validate_version_field(field: &str, value: &str) -> Result<(), String> {
 }
 
 fn validate_https_url(value: &str) -> Result<(), String> {
-    let rest = value
-        .strip_prefix("https://")
-        .ok_or_else(|| "artifact URL must use HTTPS".to_owned())?;
-
-    if rest.is_empty() {
-        return Err("artifact URL must include a host".to_owned());
+    // Production release artifacts must use HTTPS; cleartext is accepted
+    // only for explicit loopback hosts — the launcher's documented
+    // development/test transport (the checked-in development fixture is
+    // served from one), the same policy every other transport boundary
+    // applies.
+    let parsed = Url::parse(value).map_err(|_| "artifact URL is not valid".to_owned())?;
+    if parsed.cannot_be_a_base() {
+        return Err("artifact URL is not valid".to_owned());
     }
-    if rest.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err("artifact URL must not contain whitespace or control characters".to_owned());
+    if parsed.scheme() == "https" {
+        return Ok(());
     }
-
-    Ok(())
+    if parsed.scheme() == "http" && is_loopback_host(&parsed) {
+        return Ok(());
+    }
+    Err("artifact URL must use HTTPS".to_owned())
 }
 
 fn validate_sha256_hex(value: &str) -> Result<(), String> {
@@ -393,7 +465,10 @@ mod tests {
                 replace_artifact_field(&valid, 0, "url", "http://insecure.example/aurora.jar"),
                 "HTTPS",
             ),
-            (replace_artifact_field(&valid, 0, "url", "https://"), "host"),
+            (
+                replace_artifact_field(&valid, 0, "url", "https://"),
+                "not valid",
+            ),
             (
                 replace_artifact_field(&valid, 0, "sha256", "deadbeef"),
                 "64 hexadecimal",
@@ -432,6 +507,83 @@ mod tests {
             assert!(
                 message.contains(expected_fragment),
                 "expected error for {json} to mention '{expected_fragment}', got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_urls_accept_https_and_loopback_http_only() {
+        assert!(validate_https_url("https://releases.example.invalid/a.jar").is_ok());
+        assert!(validate_https_url("http://127.0.0.1:8765/aurora-0.3.0-dev.jar").is_ok());
+        assert!(validate_https_url("http://localhost:8765/a.jar").is_ok());
+        assert!(validate_https_url("http://[::1]:8765/a.jar").is_ok());
+
+        for rejected in [
+            "http://releases.example.invalid/a.jar",
+            "http://192.168.0.2/a.jar",
+            "ftp://releases.example.invalid/a.jar",
+            "not a url",
+        ] {
+            assert!(
+                validate_https_url(rejected).is_err(),
+                "{rejected} must be rejected as an artifact URL"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_resolution_selects_precisely_without_substitution() {
+        let manifest = ReleaseManifest::from_json(VALID_MANIFEST).unwrap();
+
+        let stable = manifest
+            .resolve_exact("0.3.0", Some(ReleaseChannel::Stable))
+            .expect("the exact stable release must resolve");
+        assert_eq!(stable.minecraft_version(), "1.21.11");
+
+        // Same version pinned to the wrong channel does not resolve to it.
+        assert!(
+            manifest
+                .resolve_exact("0.3.0", Some(ReleaseChannel::Nightly))
+                .is_none()
+        );
+        // Unknown versions never fall back to anything.
+        assert!(manifest.resolve_exact("0.9.9", None).is_none());
+        // Channel-agnostic lookup still requires the exact version.
+        let nightly = manifest
+            .resolve_exact("0.4.0-nightly.20260914", None)
+            .unwrap();
+        assert_eq!(nightly.channel(), ReleaseChannel::Nightly);
+    }
+
+    #[test]
+    fn the_development_fixture_parses_and_resolves() {
+        let manifest = development_manifest().expect("the checked-in fixture must parse");
+
+        let release = manifest
+            .resolve_exact("0.3.0", Some(ReleaseChannel::Stable))
+            .expect("the fixture's stable release must resolve");
+        assert_eq!(release.minecraft_version(), "26.2");
+        assert_eq!(release.fabric_loader_version(), "0.19.5");
+        assert!(
+            release
+                .artifact()
+                .url()
+                .starts_with("http://127.0.0.1:8765/")
+        );
+        assert_eq!(release.artifact().size_bytes(), Some(57));
+
+        // Every channel the model supports is represented by the fixture.
+        for channel in [
+            ReleaseChannel::Stable,
+            ReleaseChannel::Beta,
+            ReleaseChannel::Nightly,
+        ] {
+            assert!(
+                manifest
+                    .releases()
+                    .iter()
+                    .any(|release| release.channel() == channel),
+                "the development fixture must carry a {channel:?} release"
             );
         }
     }

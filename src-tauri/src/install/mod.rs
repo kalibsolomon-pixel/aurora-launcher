@@ -106,6 +106,18 @@ impl InstallContext {
         }
     }
 
+    /// Test context with explicit transport limits and a loopback asset
+    /// root (the launcher's documented test-transport pattern).
+    pub fn loopback_for_testing(
+        download_options: DownloadOptions,
+        asset_endpoints: AssetObjectEndpoints,
+    ) -> Self {
+        Self {
+            download_options,
+            asset_endpoints,
+        }
+    }
+
     pub fn download_options(&self) -> &DownloadOptions {
         &self.download_options
     }

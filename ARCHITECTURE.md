@@ -382,6 +382,66 @@ One installation may run per instance at a time (an in-process per-instance asyn
 
 New stable command codes: `instance_id_invalid`, `installation_already_in_progress`, `installation_state_invalid`, `installation_target_conflict`, `minecraft_asset_index_invalid`, `minecraft_asset_invalid`, `native_archive_invalid`, `native_extraction_failure`, `artifact_materialization_failure`, `installation_validation_failure`, `installation_commit_failure`, and `fabric_artifact_unverified` (a digest-less Fabric artifact whose content drifted from its locally recorded observation). Acquisition failures keep their established transport/integrity/cache codes. Acquisition, integrity, malformed asset metadata, extraction, materialization, validation, and commit failures are distinct categories, each carrying developer context without exposing raw library errors.
 
+## Implemented in Phase 6
+
+Phase 6 turns the low-level installation capabilities into a persistent Aurora launcher instance: a writable instance registry, instance creation/rename/selection with referential integrity, an operational Aurora release model, SHA-256-verified Aurora client-artifact installation with its own installed-state record, complete read-only instance validation, and the first restrained production instance UI. An instance is complete and persistent — it is still not launchable: Java management, authentication, and process launching remain deferred, and instance deletion is deliberately unimplemented.
+
+### Instance registry (writable, schema 2)
+
+`launcher/instances.json` is now load-and-save. Schema 2 records carry the validated `InstanceId`, the display name (never a path), an explicit lifecycle `state` (`installing`/`ready`), and a concrete release pin (`channel`, `auroraVersion`, `minecraftVersion`, `fabricLoaderVersion`). Schema 1 — from before any code could write the registry — fails deliberately as unsupported; malformed registries are never overwritten. Saves are atomic (sibling temporary file plus rename), reject duplicate identifiers before touching disk, and registry read-modify-write windows are serialized by a process-wide mutex (long installations run outside it). "Channel-only" pins are deliberately unrepresentable: channels drift over time, installed state must identify the concrete release.
+
+### Instance identity
+
+Identifiers are generated, not user-chosen: opaque UUIDv4 in the canonical simple lowercase-hex form (32 characters, satisfying every `InstanceId` rule by construction), independent of display names and of timestamps alone. Generation re-checks uniqueness against the registry and the filesystem. The `uuid` crate (v4) is the one new dependency — a focused, universally maintained implementation rather than a custom identifier scheme.
+
+### Creation, failure, and retry semantics (one coherent policy)
+
+```text
+resolve exact Aurora release
+      ↓ allocate UUID, persist registry record with state = installing
+resolve Minecraft + Fabric plans → Phase 5 game installer
+      ↓ acquire + materialize Aurora artifact (SHA-256 verified)
+complete read-only validation
+      ↓ commit ready state (registry) → select if nothing is selected
+ready instance
+```
+
+The `installing` record is persisted **before** the long installation runs, so a failure at any point — including a 15-minute game install dying midway — leaves an explicit non-ready record with its pinned release, never an ordinary-looking healthy instance and never a silent gap. Rollback never deletes anything (user data and managed trees alike are preserved for diagnosis); instead, `retry_instance_install` re-runs the installation for that same record, reusing Phase 5's staged-install recovery (a complete prior install is deliberately replaced; staging debris is recovered) and the verified caches, so already-valid artifacts are not re-downloaded. The record becomes `ready` only after complete validation passes, and nothing else moves it there. Progress is Rust-owned (`instance-progress` events) and composes the Phase 5 installer's item progress verbatim during the game-installation phase rather than duplicating it.
+
+### Selection and referential integrity
+
+The first successfully created instance is selected automatically when nothing is selected (explicit policy, tested); later creations never change an existing selection. Selection writes only identifiers that exist in the registry, and loading launcher state with a dangling stored selection is a deliberate error (`config_selected_instance_dangling`) — the launcher never silently selects a random instance and never repairs the selection behind the user's back.
+
+### Aurora release model (operational) and release source
+
+The Phase 1 release-manifest model is now operational: `ReleaseManifest::resolve_exact(version, channel)` selects exact releases — no "latest", no channel fallback, no substitution. **No production Aurora release infrastructure exists** (no manifest endpoint, no artifact repository), so the only operational source is the checked-in development fixture (`src-tauri/development/aurora-releases.json`, embedded via `include_str!`) whose artifact URLs pin a loopback development server the developer runs (`python -m http.server 8765` from that directory). The artifact-URL policy accepts HTTPS (production) and loopback cleartext (development/test) — the same policy every other transport boundary applies — and the UI labels the source as a development fixture; nothing implies production release discovery exists. Wiring a real HTTPS manifest source later is an additive change to this boundary. Manifest authenticity is stated honestly: an HTTPS-fetched manifest would be HTTPS-authenticated release metadata, not independently signature-verified — its SHA-256 values verify downloaded artifacts against it, and compromise of the manifest origin could replace both URL and digest together. No signing infrastructure exists, so none is invented.
+
+### Aurora artifact installation and managed ownership
+
+Aurora's client artifact always has a pre-known expected SHA-256 from release metadata, so acquisition uses the Phase 2 SHA-256 verified store unchanged — an Aurora artifact is always `ExpectedDigestVerified(sha256)`, never the transport-observed path reserved for digest-less Fabric artifacts; a release lacking a digest fails rather than weakening this. The artifact materializes at a deterministic launcher-managed path derived from validated release metadata (never a remote filename):
+
+```text
+instances/<id>/mods/aurora-<aurora version>.jar    # launcher-owned, repairable
+```
+
+The managed copy is size-checked and re-hashed against the expected digest before the Aurora installed-state record (`instances/<id>/aurora-installed.json`, schema 1, written atomically, committed only after the materialized artifact validates) records the concrete release facts and the artifact's path/size/SHA-256. Ownership is unambiguous: the launcher owns exactly the files its installed-state record names; every other file under `mods/` — and all user data — is user-owned, is never enumerated or removed by installation/update, and never counts as damage in validation. The record deliberately does not duplicate the game manifest; it is compared against the registry pin and the game manifest by complete validation.
+
+### Complete instance validation (read-only)
+
+`validate_instance` is the single deep, download-free, mutation-free check combining: registry presence; the Phase 5 game validation; the Aurora installed-state validation plus a SHA-256 re-hash of the materialized artifact; and cross-component consistency (registry pin ↔ Aurora installed state ↔ game manifest on Aurora/Minecraft/Fabric-Loader versions). The outcome is one of `ready`, `damaged` (with a concrete per-component problem list), `installing` (stored state; damage may exist underneath but readiness is not claimed), or `notInstalled`. The stored registry state is never treated as proof of health: `ready` is only reported when every component re-verifies. The stored `state` field is therefore not re-derived on every state load — deep validation hashes the whole installation and runs on demand.
+
+### User-data boundary (unchanged, now enforced end to end)
+
+`instances/<id>/game/` and the launcher-named Aurora artifact under `mods/` are launcher-managed and reconstructable. `mods/` (other files), `config/`, `logs/`, future `saves/`, screenshots, and resource packs are user data: creation, retry, rename, and validation never modify them, and rollback never deletes them.
+
+### Production UI boundary
+
+The production shell gains one restrained Instances panel: list (name, state, pinned versions), create (from the development release fixture, labeled as such), select, rename, retry (installing instances), and on-demand deep validation with per-problem output. Every displayed value is real Rust-owned state; progress comes only from native events. There is deliberately no launch control, no account/Java/mod-manager UI, and no instance deletion.
+
+### Performance and storage posture (documented, deliberately unchanged)
+
+Sequential game installation (~15 minutes cold for a modern version) and per-instance asset duplication remain as Phase 5 left them; instance creation reuses the verified caches so repeated creations of the same release are fast. Bounded download concurrency and hard-link asset sharing remain concrete future optimizations — they are not snuck into this phase.
+
 ## Frontend/native boundary
 
 Svelte is a presentation layer. Security-sensitive state and all future Minecraft/Aurora installation, authentication, download, integrity, Java/runtime, filesystem mutation, and process-launch logic stay behind native Rust commands or events. Commands should be narrow and use explicit request/response DTOs. Frontend code must not infer structured state by parsing strings.
@@ -390,11 +450,12 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 
 ## Current native modules
 
-- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`, `plan_fabric_install`, `install_game`, `validate_installed_game`).
+- `application`: constructs the status and launcher-state DTOs, maps internal failures to the command error contract, and exposes the Tauri commands (`get_application_status`, `get_launcher_state`, `acquire_artifact`, `plan_minecraft_install`, `plan_fabric_install`, `install_game`, `validate_installed_game`, `list_aurora_releases`, `create_instance`, `retry_instance_install`, `rename_instance`, `select_instance`, `validate_instance`).
 - `paths`: validates and represents the platform-resolved application-local data root and derives managed locations without touching the filesystem.
 - `config`: the versioned launcher-configuration model and its atomic JSON persistence.
-- `instances`: validated instance identifiers, instance records, and the read-only instance-registry loader.
-- `distribution`: the typed, validated Aurora release-manifest data model (local representation only).
+- `instances`: validated instance identifiers (plus UUIDv4 generation), instance records with lifecycle state and concrete release pins, the writable atomic-persisted instance registry, and `lifecycle` (creation, retry, rename, selection, and complete read-only instance validation).
+- `distribution`: the typed Aurora release-manifest model, exact release resolution, and the checked-in development release fixture (no production release infrastructure exists yet).
+- `aurora`: Aurora client-artifact installation — SHA-256-verified acquisition through the Phase 2 store, managed materialization under the instance's mods directory, and the versioned Aurora installed-state record.
 - `downloads`: transport for trusted artifact acquisition (HTTPS enforcement, redirect policy, timeouts, streamed transfer with inline verification for SHA-256, official SHA-1, and digest-less observed sources); also builds the shared HTTP client the metadata transports reuse.
 - `integrity`: canonical SHA-256 digests, official-metadata SHA-1 digests, streaming size/hash verification for both algorithms, and the `ArtifactTrust` representation of how bytes came to be trusted.
 - `cache`: the content-addressed artifact stores — SHA-256-addressed, SHA-1-addressed, and transport-observed with provenance sidecars — plus untrusted staging, cache-hit validation, and promotion.
@@ -404,7 +465,7 @@ SvelteKit is configured as a static, client-side SPA because Tauri has no Node s
 
 Future code should add a module when its behavior is implemented. Likely domain boundaries are instance lifecycle, Java/runtime management, distribution transport, authentication, and launch/process supervision. Avoid a speculative service container, placeholder traits, empty module trees, and generic mod-loader abstractions — Aurora uses Fabric, and the Fabric boundary is built directly.
 
-Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `instances_invalid`, `instances_unsupported_schema`, `instance_id_invalid`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, `minecraft_platform_unsupported`, `fabric_loader_version_invalid`, `fabric_metadata_network_failure`, `fabric_metadata_invalid`, `fabric_metadata_unsupported`, `fabric_loader_not_found`, `fabric_combination_unsupported`, `fabric_library_invalid`, `fabric_repository_invalid`, `fabric_plan_conflict`, `fabric_artifact_unverified`, `installation_already_in_progress`, `installation_state_invalid`, `installation_target_conflict`, `minecraft_asset_index_invalid`, `minecraft_asset_invalid`, `native_archive_invalid`, `native_extraction_failure`, `artifact_materialization_failure`, `installation_validation_failure`, and `installation_commit_failure`. Codes are compatibility contracts; keep them stable and user messages readable.
+Structured error codes crossing the command boundary: `managed_path_unavailable`, `config_malformed`, `config_unsupported_schema`, `config_selected_instance_dangling`, `instances_invalid`, `instances_unsupported_schema`, `instance_id_invalid`, `instance_not_found`, `instance_name_invalid`, `instance_registry_write_failure`, `instance_release_invalid`, `instance_not_ready`, `instance_consistency_failure`, `aurora_release_not_found`, `aurora_manifest_invalid`, `aurora_artifact_invalid`, `aurora_installation_invalid`, `aurora_materialization_failure`, `storage_io_failure`, `artifact_source_invalid`, `network_unavailable`, `download_http_failure`, `download_timeout`, `download_redirect_failure`, `artifact_size_mismatch`, `artifact_hash_mismatch`, `cache_io_failure`, `artifact_promotion_failure`, `minecraft_version_invalid`, `minecraft_version_not_found`, `minecraft_manifest_invalid`, `minecraft_version_metadata_invalid`, `minecraft_metadata_network_failure`, `minecraft_metadata_integrity_failure`, `minecraft_version_unsupported`, `minecraft_library_invalid`, `minecraft_artifact_invalid`, `minecraft_platform_unsupported`, `fabric_loader_version_invalid`, `fabric_metadata_network_failure`, `fabric_metadata_invalid`, `fabric_metadata_unsupported`, `fabric_loader_not_found`, `fabric_combination_unsupported`, `fabric_library_invalid`, `fabric_repository_invalid`, `fabric_plan_conflict`, `fabric_artifact_unverified`, `installation_already_in_progress`, `installation_state_invalid`, `installation_target_conflict`, `minecraft_asset_index_invalid`, `minecraft_asset_invalid`, `native_archive_invalid`, `native_extraction_failure`, `artifact_materialization_failure`, `installation_validation_failure`, and `installation_commit_failure`. Codes are compatibility contracts; keep them stable and user messages readable.
 
 ## Managed filesystem model
 
@@ -425,10 +486,12 @@ The implemented layout is:
 ├── metadata/       # verified manifests and installation metadata (derived, not created yet)
 └── instances/      # one directory per validated instance id
     └── <instance-id>/
-        ├── game/   # launcher-managed, reconstructable game tree (versions/libraries/assets/natives + installed-game.json); installation stages in .install-staging/ beside it
-        ├── mods/   # Aurora plus optional instance-scoped mods (user data)
-        ├── config/ # Minecraft, Fabric, Aurora, and mod configuration (user data)
-        └── logs/   # instance-local launch/game logs (user data)
+        ├── game/               # launcher-managed, reconstructable game tree (versions/libraries/assets/natives + installed-game.json); installation stages in .install-staging/ beside it
+        ├── mods/aurora-<version>.jar  # launcher-managed Aurora client artifact (other mods/ files are user data)
+        ├── aurora-installed.json      # Aurora installed-state record (instance root)
+        ├── mods/               # other files here are user data
+        ├── config/             # Minecraft, Fabric, Aurora, and mod configuration (user data)
+        └── logs/               # instance-local launch/game logs (user data)
 ```
 
 - Cache and incomplete temporary downloads should be safe to delete and reconstruct.
@@ -439,11 +502,11 @@ The implemented layout is:
 
 ## Instances
 
-An instance is an isolated, identifiable game installation with its own game directory, compatible Aurora release, Minecraft version, Fabric Loader version, Java requirements, and user content. The Phase 1 domain model (validated identifiers, records, registry loading, path derivation) is implemented; Phase 5 installs games into `instances/<id>/game/` for any validated instance id without requiring a registry record and without writing the registry. Creating, selecting in the UI, or deleting instances is still not implemented. Path validation prevents traversal, and destructive operations must prove that a target is beneath launcher-managed storage; within an instance, only `game/` and the derived `.install-staging/` are launcher-managed, while `mods/`, `config/`, `logs/`, and any future root-level user content are user data installation never touches.
+An instance is an isolated, identifiable game installation with its own game directory, compatible Aurora release, Minecraft version, Fabric Loader version, Java requirements, and user content. The full lifecycle through ready is implemented: opaque UUID identifiers, records with lifecycle state and concrete release pins, a writable atomic registry, creation and retry orchestration over the Phase 5 installer plus Aurora artifact installation, display-name rename, selection with referential integrity, and complete read-only validation. Deleting instances remains deliberately unimplemented (user-data retention deserves its own design). Path validation prevents traversal, and destructive operations must prove that a target is beneath launcher-managed storage; within an instance, `game/`, the derived `.install-staging/`, and the launcher-named `mods/aurora-<version>.jar` are managed, while other `mods/` files, `config/`, `logs/`, and any future root-level user content are user data the lifecycle never touches.
 
 ## Distribution metadata
 
-Aurora distribution should be manifest-driven rather than tied forever to one Minecraft version. The Phase 1 local schema implements exactly this shape:
+Aurora distribution should be manifest-driven rather than tied forever to one Minecraft version. The Phase 1 local schema implements exactly this shape, and Phase 6 made it operational locally:
 
 ```text
 Aurora release and channel
@@ -454,7 +517,7 @@ Aurora release and channel
   -> expected cryptographic hash
 ```
 
-The model supports stable, beta, and nightly channels and keeps each mapping independent. What remains future: hosting and fetching the manifest, signature verification, key rotation, canonical encoding, and rollback policy — decisions for the phase that implements distribution.
+The model supports stable, beta, and nightly channels and keeps each mapping independent; resolution is exact (`resolve_exact`), and instances pin concrete releases rather than channels. No production manifest endpoint or artifact repository exists: the operational source is the checked-in development fixture (`src-tauri/development/`), whose loopback artifact URLs a developer serves locally; a real HTTPS release source later is an additive boundary change. What remains future: production hosting and fetching of the manifest, signature verification, key rotation, canonical encoding, and rollback policy — decisions for the phase that implements real distribution.
 
 ## Security model
 
@@ -495,6 +558,7 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - `sha1` (added in Phase 3, RustCrypto) implements the digest algorithm official Mojang metadata actually publishes. It exists next to `sha2` so official SHA-1 expectations are represented and verified accurately — never faked as SHA-256 and never used for verified-cache identity. No other hash algorithm or generic digest framework was introduced.
 - `tokio` (added in Phase 2, `fs` + `io-util` features only) is used for async staging-file I/O. Tauri already runs commands on its tokio async runtime and enables these exact features, so the direct dependency adds no new packages; tests additionally enable `rt` + `macros` as a dev-dependency for `#[tokio::test]`, and Phase 5 enabled `sync` for the per-instance installation exclusion mutex (still no new packages).
 - `url` (added in Phase 2) parses artifact URLs so scheme and loopback-host enforcement is robust. It was already resolved in Tauri's dependency tree.
+- `uuid` (added in Phase 6, `v4` feature) generates opaque instance identifiers — the simplest mature solution to collision-resistant, name-independent, timestamp-independent IDs; the canonical simple form fits the identifier rules by construction. A custom identifier scheme would have been invented complexity.
 - `zip` (added in Phase 5, version 8.6, `deflate` feature only, default features off) implements the one archive format Minecraft native artifacts actually are — ZIP/JAR — for extraction only. It is the focused, actively maintained zip-rs implementation (stable 8.6.0, April 2026); its reader is wrapped by the launcher's own strict path-safety validation rather than trusted for it. No TAR support, no generic archive abstraction, no extra compression codecs.
 - Svelte and TypeScript implement the typed presentation layer; SvelteKit's static adapter is retained from the official Tauri Svelte template to produce a serverless SPA.
 - Vite supplies fast development and production asset builds; `svelte-check` provides compiler-aware type checking.
@@ -564,10 +628,22 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 - Reinstallation over a manifest-proven installation is an explicit, deliberate replacement; an unrecognizable existing `game/` tree is a hard conflict, and a malformed installed-state document is never overwritten — the user repairs it, not the installer.
 - Installation is sequential; one install per instance at a time (in-process async mutex, immediate `installation_already_in_progress` for overlaps). No download parallelism, no pause/resume, no cancellation, no repair yet — correctness first, each a deliberate future decision.
 
+## Major Phase 6 decisions
+
+- No production Aurora release infrastructure exists, so none was invented: the operational release source is the checked-in development fixture with loopback artifact URLs, labeled as development everywhere it surfaces, and the resolver consumes any parsed manifest so a real HTTPS source is additive later. Manifest authenticity is documented as HTTPS-authenticated (not signature-verified) — no signing infrastructure, no fake trust roots.
+- Instance identity is generated (UUIDv4, simple form), never derived from user text; display names remain pure metadata whose change cannot move a single file.
+- Registry writes are atomic and schema-versioned (schema 2 introduced lifecycle state and concrete release pins; schema 1 fails as unsupported rather than migrating). A malformed registry is never overwritten, and duplicate identifiers never reach disk.
+- Creation persists an explicit `installing` record before the long installation and promotes it to `ready` only after complete validation; failures leave a retryable non-ready record rather than any form of destructive rollback. "Damaged" is computed by validation on demand, never stored.
+- Aurora artifacts always require a pre-known expected SHA-256 and always verify through the Phase 2 SHA-256 store; the launcher-owned file is deterministically named from validated release metadata under `mods/`, with ownership recorded in a small versioned installed-state document that references — never duplicates — the game manifest.
+- Complete validation is read-only and download-free: registry presence, deep game validation, Aurora artifact re-hash, and three-way version consistency (pin ↔ Aurora state ↔ game manifest). The stored `ready` flag is a floor, not proof; the UI exposes deep validation on demand instead of hashing whole installations on every state load.
+- Selection is explicit: first successful instance auto-selected when nothing is selected, later creations never steal the selection, dangling selections are a deliberate state error, and nothing ever silently selects a random instance.
+- Registry mutations are serialized by a process-wide mutex held only across read-modify-write windows; installations run outside it under Phase 5's per-instance exclusion.
+- Sequential installation speed and per-instance asset duplication are deliberately untouched; they are documented, measured realities with concrete future optimization paths (bounded concurrency, hard links), not things to smuggle into a lifecycle phase.
+
 ## Explicitly deferred
 
-Authentication and token storage; Java runtime discovery, download, extraction, and management; Aurora installation as a product feature (the launcher installs the Minecraft + Fabric game only); manifest fetching and signature verification for Aurora distribution; instance creation/selection/deletion UX and registry writes (installation works for any validated instance id without a registry record); a full user-facing trust/pinning policy for transport-observed artifacts; repair and automatic repair of damaged installations (the installed-state manifest exists to enable it); launch-argument substitution, the final JVM logging argument, classpath command construction, and JVM/game process launching and supervision; pause/resume and cancellation of installations; download parallelism, retry, resume, bandwidth controls, and generalized queues; cache eviction and cache-size policy; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
+Authentication and token storage; Java runtime discovery, download, extraction, and management; production Aurora release infrastructure (manifest endpoint, artifact repository, signing) — today's source is the checked-in development fixture; instance deletion (user-data retention policy deserves its own design); generic mod management; a full user-facing trust/pinning policy for transport-observed artifacts; repair and automatic repair of damaged instances and installations (complete validation and the installed-state records exist to enable it); Aurora version updates and channel movement; launch-argument substitution, the final JVM logging argument, native launch-path selection, classpath command construction, and JVM/game process launching and supervision; pause/resume and cancellation of installations; download parallelism, retry, resume, bandwidth controls, and generalized queues; hard-link asset sharing and cache eviction/size policy; self-update; telemetry; social/news/cosmetic/cloud systems; and any custom backend service.
 
 ## Known limitations
 
-The launcher reports native status, persists a minimal configuration, loads the instance registry read-only, acquires verified artifacts into its content-addressed stores, resolves a normalized Minecraft installation plan for an exact modern version from official metadata, composes it with a normalized Fabric plan from official Fabric Meta, and installs the complete isolated game (client, libraries, natives, asset index, asset objects, logging configuration) into launcher-managed instance storage with a committed, re-validatable installed-state record. It does not create instances in the registry, install or manage Java runtimes, install Aurora itself, authenticate accounts, or launch anything. Minecraft and Fabric metadata are re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported, as are future `launcherMeta` generations and non-log4j2-xml logging types. The loader and intermediary Fabric artifacts have no published digests; they are acquired over secure transport with locally observed identities and TOFU-style consistency checks, which is explicitly weaker than expected-digest verification. Installation is sequential (no bounded download concurrency), one installation per instance at a time within this process (no cross-process locking), with no pause/resume/cancellation. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. Damaged installations are detected and reported but not repaired. A hand-edited `selectedInstanceId` is validated as an identifier shape but not checked against the registry until instance management exists. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.
+The launcher reports native status, persists a minimal configuration, loads the instance registry, acquires verified artifacts into its content-addressed stores, resolves a normalized Minecraft installation plan for an exact modern version from official metadata, composes it with a normalized Fabric plan from official Fabric Meta, installs the complete isolated game (client, libraries, natives, asset index, asset objects, logging configuration) into launcher-managed instance storage with a committed, re-validatable installed-state record, and — as of Phase 6 — creates, names, selects, retries, and completely validates persistent Aurora instances whose Aurora client artifact is SHA-256-verified and launcher-owned. It does not manage Java runtimes, authenticate accounts, launch anything, delete instances, or update Aurora across versions. Aurora releases come from the checked-in development fixture because no production release infrastructure exists; its artifact URLs require a loopback development server, and the UI says so. Minecraft and Fabric metadata are re-fetched on every resolution with no on-disk cache. Historical Minecraft versions (pre-modern-arguments metadata, `old_beta`/`old_alpha`, version inheritance) are deliberately unsupported, as are future `launcherMeta` generations and non-log4j2-xml logging types. The loader and intermediary Fabric artifacts have no published digests; they are acquired over secure transport with locally observed identities and TOFU-style consistency checks, which is explicitly weaker than expected-digest verification. Installation is sequential (~15 minutes cold for a modern version; warm cache reuse makes repeat creations fast), one installation per instance at a time within this process (no cross-process locking), with no pause/resume/cancellation; asset objects are copied per instance, doubling that disk usage alongside the shared cache. Concurrent acquisitions of the same artifact download in duplicate by design; only corruption-freedom is guaranteed. Damaged instances are detected and reported but not repaired. A hand-edited registry or a dangling selected instance id surface as deliberate errors and stay unrepaired until a launcher operation or the user resolves them. The TypeScript DTOs mirror the Rust DTOs manually; if the boundary grows further, evaluate generated bindings then rather than adding that dependency preemptively.

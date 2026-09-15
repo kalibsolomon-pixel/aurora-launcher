@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::aurora::AuroraInstallError;
 use crate::cache::{AcquisitionError, ArtifactCache, ArtifactOrigin};
 use crate::config::{ConfigError, ConfigLoad};
 use crate::distribution::ReleaseChannel;
@@ -12,6 +13,9 @@ use crate::install::{
     InstallContext, InstallError, InstallFaults, InstalledGameValidation, ValidationOutcome,
     ValidationStatus, install_game as execute_install_game,
     validate_installed_game as run_installed_game_validation,
+};
+use crate::instances::lifecycle::{
+    CreateInstanceRequest as LifecycleCreateRequest, InstanceError, InstanceFaults,
 };
 use crate::instances::{
     InstanceRecord, InstanceRegistry, InstanceRegistryError, InvalidInstanceId,
@@ -75,8 +79,26 @@ pub struct LauncherState {
 }
 
 impl LauncherState {
-    fn from_parts(config: crate::config::LauncherConfig, registry: InstanceRegistry) -> Self {
-        Self {
+    fn from_parts(
+        config: crate::config::LauncherConfig,
+        registry: InstanceRegistry,
+    ) -> Result<Self, CommandError> {
+        // Referential integrity: a stored selection must name a registered
+        // instance. A dangling one is a deliberate, documented error â€” the
+        // launcher never silently selects a random instance.
+        if let Some(selected) = config.selected_instance_id() {
+            if registry.find(selected).is_none() {
+                return Err(CommandError::new(
+                    "config_selected_instance_dangling",
+                    format!(
+                        "the configured selected instance '{}' does not exist in the instance registry; select an existing instance to repair the selection",
+                        selected
+                    ),
+                ));
+            }
+        }
+
+        Ok(Self {
             config: LauncherConfigSummary {
                 schema_version: config.schema_version(),
                 selected_instance_id: config.selected_instance_id().map(|id| id.to_string()),
@@ -86,7 +108,7 @@ impl LauncherState {
                 .iter()
                 .map(InstanceSummary::from_record)
                 .collect(),
-        }
+        })
     }
 }
 
@@ -102,8 +124,15 @@ pub struct LauncherConfigSummary {
 pub struct InstanceSummary {
     id: String,
     display_name: String,
+    /// The stored lifecycle state (`installing`/`ready`). Whether a ready
+    /// instance is still internally consistent is answered by the
+    /// `validate_instance` command, which performs the deep (hashing)
+    /// validation on demand rather than on every state load.
+    state: String,
     channel: ReleaseChannel,
-    aurora_version: Option<String>,
+    aurora_version: String,
+    minecraft_version: String,
+    fabric_loader_version: String,
 }
 
 impl InstanceSummary {
@@ -111,8 +140,11 @@ impl InstanceSummary {
         Self {
             id: record.id().to_string(),
             display_name: record.display_name().to_owned(),
+            state: record.state().as_str().to_owned(),
             channel: record.release().channel(),
-            aurora_version: record.release().aurora_version().map(str::to_owned),
+            aurora_version: record.release().aurora_version().to_owned(),
+            minecraft_version: record.release().minecraft_version().to_owned(),
+            fabric_loader_version: record.release().fabric_loader_version().to_owned(),
         }
     }
 }
@@ -160,6 +192,7 @@ impl From<InstanceRegistryError> for CommandError {
             InstanceRegistryError::Malformed(_) => "instances_invalid",
             InstanceRegistryError::UnsupportedSchema { .. } => "instances_unsupported_schema",
             InstanceRegistryError::Read(_) => "storage_io_failure",
+            InstanceRegistryError::Write(_) => "instance_registry_write_failure",
         };
         Self::new(code, error.to_string())
     }
@@ -328,7 +361,7 @@ pub fn get_launcher_state(app: AppHandle) -> Result<LauncherState, CommandError>
 
     let registry = InstanceRegistry::load(&managed_paths.instance_registry_file())?;
 
-    Ok(LauncherState::from_parts(loaded.into_config(), registry))
+    LauncherState::from_parts(loaded.into_config(), registry)
 }
 
 /// Typed artifact metadata accepted by the acquisition command.
@@ -366,9 +399,9 @@ pub enum AcquisitionOrigin {
 ///
 /// This is the development-facing proof of the acquisition pipeline: it takes
 /// typed artifact metadata (never a shell string or arbitrary path), runs the
-/// full untrusted-staging → verify → promote flow natively, and returns the
+/// full untrusted-staging â†’ verify â†’ promote flow natively, and returns the
 /// verified object. It accepts no fixture shortcuts, so it can only be driven
-/// with a real reachable source — deterministic pipeline verification lives
+/// with a real reachable source â€” deterministic pipeline verification lives
 /// in the Rust test suite, which uses local loopback test servers.
 #[tauri::command]
 pub async fn acquire_artifact(
@@ -437,7 +470,7 @@ pub struct MinecraftPlanSummary {
 /// This is the development-facing proof of the Phase 3 metadata-resolution
 /// layer: it performs real discovery, SHA-1-verified version-document
 /// fetching, parsing, and platform-aware planning in Rust, and installs
-/// nothing — no client jar, library, native, asset, or runtime is downloaded.
+/// nothing â€” no client jar, library, native, asset, or runtime is downloaded.
 #[tauri::command]
 pub async fn plan_minecraft_install(
     request: PlanMinecraftInstallRequest,
@@ -514,7 +547,7 @@ pub struct FabricPlanSummary {
 /// This is the development-facing proof of the Phase 4 Fabric resolution and
 /// composition layer: it performs real loader discovery, exact profile
 /// resolution, Mojang planning, and composition in Rust, and installs
-/// nothing — no Minecraft or Fabric artifact is downloaded.
+/// nothing â€” no Minecraft or Fabric artifact is downloaded.
 #[tauri::command]
 pub async fn plan_fabric_install(
     request: PlanFabricInstallRequest,
@@ -624,7 +657,7 @@ pub struct InstalledGameSummary {
 /// complete, isolated game into launcher-managed instance storage.
 ///
 /// This is the development-facing proof of the Phase 5 installation
-/// executor: it performs the full resolve → acquire → stage → validate →
+/// executor: it performs the full resolve â†’ acquire â†’ stage â†’ validate â†’
 /// commit flow natively and reports progress through `install-progress`
 /// events. It installs a game, never launches one, installs no Java runtime,
 /// and never touches the user's `.minecraft`.
@@ -740,7 +773,7 @@ pub struct ValidationProblemDto {
 }
 
 /// Validates one instance's installed game against its installed-state
-/// record — a read-only, download-free check that reports damage precisely.
+/// record â€” a read-only, download-free check that reports damage precisely.
 #[tauri::command]
 pub fn validate_installed_game(
     app: AppHandle,
@@ -784,6 +817,307 @@ fn validation_dto(validation: InstalledGameValidation) -> InstalledGameValidatio
             })
             .collect(),
     }
+}
+
+impl From<InstanceError> for CommandError {
+    fn from(error: InstanceError) -> Self {
+        match error {
+            InstanceError::Registry(registry) => Self::from(registry),
+            InstanceError::Config(config) => Self::from(config),
+            InstanceError::GameInstall(install) => Self::from(install),
+            InstanceError::Aurora(aurora) => Self::from(aurora),
+            InstanceError::GameResolution(resolution) => Self::from(resolution),
+            other => {
+                let code = match &other {
+                    InstanceError::NotFound { .. } => "instance_not_found",
+                    InstanceError::NotReady { .. } => "instance_not_ready",
+                    InstanceError::NameInvalid(_) => "instance_name_invalid",
+                    InstanceError::ReleaseInvalid(_) => "instance_release_invalid",
+                    InstanceError::AuroraReleaseNotFound { .. } => "aurora_release_not_found",
+                    InstanceError::Platform(_) => "minecraft_platform_unsupported",
+                    InstanceError::GameInstallState(_) => "installation_state_invalid",
+                    InstanceError::ValidationFailed { .. } => "instance_consistency_failure",
+                    InstanceError::Registry(_)
+                    | InstanceError::Config(_)
+                    | InstanceError::GameInstall(_)
+                    | InstanceError::Aurora(_)
+                    | InstanceError::GameResolution(_) => {
+                        unreachable!("handled by value above")
+                    }
+                };
+                Self::new(code, other.to_string())
+            }
+        }
+    }
+}
+
+impl From<AuroraInstallError> for CommandError {
+    fn from(error: AuroraInstallError) -> Self {
+        let code = match &error {
+            AuroraInstallError::ReleaseInvalid(_) => "aurora_artifact_invalid",
+            AuroraInstallError::ArtifactInvalid(_) => "aurora_artifact_invalid",
+            AuroraInstallError::Acquisition(_) => "aurora_artifact_invalid",
+            AuroraInstallError::Materialization { .. } => "aurora_materialization_failure",
+            AuroraInstallError::StateRead(_) | AuroraInstallError::State(_) => {
+                "aurora_installation_invalid"
+            }
+            AuroraInstallError::StateWrite(_) => "aurora_installation_invalid",
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
+/// One Aurora release offered for instance creation.
+///
+/// `source` is always explicit: today the only operational source is the
+/// checked-in development fixture, and the UI must not imply production
+/// release discovery exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuroraReleaseSummary {
+    source: &'static str,
+    aurora_version: String,
+    channel: ReleaseChannel,
+    minecraft_version: String,
+    fabric_loader_version: String,
+    java_major_version: u32,
+}
+
+/// Lists the Aurora releases available for instance creation.
+///
+/// Resolves from the operational development release source (a checked-in
+/// fixture) â€” no production Aurora release endpoint exists yet.
+#[tauri::command]
+pub fn list_aurora_releases() -> Result<Vec<AuroraReleaseSummary>, CommandError> {
+    let manifest = crate::distribution::development_manifest()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+
+    Ok(manifest
+        .releases()
+        .iter()
+        .map(|release| AuroraReleaseSummary {
+            source: "development-fixture",
+            aurora_version: release.aurora_version().to_owned(),
+            channel: release.channel(),
+            minecraft_version: release.minecraft_version().to_owned(),
+            fabric_loader_version: release.fabric_loader_version().to_owned(),
+            java_major_version: release.java().major_version(),
+        })
+        .collect())
+}
+
+/// Typed request for instance creation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateInstanceRequest {
+    display_name: String,
+    channel: ReleaseChannel,
+    aurora_version: String,
+}
+
+/// One lifecycle progress event payload; the game installer's item progress
+/// is embedded verbatim during the game-installation phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceProgressEvent {
+    phase: &'static str,
+    game: Option<InstallProgressEvent>,
+}
+
+/// Creates a complete persistent Aurora instance: resolve the release,
+/// install the game through the Phase 5 executor, install Aurora, validate
+/// everything, and mark the instance ready. Progress is reported through
+/// `instance-progress` events.
+#[tauri::command]
+pub async fn create_instance(
+    app: AppHandle,
+    request: CreateInstanceRequest,
+) -> Result<InstanceSummary, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+
+    let record = crate::instances::lifecycle::create_instance(
+        &managed_paths,
+        &managed_paths.instance_registry_file(),
+        &managed_paths.config_file(),
+        &endpoints,
+        LifecycleCreateRequest::new(
+            request.display_name,
+            request.channel,
+            request.aurora_version,
+        ),
+        &mut |progress| {
+            let _ = app.emit(
+                "instance-progress",
+                InstanceProgressEvent {
+                    phase: progress.phase.as_str(),
+                    game: progress.game.map(|game| InstallProgressEvent {
+                        phase: game.phase.as_str(),
+                        completed_items: game.completed_items,
+                        total_items: game.total_items,
+                        current_item: game.current_item,
+                    }),
+                },
+            );
+        },
+        InstanceFaults::default(),
+    )
+    .await?;
+
+    eprintln!(
+        "[aurora-launcher] created instance '{}' ({} {} for Minecraft {} + Fabric Loader {})",
+        record.id(),
+        record.release().channel(),
+        record.release().aurora_version(),
+        record.release().minecraft_version(),
+        record.release().fabric_loader_version(),
+    );
+
+    Ok(InstanceSummary::from_record(&record))
+}
+
+/// Typed request for retrying an unfinished instance installation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryInstanceRequest {
+    instance_id: String,
+}
+
+/// Retries the installation of an instance whose creation did not finish.
+#[tauri::command]
+pub async fn retry_instance_install(
+    app: AppHandle,
+    request: RetryInstanceRequest,
+) -> Result<InstanceSummary, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+
+    let record = crate::instances::lifecycle::retry_instance_install(
+        &managed_paths,
+        &managed_paths.instance_registry_file(),
+        &managed_paths.config_file(),
+        &endpoints,
+        &instance,
+        &mut |progress| {
+            let _ = app.emit(
+                "instance-progress",
+                InstanceProgressEvent {
+                    phase: progress.phase.as_str(),
+                    game: progress.game.map(|game| InstallProgressEvent {
+                        phase: game.phase.as_str(),
+                        completed_items: game.completed_items,
+                        total_items: game.total_items,
+                        current_item: game.current_item,
+                    }),
+                },
+            );
+        },
+        InstanceFaults::default(),
+    )
+    .await?;
+
+    Ok(InstanceSummary::from_record(&record))
+}
+
+/// Typed request for renaming an instance.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameInstanceRequest {
+    instance_id: String,
+    new_display_name: String,
+}
+
+/// Renames an instance's display name. Metadata only â€” identifiers and
+/// filesystem paths are untouched.
+#[tauri::command]
+pub fn rename_instance(
+    app: AppHandle,
+    request: RenameInstanceRequest,
+) -> Result<InstanceSummary, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+
+    let record = crate::instances::lifecycle::rename_instance(
+        &managed_paths.instance_registry_file(),
+        &instance,
+        request.new_display_name.trim(),
+    )?;
+
+    Ok(InstanceSummary::from_record(&record))
+}
+
+/// Typed request for selecting an instance.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectInstanceRequest {
+    instance_id: String,
+}
+
+/// Selects an instance. The selection always refers to a registered
+/// instance; a dangling selection is never written.
+#[tauri::command]
+pub fn select_instance(app: AppHandle, request: SelectInstanceRequest) -> Result<(), CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+
+    crate::instances::lifecycle::select_instance(
+        &managed_paths.instance_registry_file(),
+        &managed_paths.config_file(),
+        &instance,
+    )?;
+
+    Ok(())
+}
+
+/// The complete validation outcome of one instance, as reported by the
+/// read-only deep validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceValidationDto {
+    instance_id: String,
+    display_name: String,
+    status: String,
+    problems: Vec<InstanceProblemDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceProblemDto {
+    component: String,
+    reason: String,
+}
+
+/// Validates one instance completely â€” a read-only, download-free check
+/// covering the game installation, the Aurora installation and artifact
+/// bytes, and cross-component version consistency.
+#[tauri::command]
+pub fn validate_instance(
+    app: AppHandle,
+    request: ValidateInstalledGameRequest,
+) -> Result<InstanceValidationDto, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let registry = InstanceRegistry::load(&managed_paths.instance_registry_file())?;
+
+    let validation =
+        crate::instances::lifecycle::validate_instance(&managed_paths, &registry, &instance)?;
+
+    Ok(InstanceValidationDto {
+        instance_id: validation.instance_id,
+        display_name: validation.display_name,
+        status: validation.status.as_str().to_owned(),
+        problems: validation
+            .problems
+            .into_iter()
+            .map(|problem| InstanceProblemDto {
+                component: problem.component.to_owned(),
+                reason: problem.reason,
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -1299,19 +1633,25 @@ mod tests {
         .unwrap();
         let registry = InstanceRegistry::from_json(
             r#"{
-                "schemaVersion": 1,
+                "schemaVersion": 2,
                 "instances": [
                     {
                         "id": "aurora-default",
                         "displayName": "Aurora Default",
-                        "release": { "channel": "stable", "auroraVersion": null }
+                        "state": "ready",
+                        "release": {
+                            "channel": "stable",
+                            "auroraVersion": "0.3.0",
+                            "minecraftVersion": "26.2",
+                            "fabricLoaderVersion": "0.19.5"
+                        }
                     }
                 ]
             }"#,
         )
         .unwrap();
 
-        let state = LauncherState::from_parts(config, registry);
+        let state = LauncherState::from_parts(config, registry).unwrap();
 
         assert_eq!(state.config.schema_version, 1);
         assert_eq!(
@@ -1321,7 +1661,29 @@ mod tests {
         assert_eq!(state.instances.len(), 1);
         assert_eq!(state.instances[0].id, "aurora-default");
         assert_eq!(state.instances[0].display_name, "Aurora Default");
+        assert_eq!(state.instances[0].state, "ready");
         assert_eq!(state.instances[0].channel, ReleaseChannel::Stable);
-        assert_eq!(state.instances[0].aurora_version, None);
+        assert_eq!(state.instances[0].aurora_version, "0.3.0");
+        assert_eq!(state.instances[0].minecraft_version, "26.2");
+        assert_eq!(state.instances[0].fabric_loader_version, "0.19.5");
+    }
+
+    #[test]
+    fn a_dangling_selected_instance_is_a_deliberate_state_error() {
+        let config = crate::config::LauncherConfig::from_json(
+            r#"{ "schemaVersion": 1, "selectedInstanceId": "ghost" }"#,
+        )
+        .unwrap();
+        let registry = InstanceRegistry::empty();
+
+        let error = LauncherState::from_parts(config, registry).unwrap_err();
+
+        assert_eq!(error.code, "config_selected_instance_dangling");
+    }
+
+    #[test]
+    fn no_selection_or_a_valid_selection_loads_normally() {
+        let unselected = crate::config::LauncherConfig::default();
+        assert!(LauncherState::from_parts(unselected, InstanceRegistry::empty()).is_ok());
     }
 }

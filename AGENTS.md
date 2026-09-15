@@ -74,6 +74,20 @@ npm run tauri build
 - Never overwrite a malformed or unsupported-schema installed-state document; fail deliberately and leave repair to the user. Unknown existing `game/` trees are a hard conflict, not something to wipe.
 - One installation per instance at a time; overlapping attempts fail with `installation_already_in_progress`. Do not add download parallelism, pause/resume, or repair without a phase that owns those decisions.
 
+## Persistent instance lifecycle
+
+- Instance display names never determine paths or identifiers; identifiers are generated opaque UUIDs, and rename changes metadata only — never move a filesystem directory.
+- Registry writes are atomic (temporary sibling plus rename), schema-versioned, duplicate-checked, and never overwrite a malformed or unsupported file.
+- Incomplete instances are never reported ready: creation persists an explicit `installing` record before installing and promotes it to `ready` only after complete validation passes; failures leave a retryable record rather than destructive rollback.
+- Aurora artifacts require a pre-known expected SHA-256 from release metadata and verify through the SHA-256 store — never the transport-observed path; a release without a digest fails.
+- Aurora-managed mods are deterministically named (`mods/aurora-<version>.jar`) and recorded in the instance's Aurora installed-state document so they stay distinguishable from user mods; never delete or enumerate user mods/config during install, update, or rollback, and never treat unrelated user files as validation damage.
+- Instances pin concrete releases (channel + Aurora/Minecraft/Fabric Loader versions); never represent an instance as channel-only, never move instances between channels silently, and never auto-update.
+- The release source today is the checked-in development fixture because no production Aurora release infrastructure exists; never invent production URLs, endpoints, or signing — wire the real source when it exists and keep the UI honest about the development source.
+- Complete-instance validation is read-only and download-free: registry, game, Aurora artifact hash, and three-way version consistency. Never mutate or download during validation.
+- A dangling selected instance is a deliberate state error; never silently select a random instance. Selection writes only identifiers present in the registry.
+- Instance deletion is out of scope until a phase owns user-data retention policy; do not add delete buttons or recursive instance removal.
+- `.minecraft` remains off-limits.
+
 ## Verification and Git
 
 Run checks proportional to the change. Native-boundary or startup changes require type checking, Rust format/check/test, a production build, and a real application boot when the host permits it. Keep documentation aligned with implemented behavior. Preserve user changes, inspect `git status`, make focused commits, and never push unless explicitly requested.

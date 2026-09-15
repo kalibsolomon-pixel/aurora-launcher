@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "releases": [
+    {
+      "auroraVersion": "0.3.0",
+      "channel": "stable",
+      "minecraftVersion": "26.2",
+      "fabricLoaderVersion": "0.19.5",
+      "java": { "majorVersion": 25 },
+      "artifact": {
+        "url": "http://127.0.0.1:8765/aurora-0.3.0-dev.jar",
+        "sha256": "41765f8d32372d242b51a5509f467480be661c19d127ea203e5bdf9d5da4f2c3",
+        "sizeBytes": 57
+      }
+    },
+    {
+      "auroraVersion": "0.3.1-beta.1",
+      "channel": "beta",
+      "minecraftVersion": "26.2",
+      "fabricLoaderVersion": "0.19.5",
+      "java": { "majorVersion": 25 },
+      "artifact": {
+        "url": "http://127.0.0.1:8765/aurora-0.3.1-beta.1-dev.jar",
+        "sha256": "7067bda93d1f95d2c068e1344d4cead3b004f27868c24fa58e1ea75511420d06",
+        "sizeBytes": 64
+      }
+    },
+    {
+      "auroraVersion": "0.4.0-nightly.20260915",
+      "channel": "nightly",
+      "minecraftVersion": "1.21.11",
+      "fabricLoaderVersion": "0.19.5",
+      "java": { "majorVersion": 21 },
+      "artifact": {
+        "url": "http://127.0.0.1:8765/aurora-0.4.0-nightly-dev.jar",
+        "sha256": "8037cf19282b0d3510ff78fdde8a94c20bef4804842a849a692e3f322eb98540",
+        "sizeBytes": 65
+      }
+    }
+  ]
+}

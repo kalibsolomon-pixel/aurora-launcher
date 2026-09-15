@@ -47,6 +47,13 @@ impl LauncherConfig {
         self.selected_instance_id.as_ref()
     }
 
+    /// Sets (or clears) the selected instance. The value is validated as an
+    /// identifier shape by the type system; referential integrity against
+    /// the registry is enforced by the lifecycle operations that call this.
+    pub fn set_selected_instance_id(&mut self, id: Option<InstanceId>) {
+        self.selected_instance_id = id;
+    }
+
     /// Parses and validates a configuration from JSON text.
     pub fn from_json(json: &str) -> Result<Self, ConfigError> {
         let config: Self = serde_json::from_str(json)
