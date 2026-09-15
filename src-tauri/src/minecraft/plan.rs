@@ -93,6 +93,31 @@ impl AssetIndexRequirement {
     }
 }
 
+/// The official client logging configuration a modern version requires at
+/// launch.
+///
+/// Current documents publish a log4j2 XML configuration file with an official
+/// SHA-1; installing it is part of a complete installation (the launch-time
+/// JVM argument that references it is deliberately not constructed here).
+/// A version without a logging block plans without one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggingRequirement {
+    /// The official file id (for example `client-1.21.2.xml`); a validated
+    /// single-segment name used as the installed file name.
+    file_name: String,
+    artifact: ArtifactRequirement,
+}
+
+impl LoggingRequirement {
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+
+    pub fn artifact(&self) -> &ArtifactRequirement {
+        &self.artifact
+    }
+}
+
 /// A parsed Maven coordinate identifying one library.
 ///
 /// Coordinates are structured identity: group, artifact, version, and an
@@ -243,6 +268,7 @@ pub struct MinecraftInstallPlan {
     java: JavaRequirement,
     client: ArtifactRequirement,
     asset_index: AssetIndexRequirement,
+    logging: Option<LoggingRequirement>,
     libraries: Vec<PlannedLibrary>,
     launch: LaunchMetadata,
 }
@@ -266,6 +292,12 @@ impl MinecraftInstallPlan {
 
     pub fn asset_index(&self) -> &AssetIndexRequirement {
         &self.asset_index
+    }
+
+    /// The official logging configuration requirement, when the version
+    /// publishes one.
+    pub fn logging(&self) -> Option<&LoggingRequirement> {
+        self.logging.as_ref()
     }
 
     /// The applicable libraries in official metadata order — the deterministic
@@ -348,6 +380,26 @@ pub fn plan_version_document(
         total_size: document.asset_index.total_size,
     };
 
+    let logging = document
+        .logging
+        .as_ref()
+        .and_then(|logging| logging.client.as_ref())
+        .map(|client| {
+            let file_name = validate_logging_file_name(&client.file.id)?;
+            Ok(LoggingRequirement {
+                file_name,
+                artifact: artifact_requirement(
+                    &format!("{} logging configuration", document.id),
+                    &client.file.sha1,
+                    client.file.size,
+                    &client.file.url,
+                    None,
+                    None,
+                )?,
+            })
+        })
+        .transpose()?;
+
     let mut libraries = Vec::with_capacity(document.libraries.len());
     for library in &document.libraries {
         match plan_decision(library.rules.as_deref(), platform) {
@@ -384,9 +436,47 @@ pub fn plan_version_document(
         },
         client,
         asset_index,
+        logging,
         libraries,
         launch,
     })
+}
+
+/// Validates an official logging-configuration file id as a single safe
+/// installed file name: one segment over the conservative charset, not a
+/// traversal shape, ending in `.xml` as every current official id does.
+fn validate_logging_file_name(file_name: &str) -> Result<String, PlanError> {
+    let invalid = |reason: String| PlanError::ArtifactInvalid {
+        source: "logging configuration".to_owned(),
+        reason,
+    };
+
+    if file_name.split('/').count() != 1 || file_name.split('\\').count() > 1 {
+        return Err(invalid(
+            "the logging configuration file id must be a single path segment".to_owned(),
+        ));
+    }
+    if !file_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(invalid(
+            "the logging configuration file id may only contain letters, digits, '.', '_', and '-'"
+                .to_owned(),
+        ));
+    }
+    if file_name.starts_with('.') || file_name == ".." || file_name.ends_with(".tmp") {
+        return Err(invalid(
+            "the logging configuration file id is not a safe file name".to_owned(),
+        ));
+    }
+    if !file_name.ends_with(".xml") {
+        return Err(invalid(
+            "the logging configuration file id must end with '.xml'".to_owned(),
+        ));
+    }
+
+    Ok(file_name.to_owned())
 }
 
 /// Builds one typed artifact requirement from an official artifact block.
@@ -416,7 +506,7 @@ fn artifact_requirement(
         ));
     }
 
-    if !url.starts_with("https://") {
+    if !is_secure_artifact_url(url) {
         return Err(invalid(format!(
             "the artifact URL must use HTTPS ('{url}' does not)"
         )));
@@ -435,6 +525,25 @@ fn artifact_requirement(
         sha1,
         size_bytes: size,
     })
+}
+
+/// Whether an official artifact URL satisfies the launcher's transport
+/// policy: production HTTPS, with cleartext HTTP accepted only for explicit
+/// loopback hosts — the same test-transport policy every other transport
+/// boundary (metadata URLs, repositories) applies. Official production
+/// metadata is always HTTPS; the loopback allowance exists so deterministic
+/// offline tests can plan against local servers.
+fn is_secure_artifact_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.cannot_be_a_base() {
+        return false;
+    }
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    parsed.scheme() == "http" && crate::downloads::is_loopback_host(&parsed)
 }
 
 /// Plans one applicable library.
@@ -964,5 +1073,78 @@ mod tests {
             plan_version_document(&document, WINDOWS_X64),
             Err(PlanError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn a_version_with_a_logging_block_plans_the_configuration_requirement() {
+        let mut value: serde_json::Value = serde_json::from_str(&fixture_document()).unwrap();
+        value["logging"] = serde_json::json!({
+            "client": {
+                "argument": "-Dlog4j.configurationFile=${path}",
+                "file": {
+                    "id": "client-1.21.2.xml",
+                    "sha1": "39384bd14c0606d812afec88d8aff595b2587dd9",
+                    "size": 1073,
+                    "url": "https://piston-data.mojang.com/v1/objects/39384bd14c0606d812afec88d8aff595b2587dd9/client-1.21.2.xml"
+                },
+                "type": "log4j2-xml"
+            }
+        });
+        let document = VersionDocument::from_json(&value.to_string()).unwrap();
+
+        let plan = plan_version_document(&document, WINDOWS_X64).unwrap();
+        let logging = plan.logging().expect("the requirement must be planned");
+
+        assert_eq!(logging.file_name(), "client-1.21.2.xml");
+        assert_eq!(
+            logging.artifact().sha1().as_hex(),
+            "39384bd14c0606d812afec88d8aff595b2587dd9"
+        );
+        assert_eq!(logging.artifact().size_bytes(), 1073);
+        assert_eq!(
+            plan_version_document(&parsed_fixture(), WINDOWS_X64)
+                .unwrap()
+                .logging(),
+            None,
+            "the base fixture carries no logging block and plans without one"
+        );
+    }
+
+    #[test]
+    fn logging_file_ids_must_be_safe_single_segment_xml_names() {
+        assert_eq!(
+            validate_logging_file_name("client-1.21.2.xml").unwrap(),
+            "client-1.21.2.xml"
+        );
+        for broken in [
+            "nested/client.xml",
+            "..",
+            ".hidden.xml",
+            "weird name.xml",
+            "client.json",
+            "client.xml/../escape.xml",
+            "",
+        ] {
+            assert!(
+                validate_logging_file_name(broken).is_err(),
+                "{broken:?} must be rejected as a logging file name"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_http_artifact_urls_are_the_only_cleartext_urls_accepted() {
+        // The planning boundary accepts the documented test-transport policy:
+        // HTTPS production URLs, plus cleartext loopback for offline tests.
+        assert!(is_secure_artifact_url(
+            "https://piston-data.mojang.com/v1/objects/abc/client.jar"
+        ));
+        assert!(is_secure_artifact_url("http://127.0.0.1:9123/client.jar"));
+        assert!(is_secure_artifact_url("http://localhost:9123/client.jar"));
+        assert!(!is_secure_artifact_url(
+            "http://piston-data.mojang.com/v1/objects/abc/client.jar"
+        ));
+        assert!(!is_secure_artifact_url("ftp://example.invalid/client.jar"));
+        assert!(!is_secure_artifact_url("not a url"));
     }
 }

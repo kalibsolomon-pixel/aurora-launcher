@@ -13,6 +13,7 @@
 use std::fmt;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
@@ -159,6 +160,10 @@ impl Sha1Digest {
         }
         hex
     }
+
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
 }
 
 impl fmt::Display for Sha1Digest {
@@ -206,12 +211,119 @@ fn hex_value(byte: u8) -> Result<u8, u8> {
     }
 }
 
+/// The digest algorithm an artifact's trust is anchored in.
+///
+/// SHA-1 is exclusively the algorithm of official Mojang expectations;
+/// SHA-256 is the algorithm of Aurora's own distribution, Fabric's published
+/// digests, and the verified cache's content addressing. The two never
+/// exchange roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestAlgorithm {
+    Sha256,
+    Sha1,
+}
+
+impl fmt::Display for DigestAlgorithm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Sha256 => "sha256",
+            Self::Sha1 => "sha1",
+        })
+    }
+}
+
+/// How an artifact's bytes came to be trusted, and against what.
+///
+/// The distinction is deliberate and load-bearing:
+///
+/// - `ExpectedDigestVerified` means a digest was known *before* acquisition
+///   from trusted metadata (an Aurora/Fabric SHA-256 or a Mojang SHA-1) and
+///   the received bytes were verified against it. This is cryptographic
+///   content verification.
+/// - `SecureTransportObserved` means no expected digest existed; the artifact
+///   was acquired over verified-HTTPS transport and its SHA-256 was computed
+///   locally as a stable identity. The digest is an observation, never an
+///   externally verified expectation, and the artifact must never be reported
+///   as digest-verified.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum ArtifactTrust {
+    /// Verified against a pre-known expected digest from trusted metadata.
+    ExpectedDigestVerified {
+        algorithm: DigestAlgorithm,
+        digest: String,
+    },
+    /// Acquired over secure transport with no published digest; the SHA-256
+    /// was computed locally on first acquisition and is recorded as an
+    /// observation (a local consistency reference, not official verification).
+    SecureTransportObserved { observed_sha256: String },
+}
+
+impl ArtifactTrust {
+    /// The persisted trust-class name (`expectedDigestVerified` or
+    /// `secureTransportObserved`).
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::ExpectedDigestVerified { .. } => "expectedDigestVerified",
+            Self::SecureTransportObserved { .. } => "secureTransportObserved",
+        }
+    }
+
+    /// The canonical trust record for a verified SHA-256 artifact.
+    pub fn verified_sha256(digest: &ArtifactDigest) -> Self {
+        Self::ExpectedDigestVerified {
+            algorithm: DigestAlgorithm::Sha256,
+            digest: digest.as_hex(),
+        }
+    }
+
+    /// The canonical trust record for a verified official Mojang SHA-1
+    /// artifact.
+    pub fn verified_sha1(digest: &Sha1Digest) -> Self {
+        Self::ExpectedDigestVerified {
+            algorithm: DigestAlgorithm::Sha1,
+            digest: digest.as_hex(),
+        }
+    }
+
+    /// The canonical trust record for a digest-less artifact acquired over
+    /// secure transport.
+    pub fn transport_observed(digest: &ArtifactDigest) -> Self {
+        Self::SecureTransportObserved {
+            observed_sha256: digest.as_hex(),
+        }
+    }
+}
+
+impl fmt::Display for ArtifactTrust {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExpectedDigestVerified { algorithm, digest } => {
+                write!(
+                    formatter,
+                    "verified against expected {algorithm} digest {digest}"
+                )
+            }
+            Self::SecureTransportObserved { observed_sha256 } => write!(
+                formatter,
+                "secure transport with locally observed SHA-256 {observed_sha256} (no published digest)"
+            ),
+        }
+    }
+}
+
 /// A failed integrity comparison. Every variant is a hard failure: the
 /// artifact is untrusted and must never be promoted or activated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationFailure {
     SizeMismatch { expected: u64, actual: u64 },
     Sha256Mismatch { expected: String, actual: String },
+    Sha1Mismatch { expected: String, actual: String },
 }
 
 impl fmt::Display for VerificationFailure {
@@ -224,6 +336,10 @@ impl fmt::Display for VerificationFailure {
             Self::Sha256Mismatch { expected, actual } => write!(
                 formatter,
                 "artifact SHA-256 digest does not match the expected digest: expected {expected} but computed {actual}"
+            ),
+            Self::Sha1Mismatch { expected, actual } => write!(
+                formatter,
+                "artifact SHA-1 digest does not match the official expected digest: expected {expected} but computed {actual}"
             ),
         }
     }
@@ -294,6 +410,85 @@ impl StreamingVerifier {
 
         Ok(self.bytes)
     }
+
+    /// Completes without any expected digest, returning the observed byte
+    /// count and the locally computed SHA-256.
+    ///
+    /// For digest-less artifacts acquired over secure transport only: the
+    /// returned digest is an observation recorded for stable local identity,
+    /// never a verification against an external expectation.
+    pub fn finish_observed(self) -> (u64, ArtifactDigest) {
+        let digest = ArtifactDigest::from_sha256(self.hasher.finalize().into());
+        (self.bytes, digest)
+    }
+}
+
+/// Accumulates the SHA-1 digest and byte count of a streamed artifact and
+/// enforces the expected size as the bytes arrive.
+///
+/// This is the Mojang-side twin of [`StreamingVerifier`]: same size
+/// enforcement, same fail-closed behavior, different (officially expected)
+/// digest algorithm. A SHA-1 verification result never becomes a
+/// SHA-256-addressed cache identity.
+pub struct StreamingSha1Verifier {
+    hasher: Sha1,
+    bytes: u64,
+    expected_size: Option<u64>,
+}
+
+impl StreamingSha1Verifier {
+    pub fn new(expected_size: Option<u64>) -> Self {
+        Self {
+            hasher: Sha1::new(),
+            bytes: 0,
+            expected_size,
+        }
+    }
+
+    /// Feeds the next chunk. Fails closed as soon as the stream grows past
+    /// the expected size.
+    pub fn update(&mut self, chunk: &[u8]) -> Result<(), VerificationFailure> {
+        if let Some(expected) = self.expected_size {
+            let new_total = self.bytes + chunk.len() as u64;
+            if new_total > expected {
+                return Err(VerificationFailure::SizeMismatch {
+                    expected,
+                    actual: new_total,
+                });
+            }
+        }
+
+        self.hasher.update(chunk);
+        self.bytes += chunk.len() as u64;
+        Ok(())
+    }
+
+    /// The number of bytes streamed so far.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Completes verification against the official expected SHA-1 digest.
+    pub fn finish(self, expected: &Sha1Digest) -> Result<u64, VerificationFailure> {
+        if let Some(expected_size) = self.expected_size {
+            if self.bytes != expected_size {
+                return Err(VerificationFailure::SizeMismatch {
+                    expected: expected_size,
+                    actual: self.bytes,
+                });
+            }
+        }
+
+        let actual = Sha1Digest::from_sha1(self.hasher.finalize().into());
+        if &actual != expected {
+            return Err(VerificationFailure::Sha1Mismatch {
+                expected: expected.as_hex(),
+                actual: actual.as_hex(),
+            });
+        }
+
+        Ok(self.bytes)
+    }
 }
 
 /// The outcome of re-validating an existing file's bytes.
@@ -336,6 +531,33 @@ pub fn verify_file(
 ) -> Result<u64, VerifyFileError> {
     let mut file = std::fs::File::open(path).map_err(VerifyFileError::Io)?;
     let mut verifier = StreamingVerifier::new(expected_size);
+    let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
+
+    loop {
+        let read = std::io::Read::read(&mut file, &mut chunk).map_err(VerifyFileError::Io)?;
+        if read == 0 {
+            break;
+        }
+        verifier
+            .update(&chunk[..read])
+            .map_err(VerifyFileError::Mismatch)?;
+    }
+
+    verifier.finish(expected).map_err(VerifyFileError::Mismatch)
+}
+
+/// Re-validates an existing file by streaming its bytes through SHA-1 against
+/// an official Mojang expectation.
+///
+/// SHA-1 store objects are re-validated exactly like SHA-256 ones: never by
+/// file name, always by re-hashing.
+pub fn verify_file_sha1(
+    path: &Path,
+    expected: &Sha1Digest,
+    expected_size: Option<u64>,
+) -> Result<u64, VerifyFileError> {
+    let mut file = std::fs::File::open(path).map_err(VerifyFileError::Io)?;
+    let mut verifier = StreamingSha1Verifier::new(expected_size);
     let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
 
     loop {
@@ -520,6 +742,108 @@ mod tests {
             verify_file(&path, &expected, None).unwrap_err(),
             VerifyFileError::Io(_)
         ));
+    }
+
+    #[test]
+    fn streaming_sha1_verification_accepts_the_expected_bytes_in_any_chunking() {
+        let expected = Sha1Digest::parse(ABC_SHA1).unwrap();
+
+        for chunk_size in [1usize, 4, 1024] {
+            let mut verifier = StreamingSha1Verifier::new(None);
+            for chunk in b"abc".chunks(chunk_size) {
+                verifier.update(chunk).unwrap();
+            }
+            let bytes = verifier.finish(&expected).unwrap();
+
+            assert_eq!(bytes, 3);
+        }
+    }
+
+    #[test]
+    fn streaming_sha1_verification_fails_on_wrong_digest_and_wrong_size() {
+        let expected = Sha1Digest::parse(ABC_SHA1).unwrap();
+
+        let mut wrong_digest = StreamingSha1Verifier::new(None);
+        wrong_digest.update(b"xyz").unwrap();
+        assert_eq!(
+            wrong_digest.finish(&expected).unwrap_err(),
+            VerificationFailure::Sha1Mismatch {
+                expected: ABC_SHA1.to_owned(),
+                actual: Sha1Digest::compute(b"xyz").as_hex(),
+            }
+        );
+
+        let mut short = StreamingSha1Verifier::new(Some(4));
+        short.update(b"abc").unwrap();
+        assert_eq!(
+            short.finish(&expected).unwrap_err(),
+            VerificationFailure::SizeMismatch {
+                expected: 4,
+                actual: 3,
+            }
+        );
+
+        let mut long = StreamingSha1Verifier::new(Some(2));
+        assert_eq!(
+            long.update(b"abc").unwrap_err(),
+            VerificationFailure::SizeMismatch {
+                expected: 2,
+                actual: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn file_sha1_verification_accepts_official_content_and_rejects_drift() {
+        let directory = test_directory();
+        let path = directory.join("official.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let expected = Sha1Digest::parse(ABC_SHA1).unwrap();
+
+        assert_eq!(verify_file_sha1(&path, &expected, Some(3)).unwrap(), 3);
+
+        let drifted = directory.join("drifted.bin");
+        std::fs::write(&drifted, b"abd").unwrap();
+        assert!(matches!(
+            verify_file_sha1(&drifted, &expected, None).unwrap_err(),
+            VerifyFileError::Mismatch(VerificationFailure::Sha1Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn artifact_trust_records_preserve_the_verification_distinction() {
+        let sha256 = ArtifactDigest::parse(ABC_SHA256).unwrap();
+        let sha1 = Sha1Digest::parse(ABC_SHA1).unwrap();
+
+        let verified_256 = ArtifactTrust::verified_sha256(&sha256);
+        let verified_1 = ArtifactTrust::verified_sha1(&sha1);
+        let observed = ArtifactTrust::transport_observed(&sha256);
+
+        assert_eq!(
+            verified_256,
+            ArtifactTrust::ExpectedDigestVerified {
+                algorithm: DigestAlgorithm::Sha256,
+                digest: ABC_SHA256.to_owned(),
+            }
+        );
+        assert_eq!(
+            verified_1,
+            ArtifactTrust::ExpectedDigestVerified {
+                algorithm: DigestAlgorithm::Sha1,
+                digest: ABC_SHA1.to_owned(),
+            }
+        );
+        // The same bytes, but the observed form is a different trust class:
+        // secure transport with a locally computed identity, never claimed as
+        // an expected-digest verification.
+        assert_ne!(observed, verified_256);
+        assert_eq!(
+            observed,
+            ArtifactTrust::SecureTransportObserved {
+                observed_sha256: ABC_SHA256.to_owned(),
+            }
+        );
+        assert!(observed.to_string().contains("no published digest"));
     }
 
     fn digest_of(bytes: &[u8]) -> ArtifactDigest {

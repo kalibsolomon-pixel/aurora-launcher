@@ -261,10 +261,46 @@ pub struct VersionDocument {
     pub java_version: JavaVersionDocument,
     pub libraries: Vec<LibraryDocument>,
     pub arguments: ArgumentsDocument,
+    /// The official client logging configuration. Present in every current
+    /// modern document; a future document without one plans without one.
+    #[serde(default)]
+    pub logging: Option<LoggingDocument>,
     #[serde(default)]
     pub inherits_from: Option<String>,
     #[serde(default)]
     pub minecraft_arguments: Option<String>,
+}
+
+/// The official logging configuration block of a version document.
+///
+/// Current documents publish a client-side log4j2 XML configuration whose
+/// file is downloadable with an official SHA-1. Only the `log4j2-xml` type
+/// exists in current metadata; anything else is deliberately unsupported.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LoggingDocument {
+    #[serde(default)]
+    pub client: Option<LoggingClientDocument>,
+}
+
+/// The client-side logging configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LoggingClientDocument {
+    /// The JVM argument official metadata prescribes (for example
+    /// `-Dlog4j.configurationFile=${path}`). It is recorded, never
+    /// constructed into a command; launch-time substitution is deferred.
+    pub argument: String,
+    pub file: LoggingFileDocument,
+    #[serde(rename = "type")]
+    pub kind: String,
+}
+
+/// The downloadable logging configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct LoggingFileDocument {
+    pub id: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
 }
 
 /// The asset-index requirement published by a version document.
@@ -449,6 +485,102 @@ impl VersionDocument {
                     "version '{id}' library {} publishes classifier downloads; Aurora supports the modern per-platform library model only",
                     library.name
                 )));
+            }
+        }
+
+        if let Some(logging) = &document.logging {
+            if let Some(client) = &logging.client {
+                if client.kind != "log4j2-xml" {
+                    return Err(MetadataError::Unsupported(format!(
+                        "Minecraft version '{id}' publishes a logging configuration of type '{}'; Aurora supports the official 'log4j2-xml' type only",
+                        client.kind
+                    )));
+                }
+                if client.file.id.trim().is_empty() {
+                    return Err(MetadataError::DocumentInvalid {
+                        reason: format!(
+                            "version '{id}' publishes a logging configuration with no file id"
+                        ),
+                    });
+                }
+                if client.argument.trim().is_empty() {
+                    return Err(MetadataError::DocumentInvalid {
+                        reason: format!(
+                            "version '{id}' publishes a logging configuration with no argument"
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(document)
+    }
+}
+
+/// The asset-index document (external DTO shape): the object inventory a
+/// version's `assetIndex` URL points at.
+///
+/// Current official indexes are a single `objects` map from logical asset
+/// name to `{hash, size}`, where `hash` is the object's official SHA-1 and
+/// also its content address in Mojang's object layout
+/// (`<first two characters>/<full hash>`). Older `virtual`/
+/// `map_to_resources` semantics do not exist in current metadata and are
+/// not represented.
+///
+/// The document is verified against its official SHA-1 before this parse
+/// ever runs; validation here is about shape, not transport trust.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AssetIndexObjectsDocument {
+    pub objects: std::collections::BTreeMap<String, AssetObjectDocument>,
+}
+
+/// One asset object entry: the official SHA-1 (its content address) and the
+/// official size.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AssetObjectDocument {
+    pub hash: String,
+    pub size: u64,
+}
+
+/// Logical asset names are bounded but may contain forward slashes (for
+/// example `icons/icon_16x16.png`); they are names, never local paths, and
+/// never influence where an object is stored — the hash alone does.
+const MAX_ASSET_NAME_LENGTH: usize = 256;
+
+impl AssetIndexObjectsDocument {
+    /// Parses and validates an asset-index document.
+    ///
+    /// Every object entry must carry a canonical SHA-1 and a positive size;
+    /// a single malformed object invalidates the whole index, because a
+    /// partial asset installation is exactly what this validation exists to
+    /// prevent.
+    pub fn from_json(json: &str) -> Result<Self, MetadataError> {
+        let document: Self =
+            serde_json::from_str(json).map_err(|error| MetadataError::DocumentInvalid {
+                reason: format!("the asset index is not valid JSON: {error}"),
+            })?;
+
+        if document.objects.is_empty() {
+            return Err(MetadataError::DocumentInvalid {
+                reason: "the asset index declares no objects".to_owned(),
+            });
+        }
+
+        for (name, object) in &document.objects {
+            if name.trim().is_empty() || name.len() > MAX_ASSET_NAME_LENGTH {
+                return Err(MetadataError::DocumentInvalid {
+                    reason: format!(
+                        "an asset object name must be 1 to {MAX_ASSET_NAME_LENGTH} non-whitespace characters"
+                    ),
+                });
+            }
+            Sha1Digest::parse(&object.hash).map_err(|error| MetadataError::DocumentInvalid {
+                reason: format!("asset object '{name}' has an invalid digest: {error}"),
+            })?;
+            if object.size == 0 {
+                return Err(MetadataError::DocumentInvalid {
+                    reason: format!("asset object '{name}' declares a size of zero"),
+                });
             }
         }
 
@@ -1026,6 +1158,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn logging_blocks_parse_only_the_official_log4j2_xml_shape() {
+        let logging = serde_json::json!({
+            "client": {
+                "argument": "-Dlog4j.configurationFile=${path}",
+                "file": {
+                    "id": "client-1.21.2.xml",
+                    "sha1": "39384bd14c0606d812afec88d8aff595b2587dd9",
+                    "size": 1073,
+                    "url": "https://piston-data.mojang.com/v1/objects/39384bd14c0606d812afec88d8aff595b2587dd9/client-1.21.2.xml"
+                },
+                "type": "log4j2-xml"
+            }
+        });
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&version_document_fixture()).unwrap();
+        value["logging"] = logging.clone();
+        let parsed = VersionDocument::from_json(&value.to_string()).unwrap();
+        let client = parsed.logging.unwrap().client.unwrap();
+        assert_eq!(client.kind, "log4j2-xml");
+        assert_eq!(client.file.id, "client-1.21.2.xml");
+        assert_eq!(client.argument, "-Dlog4j.configurationFile=${path}");
+
+        // An unknown configuration type is deliberately unsupported.
+        value["logging"]["client"]["type"] = serde_json::json!("logback-xml");
+        let error = VersionDocument::from_json(&value.to_string()).unwrap_err();
+        assert!(matches!(error, MetadataError::Unsupported(_)), "{error}");
+    }
+
+    #[test]
+    fn asset_indexes_parse_and_validate_every_object_entry() {
+        let index = AssetIndexObjectsDocument::from_json(
+            r#"{
+                "objects": {
+                    "icons/icon_16x16.png": { "hash": "5ff04807c356f1beed0b86ccf659b44b9983e3fa", "size": 781 },
+                    "minecraft/sounds/random/click.ogg": { "hash": "916021c195f5799e23fd4b5e2c8e0b2b2d8b1a2c", "size": 3443 }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(index.objects.len(), 2);
+        assert_eq!(
+            index.objects["icons/icon_16x16.png"].hash,
+            "5ff04807c356f1beed0b86ccf659b44b9983e3fa"
+        );
+
+        // Malformed shapes: not JSON, no objects, bad digest, zero size,
+        // empty name.
+        for broken in [
+            "not json",
+            r#"{ "objects": {} }"#,
+            r#"{ "objects": { "a": { "hash": "deadbeef", "size": 1 } } }"#,
+            r#"{ "objects": { "a": { "hash": "5ff04807c356f1beed0b86ccf659b44b9983e3fa", "size": 0 } } }"#,
+            r#"{ "objects": { "  ": { "hash": "5ff04807c356f1beed0b86ccf659b44b9983e3fa", "size": 1 } } }"#,
+        ] {
+            assert!(
+                AssetIndexObjectsDocument::from_json(broken).is_err(),
+                "{broken} must be rejected"
+            );
+        }
+    }
+
     /// Controlled live verification against the real official metadata chain.
     ///
     /// Ignored by default so the offline suite never depends on Mojang; run
@@ -1079,6 +1274,13 @@ mod tests {
             assert!(plan.client().url().starts_with("https://"));
             assert!(!plan.asset_index().id().is_empty());
             assert!(plan.asset_index().artifact().size_bytes() > 0);
+            // Current documents publish the official log4j2 configuration.
+            let logging = plan
+                .logging()
+                .unwrap_or_else(|| panic!("{version} must publish a logging configuration"));
+            assert!(logging.file_name().ends_with(".xml"));
+            assert!(logging.artifact().url().starts_with("https://"));
+            assert!(logging.artifact().size_bytes() > 0);
             assert!(!plan.java().component().is_empty());
             assert!(plan.java().major_version() >= 21);
             assert_eq!(plan.launch().main_class(), "net.minecraft.client.main.Main");

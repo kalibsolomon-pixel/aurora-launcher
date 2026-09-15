@@ -189,3 +189,92 @@ export async function planFabricInstall(
     );
   }
 }
+
+export interface InstallGameRequest {
+  instanceId: string;
+  minecraftVersion: string;
+  loaderVersion: string;
+}
+
+/** One native installation-progress event; the frontend only displays it. */
+export interface InstallProgressEvent {
+  phase:
+    | "acquiring"
+    | "materializing"
+    | "extractingNatives"
+    | "validating"
+    | "committing";
+  completedItems: number;
+  totalItems: number;
+  currentItem: string | null;
+}
+
+/** Concise summary of one committed installation. */
+export interface InstalledGameSummary {
+  minecraftVersion: string;
+  loaderVersion: string;
+  installationId: string;
+  fileCount: number;
+  totalBytes: number;
+  verifiedSha1Files: number;
+  verifiedSha256Files: number;
+  transportObservedFiles: number;
+  nativesDirectory: string;
+  gameDirectory: string;
+}
+
+export async function installGame(
+  request: InstallGameRequest,
+): Promise<InstalledGameSummary> {
+  try {
+    return await invoke<InstalledGameSummary>("install_game", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The game installation could not be completed.",
+    );
+  }
+}
+
+export interface ValidateInstalledGameRequest {
+  instanceId: string;
+}
+
+export type InstalledGameStatus = "valid" | "damaged" | "notInstalled";
+
+export interface ValidationProblem {
+  path: string;
+  reason: string;
+}
+
+/** Read-only validation outcome of one installed game. */
+export interface InstalledGameValidation {
+  status: InstalledGameStatus;
+  minecraftVersion: string | null;
+  loaderVersion: string | null;
+  installationId: string | null;
+  checkedFiles: number;
+  verifiedBytes: number;
+  problems: ValidationProblem[];
+}
+
+export async function validateInstalledGame(
+  request: ValidateInstalledGameRequest,
+): Promise<InstalledGameValidation> {
+  try {
+    return await invoke<InstalledGameValidation>("validate_installed_game", { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The installed game could not be validated.",
+    );
+  }
+}

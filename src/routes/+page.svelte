@@ -1,15 +1,21 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import {
     acquireArtifact,
     getApplicationStatus,
     getLauncherState,
+    installGame,
     planFabricInstall,
     planMinecraftInstall,
+    validateInstalledGame,
     LauncherBackendError,
     type AcquiredArtifact,
     type ApplicationStatus,
     type FabricPlanSummary,
+    type InstalledGameSummary,
+    type InstalledGameValidation,
+    type InstallProgressEvent,
     type LauncherState,
     type MinecraftPlanSummary,
   } from "$lib/backend";
@@ -44,6 +50,20 @@
   let fabricPlanSummary = $state<FabricPlanSummary | null>(null);
   let fabricPlanningError = $state<LauncherBackendError | null>(null);
 
+  // Development proof of the Phase 5 installation executor; stripped from
+  // production builds. Progress comes from native events only — nothing is
+  // faked or inferred.
+  let installInstanceId = $state("");
+  let installMinecraftVersion = $state("");
+  let installLoaderVersion = $state("");
+  let installBusy = $state(false);
+  let installProgress = $state<InstallProgressEvent | null>(null);
+  let installSummary = $state<InstalledGameSummary | null>(null);
+  let installError = $state<LauncherBackendError | null>(null);
+  let validationBusy = $state(false);
+  let validation = $state<InstalledGameValidation | null>(null);
+  let validationError = $state<LauncherBackendError | null>(null);
+
   onMount(async () => {
     try {
       status = await getApplicationStatus();
@@ -62,6 +82,19 @@
           ? cause
           : new LauncherBackendError("unknown_error", "The launcher state could not be loaded.");
     }
+  });
+
+  onMount(() => {
+    // Native progress events drive the installation display.
+    let unsubscribe: (() => void) | null = null;
+    if (devPipelineProof) {
+      listen<InstallProgressEvent>("install-progress", (event) => {
+        installProgress = event.payload;
+      }).then((stop) => {
+        unsubscribe = stop;
+      });
+    }
+    return () => unsubscribe?.();
   });
 
   async function runAcquisition(event: SubmitEvent) {
@@ -123,6 +156,51 @@
           : new LauncherBackendError("unknown_error", "The composed plan failed.");
     } finally {
       fabricPlanningBusy = false;
+    }
+  }
+
+  async function runInstall(event: SubmitEvent) {
+    event.preventDefault();
+    installBusy = true;
+    installProgress = null;
+    installSummary = null;
+    installError = null;
+    validation = null;
+    validationError = null;
+
+    try {
+      installSummary = await installGame({
+        instanceId: installInstanceId.trim(),
+        minecraftVersion: installMinecraftVersion.trim(),
+        loaderVersion: installLoaderVersion.trim(),
+      });
+    } catch (cause: unknown) {
+      installError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The installation failed.");
+    } finally {
+      installBusy = false;
+    }
+  }
+
+  async function runValidation(event: SubmitEvent) {
+    event.preventDefault();
+    validationBusy = true;
+    validation = null;
+    validationError = null;
+
+    try {
+      validation = await validateInstalledGame({
+        instanceId: installInstanceId.trim(),
+      });
+    } catch (cause: unknown) {
+      validationError =
+        cause instanceof LauncherBackendError
+          ? cause
+          : new LauncherBackendError("unknown_error", "The validation failed.");
+    } finally {
+      validationBusy = false;
     }
   }
 </script>
@@ -491,6 +569,161 @@
         Development-only proof of the native Fabric layer: official loader discovery,
         exact profile resolution, and composition with the vanilla plan. Nothing is
         installed and no Minecraft or Fabric artifact is downloaded.
+      </p>
+    </section>
+
+    <section class="status-card" aria-labelledby="install-title" aria-live="polite">
+      <div class="status-heading">
+        <div>
+          <p class="eyebrow">Native installation proof</p>
+          <h2 id="install-title">Game installation</h2>
+        </div>
+
+        {#if installBusy}
+          <span class="badge loading"><span aria-hidden="true"></span
+            >{installProgress ? installProgress.phase : "Installing"}</span
+          >
+        {:else if installSummary}
+          <span class="badge ready"><span aria-hidden="true"></span>Installed</span>
+        {:else if installError}
+          <span class="badge error"><span aria-hidden="true"></span>Failed</span>
+        {/if}
+      </div>
+
+      <form class="acquire-form" onsubmit={runInstall}>
+        <label>
+          <span>Instance id (managed storage)</span>
+          <input
+            type="text"
+            bind:value={installInstanceId}
+            placeholder="e.g. dev-install"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          <span>Exact Minecraft version</span>
+          <input
+            type="text"
+            bind:value={installMinecraftVersion}
+            placeholder="e.g. 26.2"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <label>
+          <span>Exact Fabric Loader version</span>
+          <input
+            type="text"
+            bind:value={installLoaderVersion}
+            placeholder="e.g. 0.19.5"
+            required
+            spellcheck="false"
+          />
+        </label>
+        <button type="submit" disabled={installBusy}>
+          {installBusy ? "Installing…" : "Install isolated game"}
+        </button>
+      </form>
+
+      {#if installBusy && installProgress}
+        <dl>
+          <div>
+            <dt>Phase</dt>
+            <dd>{installProgress.phase}</dd>
+          </div>
+          <div>
+            <dt>Progress</dt>
+            <dd>
+              {installProgress.completedItems} / {installProgress.totalItems}
+              {#if installProgress.currentItem}· {installProgress.currentItem}{/if}
+            </dd>
+          </div>
+        </dl>
+      {:else if installSummary}
+        <dl>
+          <div>
+            <dt>Installed</dt>
+            <dd>
+              Minecraft {installSummary.minecraftVersion} + Fabric Loader
+              {installSummary.loaderVersion}
+            </dd>
+          </div>
+          <div>
+            <dt>Files</dt>
+            <dd>
+              {installSummary.fileCount} managed files
+              ({installSummary.totalBytes.toLocaleString()} bytes)
+            </dd>
+          </div>
+          <div>
+            <dt>Trust classes</dt>
+            <dd>
+              {installSummary.verifiedSha1Files} SHA-1 verified ·
+              {installSummary.verifiedSha256Files} SHA-256 verified ·
+              {installSummary.transportObservedFiles} secure-transport observed
+            </dd>
+          </div>
+          <div class="path-row">
+            <dt>Game directory</dt>
+            <dd>{installSummary.gameDirectory}</dd>
+          </div>
+        </dl>
+      {:else if installError}
+        <div class="error-message" role="alert">
+          <p>{installError.message}</p>
+          <code>{installError.code}</code>
+        </div>
+      {/if}
+
+      <form class="acquire-form" onsubmit={runValidation}>
+        <button type="submit" disabled={validationBusy || installInstanceId.trim() === ""}>
+          {validationBusy ? "Validating…" : "Validate installed game"}
+        </button>
+      </form>
+
+      {#if validation}
+        <dl>
+          <div>
+            <dt>Status</dt>
+            <dd>{validation.status}</dd>
+          </div>
+          {#if validation.installationId}
+            <div>
+              <dt>Installation</dt>
+              <dd>
+                {validation.minecraftVersion} + {validation.loaderVersion} ·
+                {validation.installationId}
+              </dd>
+            </div>
+          {/if}
+          {#if validation.checkedFiles > 0}
+            <div>
+              <dt>Verified</dt>
+              <dd>
+                {validation.checkedFiles} files ({validation.verifiedBytes.toLocaleString()} bytes)
+              </dd>
+            </div>
+          {/if}
+          {#each validation.problems as problem (problem.path)}
+            <div>
+              <dt>{problem.path}</dt>
+              <dd>{problem.reason}</dd>
+            </div>
+          {/each}
+        </dl>
+      {:else if validationError}
+        <div class="error-message" role="alert">
+          <p>{validationError.message}</p>
+          <code>{validationError.code}</code>
+        </div>
+      {/if}
+
+      <p class="footnote">
+        Development-only proof of the native installation executor: verified acquisition,
+        staged materialization, native extraction, validation, and atomic commit into
+        launcher-managed instance storage. Nothing is launched; no Java runtime is
+        installed; the user's .minecraft is never touched.
       </p>
     </section>
   {/if}

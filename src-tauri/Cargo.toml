@@ -38,8 +38,14 @@ rustls = { version = "0.23", default-features = false, features = [
 # RustCrypto implementation matching the existing sha2 dependency family.
 sha1 = "0.10"
 sha2 = "0.10"
-tokio = { version = "1", default-features = false, features = ["fs", "io-util"] }
+# tokio is already the async runtime Tauri runs commands on; Phase 5 enables
+# `sync` for the per-instance installation exclusion mutex (no new crate).
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "sync"] }
 url = "2"
+# ZIP-only archive support (Phase 5): Minecraft native artifacts are ZIP/JAR
+# files. Focused maintained implementation (zip-rs); `deflate` covers the
+# compression real native jars use, everything else stays off.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt"] }

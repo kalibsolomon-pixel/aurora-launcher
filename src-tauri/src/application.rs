@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::cache::{AcquisitionError, ArtifactCache, ArtifactOrigin};
 use crate::config::{ConfigError, ConfigLoad};
@@ -8,7 +8,14 @@ use crate::distribution::ReleaseChannel;
 use crate::downloads::{ArtifactSource, DownloadError, InvalidArtifactSource};
 use crate::fabric::metadata::{FabricMetadataError, InvalidLoaderVersion, LoaderVersionId};
 use crate::fabric::{FabricResolutionError, GameResolutionError, resolve_game_plan};
-use crate::instances::{InstanceRecord, InstanceRegistry, InstanceRegistryError};
+use crate::install::{
+    InstallContext, InstallError, InstallFaults, InstalledGameValidation, ValidationOutcome,
+    ValidationStatus, install_game as execute_install_game,
+    validate_installed_game as run_installed_game_validation,
+};
+use crate::instances::{
+    InstanceRecord, InstanceRegistry, InstanceRegistryError, InvalidInstanceId,
+};
 use crate::minecraft::metadata::{
     InvalidMinecraftVersion, MetadataEndpoints, MetadataError, MinecraftVersionId,
 };
@@ -127,6 +134,12 @@ impl CommandError {
             code: code.into(),
             message: message.into(),
         }
+    }
+}
+
+impl From<InvalidInstanceId> for CommandError {
+    fn from(error: InvalidInstanceId) -> Self {
+        Self::new("instance_id_invalid", error.to_string())
     }
 }
 
@@ -252,6 +265,8 @@ impl From<AcquisitionError> for CommandError {
                 DownloadError::HttpStatus { .. } => "download_http_failure",
                 DownloadError::SizeMismatch { .. } => "artifact_size_mismatch",
                 DownloadError::Sha256Mismatch { .. } => "artifact_hash_mismatch",
+                DownloadError::Sha1Mismatch { .. } => "artifact_hash_mismatch",
+                DownloadError::ObservedDigestDrift { .. } => "fabric_artifact_unverified",
                 DownloadError::StagingIo(_) => "cache_io_failure",
             },
             AcquisitionError::StoreIo(_) => "cache_io_failure",
@@ -530,6 +545,245 @@ pub async fn plan_fabric_install(
         java_raised_by_loader: plan.java().raised_by_loader(),
         final_main_class: plan.main_class().to_owned(),
     })
+}
+
+impl From<InstallError> for CommandError {
+    fn from(error: InstallError) -> Self {
+        match error {
+            // Acquisition failures keep their established transport,
+            // integrity, and cache codes.
+            InstallError::Acquisition(acquisition) => Self::from(acquisition),
+            other => {
+                let code = match &other {
+                    InstallError::AlreadyInProgress { .. } => "installation_already_in_progress",
+                    InstallError::TargetConflict { .. } => "installation_target_conflict",
+                    InstallError::State(_) => "installation_state_invalid",
+                    InstallError::AssetIndexInvalid { .. } => "minecraft_asset_index_invalid",
+                    InstallError::AssetInvalid { .. } => "minecraft_asset_invalid",
+                    InstallError::InvalidSource(_) => "artifact_source_invalid",
+                    InstallError::Materialization { .. } => "artifact_materialization_failure",
+                    InstallError::Native(native) => match native {
+                        crate::install::natives::NativeExtractionError::ArchiveInvalid {
+                            ..
+                        } => "native_archive_invalid",
+                        crate::install::natives::NativeExtractionError::EntryConflict {
+                            ..
+                        }
+                        | crate::install::natives::NativeExtractionError::Io { .. } => {
+                            "native_extraction_failure"
+                        }
+                    },
+                    InstallError::Validation { .. } => "installation_validation_failure",
+                    InstallError::Commit { .. } => "installation_commit_failure",
+                    InstallError::Storage(_) => "storage_io_failure",
+                    InstallError::Acquisition(_) => unreachable!("handled by value above"),
+                };
+                Self::new(code, other.to_string())
+            }
+        }
+    }
+}
+
+/// Typed request accepted by the installation command.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallGameRequest {
+    instance_id: String,
+    minecraft_version: String,
+    loader_version: String,
+}
+
+/// One native progress event payload; Rust owns the state, the frontend only
+/// displays it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallProgressEvent {
+    phase: &'static str,
+    completed_items: u32,
+    total_items: u32,
+    current_item: Option<String>,
+}
+
+/// A concise summary of one committed installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledGameSummary {
+    minecraft_version: String,
+    loader_version: String,
+    installation_id: String,
+    file_count: usize,
+    total_bytes: u64,
+    verified_sha1_files: usize,
+    verified_sha256_files: usize,
+    transport_observed_files: usize,
+    natives_directory: String,
+    game_directory: String,
+}
+
+/// Resolves one exact Minecraft + Fabric Loader combination and installs the
+/// complete, isolated game into launcher-managed instance storage.
+///
+/// This is the development-facing proof of the Phase 5 installation
+/// executor: it performs the full resolve → acquire → stage → validate →
+/// commit flow natively and reports progress through `install-progress`
+/// events. It installs a game, never launches one, installs no Java runtime,
+/// and never touches the user's `.minecraft`.
+#[tauri::command]
+pub async fn install_game(
+    app: AppHandle,
+    request: InstallGameRequest,
+) -> Result<InstalledGameSummary, CommandError> {
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let version = MinecraftVersionId::new(request.minecraft_version.trim())?;
+    let loader = LoaderVersionId::new(request.loader_version.trim())?;
+    let platform = crate::minecraft::rules::PlatformProfile::current()?;
+
+    let managed_paths = managed_paths(&app)?;
+    let options = crate::downloads::DownloadOptions::default();
+
+    let plan = resolve_game_plan(
+        &MetadataEndpoints::official(),
+        &crate::fabric::metadata::FabricMetaEndpoints::official(),
+        &version,
+        &loader,
+        platform,
+        &options,
+    )
+    .await?;
+
+    let installed = execute_install_game(
+        &managed_paths,
+        &instance,
+        &plan,
+        &InstallContext::official(),
+        &mut |progress| {
+            let _ = app.emit(
+                "install-progress",
+                InstallProgressEvent {
+                    phase: progress.phase.as_str(),
+                    completed_items: progress.completed_items,
+                    total_items: progress.total_items,
+                    current_item: progress.current_item.clone(),
+                },
+            );
+        },
+        InstallFaults::default(),
+    )
+    .await?;
+
+    eprintln!(
+        "[aurora-launcher] installed Minecraft {} + Fabric Loader {} into {} ({} files, {} bytes)",
+        installed.manifest().minecraft_version(),
+        installed.manifest().fabric_loader_version(),
+        installed.game_directory().display(),
+        installed.manifest().files().len(),
+        installed.total_byte_count(),
+    );
+
+    let manifest = installed.manifest();
+    let mut verified_sha1_files = 0usize;
+    let mut verified_sha256_files = 0usize;
+    let mut transport_observed_files = 0usize;
+    for file in manifest.files() {
+        match file.trust() {
+            crate::integrity::ArtifactTrust::ExpectedDigestVerified { algorithm, .. } => {
+                match algorithm {
+                    crate::integrity::DigestAlgorithm::Sha1 => verified_sha1_files += 1,
+                    crate::integrity::DigestAlgorithm::Sha256 => verified_sha256_files += 1,
+                }
+            }
+            crate::integrity::ArtifactTrust::SecureTransportObserved { .. } => {
+                transport_observed_files += 1;
+            }
+        }
+    }
+
+    Ok(InstalledGameSummary {
+        minecraft_version: manifest.minecraft_version().to_owned(),
+        loader_version: manifest.fabric_loader_version().to_owned(),
+        installation_id: manifest.installation_id().to_owned(),
+        file_count: manifest.files().len(),
+        total_bytes: installed.total_byte_count(),
+        verified_sha1_files,
+        verified_sha256_files,
+        transport_observed_files,
+        natives_directory: manifest.natives().directory().to_owned(),
+        game_directory: installed.game_directory().to_string_lossy().into_owned(),
+    })
+}
+
+/// Typed request accepted by the installed-game validation command.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateInstalledGameRequest {
+    instance_id: String,
+}
+
+/// The validation outcome of one installed game.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledGameValidationDto {
+    status: String,
+    minecraft_version: Option<String>,
+    loader_version: Option<String>,
+    installation_id: Option<String>,
+    checked_files: usize,
+    verified_bytes: u64,
+    problems: Vec<ValidationProblemDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationProblemDto {
+    path: String,
+    reason: String,
+}
+
+/// Validates one instance's installed game against its installed-state
+/// record — a read-only, download-free check that reports damage precisely.
+#[tauri::command]
+pub fn validate_installed_game(
+    app: AppHandle,
+    request: ValidateInstalledGameRequest,
+) -> Result<InstalledGameValidationDto, CommandError> {
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let managed_paths = managed_paths(&app)?;
+
+    match run_installed_game_validation(&managed_paths, &instance)? {
+        ValidationOutcome::NotInstalled => Ok(InstalledGameValidationDto {
+            status: "notInstalled".to_owned(),
+            minecraft_version: None,
+            loader_version: None,
+            installation_id: None,
+            checked_files: 0,
+            verified_bytes: 0,
+            problems: Vec::new(),
+        }),
+        ValidationOutcome::Installed(validation) => Ok(validation_dto(validation)),
+    }
+}
+
+fn validation_dto(validation: InstalledGameValidation) -> InstalledGameValidationDto {
+    let status = match validation.status {
+        ValidationStatus::Valid => "valid",
+        ValidationStatus::Damaged => "damaged",
+    };
+    InstalledGameValidationDto {
+        status: status.to_owned(),
+        minecraft_version: Some(validation.minecraft_version),
+        loader_version: Some(validation.fabric_loader_version),
+        installation_id: Some(validation.installation_id),
+        checked_files: validation.checked_files,
+        verified_bytes: validation.verified_bytes,
+        problems: validation
+            .problems
+            .into_iter()
+            .map(|problem| ValidationProblemDto {
+                path: problem.path,
+                reason: problem.reason,
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -913,6 +1167,128 @@ mod tests {
             "a transport failure must map to a transport category, got: {}",
             command_error.code
         );
+    }
+
+    #[test]
+    fn invalid_instance_ids_map_to_a_stable_machine_code() {
+        let error = CommandError::from(crate::instances::InstanceId::new("../evil").unwrap_err());
+        assert_eq!(error.code, "instance_id_invalid");
+    }
+
+    #[test]
+    fn installation_errors_map_to_stable_machine_codes() {
+        use crate::install::natives::NativeExtractionError;
+
+        let cases: Vec<(InstallError, &str)> = vec![
+            (
+                InstallError::AlreadyInProgress {
+                    instance_id: "aurora-default".to_owned(),
+                },
+                "installation_already_in_progress",
+            ),
+            (
+                InstallError::TargetConflict {
+                    path: "C:/managed/instances/x/game".to_owned(),
+                    reason: "partial prior tree".to_owned(),
+                },
+                "installation_target_conflict",
+            ),
+            (
+                InstallError::State(crate::install::state::InstalledStateError::Malformed {
+                    reason: "broken".to_owned(),
+                }),
+                "installation_state_invalid",
+            ),
+            (
+                InstallError::AssetIndexInvalid {
+                    reason: "not JSON".to_owned(),
+                },
+                "minecraft_asset_index_invalid",
+            ),
+            (
+                InstallError::AssetInvalid {
+                    name: "icons/icon.png".to_owned(),
+                    reason: "bad hash".to_owned(),
+                },
+                "minecraft_asset_invalid",
+            ),
+            (
+                InstallError::InvalidSource("bad metadata".to_owned()),
+                "artifact_source_invalid",
+            ),
+            (
+                InstallError::Materialization {
+                    path: "libraries/x.jar".to_owned(),
+                    source: std::io::Error::other("disk"),
+                },
+                "artifact_materialization_failure",
+            ),
+            (
+                InstallError::Native(NativeExtractionError::ArchiveInvalid {
+                    archive: "org.lwjgl:lwjgl:3.4.1:natives-windows".to_owned(),
+                    reason: "traversal entry".to_owned(),
+                }),
+                "native_archive_invalid",
+            ),
+            (
+                InstallError::Native(NativeExtractionError::EntryConflict {
+                    archive: "a".to_owned(),
+                    entry: "lwjgl.dll".to_owned(),
+                    reason: "differing duplicates".to_owned(),
+                }),
+                "native_extraction_failure",
+            ),
+            (
+                InstallError::Validation {
+                    path: "versions/26.2/client.jar".to_owned(),
+                    reason: "digest drift".to_owned(),
+                },
+                "installation_validation_failure",
+            ),
+            (
+                InstallError::Commit {
+                    context: "promoting the staged installation".to_owned(),
+                    source: std::io::Error::other("locked"),
+                },
+                "installation_commit_failure",
+            ),
+            (
+                InstallError::Storage(std::io::Error::other("disk")),
+                "storage_io_failure",
+            ),
+            (
+                InstallError::Acquisition(AcquisitionError::StoreIo(std::io::Error::other("disk"))),
+                "cache_io_failure",
+            ),
+            (
+                InstallError::Acquisition(AcquisitionError::Download(
+                    DownloadError::Sha1Mismatch {
+                        expected: "a".repeat(40),
+                        actual: "b".repeat(40),
+                    },
+                )),
+                "artifact_hash_mismatch",
+            ),
+            (
+                InstallError::Acquisition(AcquisitionError::Download(
+                    DownloadError::ObservedDigestDrift {
+                        url: "https://maven.fabricmc.net/x.jar".to_owned(),
+                        recorded: "a".repeat(64),
+                        received: "b".repeat(64),
+                    },
+                )),
+                "fabric_artifact_unverified",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
     }
 
     #[test]

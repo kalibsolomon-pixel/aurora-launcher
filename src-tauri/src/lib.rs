@@ -4,6 +4,7 @@ pub mod config;
 pub mod distribution;
 pub mod downloads;
 pub mod fabric;
+pub mod install;
 pub mod instances;
 pub mod integrity;
 pub mod minecraft;
@@ -22,7 +23,9 @@ pub fn run() {
             application::get_launcher_state,
             application::acquire_artifact,
             application::plan_minecraft_install,
-            application::plan_fabric_install
+            application::plan_fabric_install,
+            application::install_game,
+            application::validate_installed_game
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Aurora Launcher");

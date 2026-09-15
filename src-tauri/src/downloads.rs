@@ -23,7 +23,10 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::integrity::{ArtifactDigest, InvalidDigest, StreamingVerifier, VerificationFailure};
+use crate::integrity::{
+    ArtifactDigest, InvalidDigest, InvalidSha1Digest, Sha1Digest, StreamingSha1Verifier,
+    StreamingVerifier, VerificationFailure,
+};
 
 /// Default bound on redirect hops the transport is willing to follow.
 pub const MAX_REDIRECTS: usize = 8;
@@ -80,27 +83,7 @@ impl ArtifactSource {
         size_bytes: Option<u64>,
         host_policy: HostPolicy,
     ) -> Result<Self, InvalidArtifactSource> {
-        let parsed = Url::parse(url).map_err(|_| InvalidArtifactSource::UnparsableUrl)?;
-        if parsed.cannot_be_a_base() {
-            return Err(InvalidArtifactSource::UnparsableUrl);
-        }
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            return Err(InvalidArtifactSource::EmbeddedCredentials);
-        }
-
-        match host_policy {
-            HostPolicy::HttpsOnly => {
-                if parsed.scheme() != "https" {
-                    return Err(InvalidArtifactSource::InsecureUrl(parsed.to_string()));
-                }
-            }
-            HostPolicy::LoopbackHttpAllowed => {
-                let loopback_http = parsed.scheme() == "http" && is_loopback_host(&parsed);
-                if !loopback_http && parsed.scheme() != "https" {
-                    return Err(InvalidArtifactSource::InsecureUrl(parsed.to_string()));
-                }
-            }
-        }
+        let parsed = validate_transport_url(url, host_policy)?;
 
         if size_bytes == Some(0) {
             return Err(InvalidArtifactSource::InvalidSize);
@@ -132,6 +115,7 @@ pub enum InvalidArtifactSource {
     InsecureUrl(String),
     EmbeddedCredentials,
     InvalidDigest(InvalidDigest),
+    InvalidSha1(InvalidSha1Digest),
     InvalidSize,
 }
 
@@ -150,6 +134,10 @@ impl fmt::Display for InvalidArtifactSource {
             Self::InvalidDigest(error) => {
                 write!(formatter, "the artifact digest is invalid: {error}")
             }
+            Self::InvalidSha1(error) => write!(
+                formatter,
+                "the official expected SHA-1 digest is invalid: {error}"
+            ),
             Self::InvalidSize => write!(
                 formatter,
                 "the artifact size, when provided, must be greater than zero"
@@ -162,6 +150,7 @@ impl std::error::Error for InvalidArtifactSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidDigest(error) => Some(error),
+            Self::InvalidSha1(error) => Some(error),
             _ => None,
         }
     }
@@ -221,52 +210,11 @@ pub async fn download(
     destination: &Path,
     options: &DownloadOptions,
 ) -> Result<DownloadedFile, DownloadError> {
-    let client = build_client(options);
-    let response = client
-        .get(source.url().clone())
-        .send()
-        .await
-        .map_err(DownloadError::from_transport)?;
+    let response = send_request(source.url(), options).await?;
+    check_declared_length(&response, source.size_bytes())?;
 
-    let status = response.status();
-    if !status.is_success() {
-        return Err(DownloadError::HttpStatus {
-            status: status.as_u16(),
-        });
-    }
-
-    // A server-declared length that already disagrees with the manifest is
-    // detected before a single byte is written.
-    if let (Some(expected), Some(declared)) = (source.size_bytes(), response.content_length()) {
-        if declared != expected {
-            return Err(DownloadError::SizeMismatch {
-                expected,
-                actual: declared,
-            });
-        }
-    }
-
-    let mut file = tokio::fs::File::create(destination)
-        .await
-        .map_err(DownloadError::StagingIo)?;
     let mut verifier = StreamingVerifier::new(source.size_bytes());
-
-    let result = stream_response(response, &mut file, &mut verifier).await;
-    match result {
-        Ok(()) => {}
-        Err(failure) => {
-            drop(file);
-            let _ = tokio::fs::remove_file(destination).await;
-            return Err(failure);
-        }
-    }
-
-    // The staging file must be completely on disk before it can be promoted.
-    if let Err(error) = file.sync_all().await {
-        drop(file);
-        let _ = tokio::fs::remove_file(destination).await;
-        return Err(DownloadError::StagingIo(error));
-    }
+    stream_body(response, destination, |chunk| verifier.update(chunk)).await?;
 
     let bytes = match verifier.finish(source.sha256()) {
         Ok(bytes) => bytes,
@@ -282,25 +230,358 @@ pub async fn download(
     })
 }
 
-async fn stream_response(
-    mut response: reqwest::Response,
-    file: &mut tokio::fs::File,
-    verifier: &mut StreamingVerifier,
+/// Validated metadata describing one official Mojang artifact: an HTTPS (or
+/// explicit loopback test) URL, the official expected SHA-1, and the official
+/// expected size when published.
+///
+/// This is the SHA-1 twin of [`ArtifactSource`]: same transport policy, same
+/// construction trust boundary, different (officially expected) digest
+/// algorithm. A SHA-1 source can never pose as a SHA-256 source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha1ArtifactSource {
+    url: Url,
+    sha1: Sha1Digest,
+    size_bytes: Option<u64>,
+}
+
+impl Sha1ArtifactSource {
+    /// Creates validated production metadata from an HTTPS artifact URL.
+    pub fn https(
+        url: &str,
+        sha1: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha1, size_bytes, HostPolicy::HttpsOnly)
+    }
+
+    /// Creates validated test metadata from a loopback HTTP URL (the
+    /// launcher's documented test-transport path).
+    pub fn loopback_http_for_testing(
+        url: &str,
+        sha1: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha1, size_bytes, HostPolicy::LoopbackHttpAllowed)
+    }
+
+    /// Creates validated metadata accepting the documented transport policy:
+    /// a production HTTPS URL, or an explicit loopback HTTP test URL. This is
+    /// the constructor plan-consuming executors use when the plan's URL has
+    /// already been policy-validated at planning time.
+    pub fn https_or_loopback(
+        url: &str,
+        sha1: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha1, size_bytes, HostPolicy::LoopbackHttpAllowed)
+    }
+
+    fn build(
+        url: &str,
+        sha1: &str,
+        size_bytes: Option<u64>,
+        host_policy: HostPolicy,
+    ) -> Result<Self, InvalidArtifactSource> {
+        let url = validate_transport_url(url, host_policy)?;
+        if size_bytes == Some(0) {
+            return Err(InvalidArtifactSource::InvalidSize);
+        }
+        Ok(Self {
+            url,
+            sha1: Sha1Digest::parse(sha1).map_err(InvalidArtifactSource::InvalidSha1)?,
+            size_bytes,
+        })
+    }
+
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    pub fn sha1(&self) -> &Sha1Digest {
+        &self.sha1
+    }
+
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+}
+
+/// The measured properties of a fully streamed (but not yet promoted)
+/// SHA-1-verified artifact file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadedSha1File {
+    pub bytes: u64,
+    pub sha1: Sha1Digest,
+}
+
+/// Streams one official Mojang artifact into `destination`, verifying size
+/// and the official expected SHA-1 while streaming.
+///
+/// Same staging contract as [`download`]: a failed transfer removes its
+/// partial file and never leaves debris.
+pub async fn download_sha1(
+    source: &Sha1ArtifactSource,
+    destination: &Path,
+    options: &DownloadOptions,
+) -> Result<DownloadedSha1File, DownloadError> {
+    let response = send_request(source.url(), options).await?;
+    check_declared_length(&response, source.size_bytes())?;
+
+    let mut verifier = StreamingSha1Verifier::new(source.size_bytes());
+    stream_body(response, destination, |chunk| verifier.update(chunk)).await?;
+
+    let bytes = match verifier.finish(source.sha1()) {
+        Ok(bytes) => bytes,
+        Err(failure) => {
+            let _ = tokio::fs::remove_file(destination).await;
+            return Err(failure.into());
+        }
+    };
+
+    Ok(DownloadedSha1File {
+        bytes,
+        sha1: *source.sha1(),
+    })
+}
+
+/// A digest-less artifact source: a URL with no published expected digest,
+/// acquired purely over the secure transport.
+///
+/// This exists for the Fabric artifacts official metadata adds without
+/// digests (the loader and the intermediary). Transport policy is unchanged —
+/// production HTTPS only, loopback cleartext only for deterministic tests —
+/// but there is no expected digest to verify against; a size limit is the
+/// only transfer bound, and the SHA-256 is *computed* locally as an observed
+/// identity rather than checked against an official expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedArtifactSource {
+    url: Url,
+    size_limit_bytes: u64,
+}
+
+impl ObservedArtifactSource {
+    /// The transfer bound for digest-less acquisitions. Fabric loader-sized
+    /// artifacts are a few megabytes; the bound exists to keep a broken or
+    /// hostile endpoint from streaming unbounded bytes, not to describe the
+    /// artifact.
+    pub const DEFAULT_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+    pub fn https(url: &str) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, HostPolicy::HttpsOnly)
+    }
+
+    pub fn loopback_http_for_testing(url: &str) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, HostPolicy::LoopbackHttpAllowed)
+    }
+
+    /// Creates validated metadata accepting the documented transport policy:
+    /// production HTTPS, or an explicit loopback HTTP test URL.
+    pub fn https_or_loopback(url: &str) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, HostPolicy::LoopbackHttpAllowed)
+    }
+
+    fn build(url: &str, host_policy: HostPolicy) -> Result<Self, InvalidArtifactSource> {
+        Ok(Self {
+            url: validate_transport_url(url, host_policy)?,
+            size_limit_bytes: Self::DEFAULT_SIZE_LIMIT_BYTES,
+        })
+    }
+
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    pub fn size_limit_bytes(&self) -> u64 {
+        self.size_limit_bytes
+    }
+}
+
+/// The measured properties of a digest-less artifact acquired over secure
+/// transport: the byte count and the locally observed SHA-256 identity.
+///
+/// `observed_sha256` is an observation, not a verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedDownload {
+    pub bytes: u64,
+    pub observed_sha256: ArtifactDigest,
+}
+
+/// Streams one digest-less artifact into `destination`, computing its
+/// observed SHA-256 while streaming and enforcing the size limit.
+///
+/// `local_pin` is an optional *locally recorded* observed digest from a prior
+/// acquisition of the same URL (a consistency reference, never an official
+/// expectation). When present and the received bytes hash to a different
+/// value, the transfer fails: content changing under a stable versioned URL
+/// is exactly what the local consistency check exists to surface.
+pub async fn download_observed(
+    source: &ObservedArtifactSource,
+    local_pin: Option<&ArtifactDigest>,
+    destination: &Path,
+    options: &DownloadOptions,
+) -> Result<ObservedDownload, DownloadError> {
+    let response = send_request(source.url(), options).await?;
+    let limit = source.size_limit_bytes();
+    // No exact expected size exists for a digest-less artifact; only reject a
+    // server-declared length that already exceeds the transfer bound.
+    if let Some(declared) = response.content_length() {
+        if declared > limit {
+            return Err(DownloadError::SizeMismatch {
+                expected: limit,
+                actual: declared,
+            });
+        }
+    }
+
+    let mut verifier = StreamingVerifier::new(None);
+    let mut streamed = 0u64;
+    stream_body(response, destination, |chunk| {
+        streamed += chunk.len() as u64;
+        if streamed > limit {
+            return Err(VerificationFailure::SizeMismatch {
+                expected: limit,
+                actual: streamed,
+            });
+        }
+        verifier.update(chunk)
+    })
+    .await?;
+
+    let (bytes, observed) = verifier.finish_observed();
+    if let Some(pinned) = local_pin {
+        if &observed != pinned {
+            let _ = tokio::fs::remove_file(destination).await;
+            return Err(DownloadError::ObservedDigestDrift {
+                url: source.url().to_string(),
+                recorded: pinned.as_hex(),
+                received: observed.as_hex(),
+            });
+        }
+    }
+
+    Ok(ObservedDownload {
+        bytes,
+        observed_sha256: observed,
+    })
+}
+
+/// Sends the GET request and enforces the success status.
+async fn send_request(
+    url: &Url,
+    options: &DownloadOptions,
+) -> Result<reqwest::Response, DownloadError> {
+    let client = build_client(options);
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(DownloadError::from_transport)?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DownloadError::HttpStatus {
+            status: status.as_u16(),
+        });
+    }
+
+    Ok(response)
+}
+
+/// A server-declared length that already disagrees with the expected value is
+/// detected before a single byte is written.
+fn check_declared_length(
+    response: &reqwest::Response,
+    expected_size: Option<u64>,
+) -> Result<(), DownloadError> {
+    if let (Some(expected), Some(declared)) = (expected_size, response.content_length()) {
+        if declared != expected {
+            return Err(DownloadError::SizeMismatch {
+                expected,
+                actual: declared,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Streams the response body into the staging file while feeding the caller's
+/// verification closure, then flushes completely to disk.
+///
+/// On any failure the partial staging file is removed before returning, so a
+/// failed transfer never leaves debris.
+async fn stream_body(
+    response: reqwest::Response,
+    destination: &Path,
+    mut verify: impl FnMut(&[u8]) -> Result<(), VerificationFailure>,
+) -> Result<(), DownloadError> {
+    match stream_body_inner(response, destination, &mut verify).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(destination).await;
+            Err(error)
+        }
+    }
+}
+
+async fn stream_body_inner(
+    response: reqwest::Response,
+    destination: &Path,
+    mut verify: impl FnMut(&[u8]) -> Result<(), VerificationFailure>,
 ) -> Result<(), DownloadError> {
     use tokio::io::AsyncWriteExt;
+
+    let mut response = response;
+    let mut file = tokio::fs::File::create(destination)
+        .await
+        .map_err(DownloadError::StagingIo)?;
 
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(DownloadError::from_transport)?
     {
-        verifier.update(&chunk)?;
+        verify(&chunk)?;
         file.write_all(&chunk)
             .await
             .map_err(DownloadError::StagingIo)?;
     }
 
+    // The staging file must be completely on disk before it can be promoted.
+    if let Err(error) = file.sync_all().await {
+        return Err(DownloadError::StagingIo(error));
+    }
+
     Ok(())
+}
+
+/// Parses and policy-checks one transport URL against the host policy.
+fn validate_transport_url(
+    url: &str,
+    host_policy: HostPolicy,
+) -> Result<Url, InvalidArtifactSource> {
+    let parsed = Url::parse(url).map_err(|_| InvalidArtifactSource::UnparsableUrl)?;
+    if parsed.cannot_be_a_base() {
+        return Err(InvalidArtifactSource::UnparsableUrl);
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(InvalidArtifactSource::EmbeddedCredentials);
+    }
+
+    match host_policy {
+        HostPolicy::HttpsOnly => {
+            if parsed.scheme() != "https" {
+                return Err(InvalidArtifactSource::InsecureUrl(parsed.to_string()));
+            }
+        }
+        HostPolicy::LoopbackHttpAllowed => {
+            let loopback_http = parsed.scheme() == "http" && is_loopback_host(&parsed);
+            if !loopback_http && parsed.scheme() != "https" {
+                return Err(InvalidArtifactSource::InsecureUrl(parsed.to_string()));
+            }
+        }
+    }
+
+    Ok(parsed)
 }
 
 /// Builds the launcher's HTTP client with the documented transport policy
@@ -443,6 +724,15 @@ pub enum DownloadError {
     SizeMismatch { expected: u64, actual: u64 },
     /// The received bytes do not hash to the expected digest.
     Sha256Mismatch { expected: String, actual: String },
+    /// The received bytes do not hash to the official expected SHA-1.
+    Sha1Mismatch { expected: String, actual: String },
+    /// A digest-less artifact's content no longer matches the locally
+    /// recorded observation from a prior acquisition of the same URL.
+    ObservedDigestDrift {
+        url: String,
+        recorded: String,
+        received: String,
+    },
     /// Writing or flushing the staging file failed.
     StagingIo(std::io::Error),
 }
@@ -471,6 +761,9 @@ impl DownloadError {
             }
             VerificationFailure::Sha256Mismatch { expected, actual } => {
                 Self::Sha256Mismatch { expected, actual }
+            }
+            VerificationFailure::Sha1Mismatch { expected, actual } => {
+                Self::Sha1Mismatch { expected, actual }
             }
         }
     }
@@ -517,6 +810,18 @@ impl fmt::Display for DownloadError {
             Self::Sha256Mismatch { expected, actual } => write!(
                 formatter,
                 "the downloaded artifact does not match its expected SHA-256 digest: expected {expected} but computed {actual}"
+            ),
+            Self::Sha1Mismatch { expected, actual } => write!(
+                formatter,
+                "the downloaded artifact does not match its official expected SHA-1 digest: expected {expected} but computed {actual}"
+            ),
+            Self::ObservedDigestDrift {
+                url,
+                recorded,
+                received,
+            } => write!(
+                formatter,
+                "the artifact at {url} no longer matches the SHA-256 observed when it was first acquired over secure transport: recorded {recorded} but received {received}; versioned artifact content should not change"
             ),
             Self::StagingIo(error) => write!(
                 formatter,
@@ -948,5 +1253,164 @@ mod tests {
             decide_redirect(&original, &escape, 0, MAX_REDIRECTS),
             RedirectDecision::Refuse(RedirectRefusal::LeftLoopbackCleartext { .. })
         ));
+    }
+
+    fn sha1_of(bytes: &[u8]) -> Sha1Digest {
+        Sha1Digest::compute(bytes)
+    }
+
+    fn sha1_source_for(server: &TestServer, path: &str, sha1: &Sha1Digest) -> Sha1ArtifactSource {
+        Sha1ArtifactSource::loopback_http_for_testing(
+            &format!("{}{path}", server.base_url()),
+            &sha1.as_hex(),
+            None,
+        )
+        .expect("test source must be valid")
+    }
+
+    #[tokio::test]
+    async fn sha1_downloads_verify_the_official_digest_or_fail_closed() {
+        let body = b"official mojang bytes".to_vec();
+        let expected = sha1_of(&body);
+        let byte_count = body.len() as u64;
+        let server = serve(move |_request| TestResponse::ok(&body));
+        let destination = staging_path("sha1-happy");
+
+        let source = sha1_source_for(&server, "/client.jar", &expected);
+        let downloaded = download_sha1(&source, &destination, &short_options())
+            .await
+            .expect("official bytes must verify");
+        assert_eq!(downloaded.bytes, byte_count);
+        assert_eq!(downloaded.sha1, expected);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"official mojang bytes"
+        );
+
+        // Wrong expectation: hard failure, no debris.
+        let wrong = sha1_source_for(&server, "/client.jar", &sha1_of(b"other bytes"));
+        let error = download_sha1(&wrong, &destination, &short_options())
+            .await
+            .expect_err("a SHA-1 mismatch must fail");
+        assert!(matches!(error, DownloadError::Sha1Mismatch { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn sha1_downloads_enforce_the_declared_size() {
+        let body = b"0123456789".to_vec();
+        let expected = sha1_of(&body);
+        let declared = body.len() as u64 + 1;
+        let server = serve(move |_request| TestResponse::ok(&body));
+        let destination = staging_path("sha1-size");
+
+        let source = Sha1ArtifactSource::loopback_http_for_testing(
+            &format!("{}/client.jar", server.base_url()),
+            &expected.as_hex(),
+            Some(declared),
+        )
+        .unwrap();
+
+        let error = download_sha1(&source, &destination, &short_options())
+            .await
+            .expect_err("a short body must fail the size check");
+        assert!(matches!(error, DownloadError::SizeMismatch { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn observed_downloads_compute_their_identity_and_respect_pins() {
+        let body = b"digest-less fabric loader bytes".to_vec();
+        let expected_digest = digest_of(&body);
+        let byte_count = body.len() as u64;
+        let server = serve(move |_request| TestResponse::ok(&body));
+        let destination = staging_path("observed-happy");
+
+        let source = ObservedArtifactSource::loopback_http_for_testing(&format!(
+            "{}/fabric-loader.jar",
+            server.base_url()
+        ))
+        .unwrap();
+
+        // Without a pin: acquisition succeeds and reports the observed digest.
+        let first = download_observed(&source, None, &destination, &short_options())
+            .await
+            .expect("secure transport acquisition must succeed");
+        assert_eq!(first.observed_sha256, expected_digest);
+        assert_eq!(first.bytes, byte_count);
+
+        // With the recorded pin: identical content passes as a consistency
+        // check.
+        let second = download_observed(
+            &source,
+            Some(&expected_digest),
+            &destination,
+            &short_options(),
+        )
+        .await
+        .expect("identical content satisfies the local pin");
+        assert_eq!(second.observed_sha256, expected_digest);
+
+        // With a pin from different bytes: deliberate drift failure.
+        let error = download_observed(
+            &source,
+            Some(&digest_of(b"other")),
+            &destination,
+            &short_options(),
+        )
+        .await
+        .expect_err("drifted content must fail the local pin");
+        assert!(matches!(error, DownloadError::ObservedDigestDrift { .. }));
+        assert!(!destination.exists(), "failed staging files are removed");
+    }
+
+    #[tokio::test]
+    async fn observed_downloads_enforce_the_transfer_size_limit() {
+        let body = vec![7u8; 128];
+        let server = serve(move |_request| TestResponse::ok(&body));
+        let destination = staging_path("observed-limit");
+
+        let url = format!("{}/loader.jar", server.base_url());
+        let mut source = ObservedArtifactSource::loopback_http_for_testing(&url).unwrap();
+        source.size_limit_bytes = 64;
+
+        let error = download_observed(&source, None, &destination, &short_options())
+            .await
+            .expect_err("an oversized transfer must fail");
+        assert!(matches!(error, DownloadError::SizeMismatch { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn sha1_and_observed_sources_share_the_transport_url_policy() {
+        let sha1 = sha1_of(b"x").as_hex();
+
+        assert!(
+            Sha1ArtifactSource::https("http://piston-data.mojang.com/client.jar", &sha1, None)
+                .is_err(),
+            "production SHA-1 sources must be HTTPS"
+        );
+        assert!(
+            Sha1ArtifactSource::https("https://piston-data.mojang.com/client.jar", &sha1, None)
+                .is_ok()
+        );
+        assert!(
+            Sha1ArtifactSource::https(
+                "https://piston-data.mojang.com/client.jar",
+                "deadbeef",
+                None
+            )
+            .is_err()
+        );
+
+        assert!(ObservedArtifactSource::https("https://maven.fabricmc.net/loader.jar").is_ok());
+        assert!(ObservedArtifactSource::https("http://maven.fabricmc.net/loader.jar").is_err());
+        assert!(
+            ObservedArtifactSource::loopback_http_for_testing("http://127.0.0.1:9/loader.jar")
+                .is_ok()
+        );
+        assert!(
+            ObservedArtifactSource::loopback_http_for_testing("http://example.invalid/x").is_err()
+        );
     }
 }
