@@ -2,11 +2,12 @@
 //!
 //! One login transaction binds one listener on `127.0.0.1` at an ephemeral
 //! port; the authorization request tells Microsoft to redirect the system
-//! browser to `http://localhost:<port>/callback` (the port is ignored for
-//! matching by the Microsoft identity platform, so an ephemeral port works
-//! with a plain registered `http://localhost` redirect).
+//! browser to `http://localhost:<port>/` (the port is ignored for matching by
+//! the Microsoft identity platform, so an ephemeral port works with a plain
+//! registered `http://localhost` redirect, while the path is matched exactly
+//! — the registration's root path is what the URI must carry).
 //!
-//! The receiver is local-only, accepts exactly the expected callback path,
+//! The receiver is local-only, accepts exactly the registered root path,
 //! ignores callbacks whose state does not match this transaction (stale tabs
 //! must not kill or hijack a fresh login), stops at the first decisive
 //! callback, and disappears with its listener when the flow ends — by
@@ -20,8 +21,10 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::oauth::{self, CallbackQuery};
 
-/// The only path accepted as a callback.
-pub const CALLBACK_PATH: &str = "/callback";
+/// The only path accepted as a callback: the root path of the registered
+/// loopback redirect (`http://localhost`). Loopback matching ignores the
+/// port but compares the path exactly, so no path segment may be appended.
+pub const CALLBACK_PATH: &str = "/";
 
 /// Bound on one request head (callback requests carry query strings only).
 const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
@@ -93,9 +96,12 @@ impl CallbackReceiver {
         self.port
     }
 
-    /// The redirect URI sent in the authorization request.
+    /// The redirect URI sent in the authorization request: the registered
+    /// `localhost` hostname with the dynamically selected port and the
+    /// registration's root path. The bind address (`127.0.0.1`) never
+    /// enters the URI.
     pub fn redirect_uri(&self) -> String {
-        format!("http://localhost:{}/callback", self.port)
+        format!("http://localhost:{}/", self.port)
     }
 
     /// Waits for the decisive callback.
@@ -150,9 +156,15 @@ async fn handle_connection(mut stream: TcpStream, expected_state: &str) -> Conne
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
 
-    // Only the exact callback path on a GET is a callback; everything else
-    // (favicon requests, probes, other methods) is refused and ignored.
-    if method != "GET" || !target.starts_with(CALLBACK_PATH) {
+    // Only an exact GET on the registered root path is a callback; every
+    // other path (favicon requests, probes) is refused and ignored. The
+    // comparison is on the path alone — a plain prefix test would match
+    // every possible request target.
+    let path = target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target);
+    if method != "GET" || path != CALLBACK_PATH {
         let _ = respond(&mut stream, 404, "Not Found", REJECTION_PAGE).await;
         return ConnectionOutcome::Continue;
     }
@@ -258,10 +270,7 @@ mod tests {
     async fn a_valid_callback_delivers_the_code_and_closes_the_listener() {
         let receiver = CallbackReceiver::bind().await.unwrap();
         let port = receiver.port();
-        assert_eq!(
-            receiver.redirect_uri(),
-            format!("http://localhost:{port}/callback")
-        );
+        assert_eq!(receiver.redirect_uri(), format!("http://localhost:{port}/"));
 
         let waiter =
             tokio::spawn(async move { receiver.wait_for_callback("expected-state").await });
@@ -269,19 +278,26 @@ mod tests {
         // A mismatched-state callback never satisfies the receiver…
         let stale = send_raw(
             port,
-            "GET /callback?code=STALE-CODE&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?code=STALE-CODE&state=wrong-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(stale.starts_with("HTTP/1.1 400"));
 
-        // …and neither does an unrelated path.
+        // …and neither does an unrelated path — including the path shape a
+        // non-root registration would use, which this registration forbids.
         let favicon = send_raw(port, "GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
         assert!(favicon.starts_with("HTTP/1.1 404"));
+        let non_root = send_raw(
+            port,
+            "GET /callback?code=STRAY-CODE&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(non_root.starts_with("HTTP/1.1 404"));
 
         // The correct state completes the transaction.
         let done = send_raw(
             port,
-            "GET /callback?code=FIXTURE-AUTH-CODE&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?code=FIXTURE-AUTH-CODE&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(done.starts_with("HTTP/1.1 200"));
@@ -300,6 +316,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_listener_is_loopback_only_and_advertises_the_registered_localhost_root() {
+        let receiver = CallbackReceiver::bind().await.unwrap();
+
+        // The listener accepts connections only on the loopback interface.
+        let address = receiver.listener.local_addr().unwrap();
+        assert!(address.ip().is_loopback());
+
+        // The advertised redirect URI carries the registered localhost
+        // hostname, the dynamically selected port, and the registration's
+        // root path — never the bind address or a path segment.
+        let port = address.port();
+        assert_ne!(port, 0, "the OS must have selected a concrete port");
+        let uri = receiver.redirect_uri();
+        assert_eq!(uri, format!("http://localhost:{port}/"));
+        assert!(
+            !uri.contains("127.0.0.1"),
+            "the bind address never enters the URI"
+        );
+        assert_eq!(
+            uri.strip_prefix("http://localhost:").unwrap_or(""),
+            format!("{port}/"),
+            "beyond host and dynamic port there is only the root path"
+        );
+    }
+
+    #[tokio::test]
     async fn a_provider_error_callback_fails_the_flow_with_its_reason() {
         let receiver = CallbackReceiver::bind().await.unwrap();
         let port = receiver.port();
@@ -308,7 +350,7 @@ mod tests {
 
         let response = send_raw(
             port,
-            "GET /callback?error=access_denied&error_description=user+declined HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?error=access_denied&error_description=user+declined HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 400"));
@@ -334,7 +376,7 @@ mod tests {
 
         let response = send_raw(
             port,
-            "GET /callback?state=expected-state&foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            "GET /?state=expected-state&foo=bar HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
         assert!(response.starts_with("HTTP/1.1 400"));

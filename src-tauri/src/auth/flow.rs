@@ -681,9 +681,9 @@ mod tests {
                 }
                 BrowserScript::Nothing => return Ok(()),
                 BrowserScript::ProviderError { error } => {
-                    let redirect = redirect_host_of(authorize_url);
+                    let (authority, path) = redirect_target_of(authorize_url);
                     let query = format!("error={error}");
-                    std::thread::spawn(move || send_callback(&redirect, &query));
+                    std::thread::spawn(move || send_callback(&authority, &path, &query));
                     return Ok(());
                 }
                 _ => {}
@@ -704,16 +704,7 @@ mod tests {
                 .find(|(key, _)| key == "state")
                 .map(|(_, value)| value.clone())
                 .unwrap_or_default();
-            let redirect = params
-                .iter()
-                .find(|(key, _)| key == "redirect_uri")
-                .map(|(_, value)| value.clone())
-                .unwrap_or_default();
-            let redirect_host = redirect
-                .strip_prefix("http://")
-                .and_then(|rest| rest.split_once('/'))
-                .map(|(host, _)| host.to_owned())
-                .unwrap_or_default();
+            let (redirect_authority, redirect_path) = redirect_target_of(authorize_url);
 
             let query = match script {
                 BrowserScript::StaleState => {
@@ -722,12 +713,15 @@ mod tests {
                 _ => format!("code={AUTH_CODE}&state={state}"),
             };
 
-            std::thread::spawn(move || send_callback(&redirect_host, &query));
+            std::thread::spawn(move || send_callback(&redirect_authority, &redirect_path, &query));
             Ok(())
         }
     }
 
-    fn redirect_host_of(authorize_url: &str) -> String {
+    /// The `(authority, path)` the scripted "browser" redirects to, taken
+    /// from the authorization request's redirect_uri exactly as a real
+    /// browser would follow it. An empty path normalizes to the root.
+    fn redirect_target_of(authorize_url: &str) -> (String, String) {
         authorize_url
             .split_once("redirect_uri=")
             .and_then(|(_, rest)| rest.split('&').next())
@@ -740,19 +734,21 @@ mod tests {
             })
             .and_then(|uri| {
                 uri.strip_prefix("http://")
-                    .and_then(|rest| rest.split_once('/'))
-                    .map(|(host, _)| host.to_owned())
+                    .map(|rest| match rest.split_once('/') {
+                        Some((authority, path)) => (authority.to_owned(), format!("/{path}")),
+                        None => (rest.to_owned(), "/".to_owned()),
+                    })
             })
             .unwrap_or_default()
     }
 
-    fn send_callback(host: &str, query: &str) {
-        let Ok(mut stream) = TcpStream::connect(host) else {
+    fn send_callback(authority: &str, path: &str, query: &str) {
+        let Ok(mut stream) = TcpStream::connect(authority) else {
             return;
         };
         let _ = std::io::Write::write_all(
             &mut stream,
-            format!("GET /callback?{query} HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes(),
+            format!("GET {path}?{query} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes(),
         );
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut sink = Vec::new();
@@ -978,6 +974,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_registered_loopback_root_reaches_both_exchange_ends_identically() {
+        let _flow_tests = serialized_flow_tests().await;
+        let setup = TestSetup::new("aurora-auth-flow-redirect-uri");
+
+        let captured_url = Arc::new(Mutex::new(String::new()));
+        let sink = Arc::clone(&captured_url);
+        let browser = move |url: &str| -> Result<(), BrowserOpenError> {
+            *sink.lock().unwrap() = url.to_owned();
+            scripted_browser(BrowserScript::Complete)(url)
+        };
+
+        let context = setup.context(&browser);
+        sign_in(&context, &mut |_| {}).await.unwrap();
+
+        // The authorization request advertised the registered loopback
+        // redirect: localhost hostname, dynamically selected port, root path.
+        let authorize_url = captured_url.lock().unwrap().clone();
+        let params: Vec<(String, String)> = url::form_urlencoded::parse(
+            authorize_url
+                .split_once('?')
+                .map(|(_, query)| query)
+                .unwrap_or("")
+                .as_bytes(),
+        )
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+        let advertised = params
+            .iter()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+
+        assert!(advertised.starts_with("http://localhost:"));
+        assert!(
+            advertised.ends_with('/'),
+            "the root path carries no segment"
+        );
+        assert!(
+            !advertised.contains("127.0.0.1"),
+            "the bind address never enters the URI"
+        );
+        let port: u16 = advertised["http://localhost:".len()..]
+            .trim_end_matches('/')
+            .parse()
+            .expect("the port is a bare number");
+        assert_ne!(port, 0, "the dynamically selected port must be present");
+
+        // The token exchange carried exactly the same redirect URI.
+        let body = setup.world.lock().unwrap().token_request_bodies[0].clone();
+        let encoded = body
+            .split("redirect_uri=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
+        let exchanged = url::form_urlencoded::parse(format!("x={encoded}").as_bytes())
+            .next()
+            .map(|(_, value)| value.into_owned())
+            .unwrap();
+        assert_eq!(exchanged, advertised);
+    }
+
+    #[tokio::test]
     async fn downstream_failures_persist_nothing() {
         let _flow_tests = serialized_flow_tests().await;
         for (name, mutate, expected_code) in [
@@ -1181,8 +1241,9 @@ mod tests {
         // receiver is already closed, so the connection is refused (or
         // closed without an answer) and nothing whatsoever is persisted.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let redirect = redirect_host_of(&authorize_url.lock().unwrap());
-        if let Ok(mut stream) = TcpStream::connect(redirect) {
+        let (redirect_authority, _redirect_path) =
+            redirect_target_of(&authorize_url.lock().unwrap());
+        if let Ok(mut stream) = TcpStream::connect(redirect_authority) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             let mut response = Vec::new();
             let _ = std::io::Read::read_to_end(&mut stream, &mut response);

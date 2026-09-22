@@ -944,7 +944,7 @@ mod tests {
             TokenGrant::AuthorizationCode {
                 code: "FIXTURE-AUTH-CODE",
                 code_verifier: "FIXTURE-VERIFIER-012345678901234567890123456789",
-                redirect_uri: "http://localhost:49152/callback",
+                redirect_uri: "http://localhost:49152/",
             },
         )
         .await
@@ -962,7 +962,7 @@ mod tests {
         assert!(form.contains("code=FIXTURE-AUTH-CODE"));
         assert!(form.contains("code_verifier=FIXTURE-VERIFIER"));
         assert!(form.contains("client_id=aurora-test-client-id"));
-        assert!(form.contains("redirect_uri=http%3A%2F%2Flocalhost%3A49152%2Fcallback"));
+        assert!(form.contains("redirect_uri=http%3A%2F%2Flocalhost%3A49152%2F"));
         assert!(form.contains("scope=XboxLive.signin+offline_access"));
         assert!(!form.contains("client_secret"));
     }

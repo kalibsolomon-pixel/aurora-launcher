@@ -309,17 +309,12 @@ mod tests {
             PkcePair::from_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_owned())
                 .unwrap();
 
-        let url = build_authorization_url(
-            &endpoint,
-            &config,
-            "http://localhost:49152/callback",
-            &state,
-            &pkce,
-        );
+        let url =
+            build_authorization_url(&endpoint, &config, "http://localhost:49152/", &state, &pkce);
 
         assert_eq!(
             url.as_str(),
-            "https://login.example.invalid/authorize?response_type=code&client_id=aurora-test-client-id&redirect_uri=http%3A%2F%2Flocalhost%3A49152%2Fcallback&scope=XboxLive.signin+offline_access&state=state-value&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&response_mode=query"
+            "https://login.example.invalid/authorize?response_type=code&client_id=aurora-test-client-id&redirect_uri=http%3A%2F%2Flocalhost%3A49152%2F&scope=XboxLive.signin+offline_access&state=state-value&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&response_mode=query"
         );
 
         // No secret parameter ever appears.
