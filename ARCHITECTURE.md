@@ -506,7 +506,7 @@ Aurora is a desktop **public client**: no client secret exists anywhere in the l
 
 The user authenticates in the **system browser** (opened through the official Tauri opener plugin; no embedded webview, no cookie persistence by Aurora, no page scraping or script injection). The redirect target is the documented native-app loopback pattern: a one-shot `TcpListener` bound to `127.0.0.1` on an ephemeral port, advertised as `http://localhost:<port>/` — the registered redirect's root path plus the dynamically selected port. Loopback redirect matching follows RFC 8252: the port is ignored when matching a registered `http://localhost` redirect, but the path is compared exactly, so the URI carries the root path and no path segment (a `/callback` suffix against the bare registration is rejected by Microsoft as `invalid_request`, a defect found and fixed during first live verification). The receiver accepts exactly that root path, answers with a fixed page (never reflecting request data), **ignores mismatched-state callbacks** (stale tabs must neither complete nor kill a fresh login) and non-root requests, and dies with its listener at the first decisive callback, on provider error, on cancellation, or on timeout — no listener ever survives its flow.
 
-**The Aurora Client Microsoft application registration exists.** `production_registration()` resolves its client ID from the `AURORA_MICROSOFT_CLIENT_ID` build-environment variable and nothing else; without it, `begin_microsoft_login` fails deliberately with `auth_configuration_missing`. Aurora will never borrow another launcher's client ID. Microsoft requires new application registrations to complete its Minecraft Services AppID review/allowlisting (the `aka.ms/mce-reviewappid` review) before `api.minecraftservices.com` accepts their tokens — an unapproved app receives HTTP 403 "Invalid app registration"; the Aurora Client review is complete. The registered platform redirect is `http://localhost`: the loopback receiver above supplies the ephemeral port and carries the registration's root path.
+**The Aurora Client Microsoft application registration exists.** The application (client) ID is public application configuration — Aurora is a desktop public client and no client secret exists anywhere — so the approved ID is committed in `auth::flow` and every normal development or official build carries it without manual setup. The optional `AURORA_MICROSOFT_CLIENT_ID` build-environment variable overrides the committed value for fork/CI builds; when neither is present, `begin_microsoft_login` fails deliberately with `auth_configuration_missing`. Aurora will never borrow another launcher's client ID. Microsoft requires new application registrations to complete its Minecraft Services AppID review/allowlisting (the `aka.ms/mce-reviewappid` review) before `api.minecraftservices.com` accepts their tokens — an unapproved app receives HTTP 403 "Invalid app registration"; the Aurora Client review is complete. The registered platform redirect is `http://localhost`: the loopback receiver above supplies the ephemeral port and carries the registration's root path.
 
 ### Authentication chain
 
@@ -544,7 +544,7 @@ One login transaction is allowed per process (a second attempt fails with `auth_
 
 ### Tauri boundary and UI
 
-Commands: `get_accounts`, `begin_microsoft_login`, `cancel_microsoft_login`, `select_account`, `remove_account`, `refresh_account_session`. No command or event ever carries a token; progress events carry only a phase string. The production Account panel signs in through the system browser, lists accounts with derived status, selects, checks sessions, and removes accounts — no email display, no skin/avatar/cosmetic features, no password fields. A build without the client ID configured still surfaces the honest `auth_configuration_missing` error instead of pretending to sign in.
+Commands: `get_accounts`, `begin_microsoft_login`, `cancel_microsoft_login`, `select_account`, `remove_account`, `refresh_account_session`. No command or event ever carries a token; progress events carry only a phase string. The production Accounts screen signs in through the system browser, lists accounts with derived status, selects, checks sessions, and removes accounts — no email display, no skin/avatar/cosmetic features, no password fields, and no raw profile UUIDs. Known authentication failures are translated into concise actionable language; internal structured error codes never appear as ordinary user-facing content there (they remain in logs and the development-only Developer screen). A build with no registration (a fork that blanks the committed client ID and sets no override) still surfaces the honest `auth_configuration_missing` condition instead of pretending to sign in.
 
 ### Live verification status
 
@@ -591,6 +591,18 @@ The production Play UI shows readiness, the selected Minecraft name, restrained 
 Svelte is a presentation layer. Security-sensitive state and all Minecraft/Aurora installation, authentication, download, integrity, Java/runtime, filesystem mutation, and process-launch logic stay behind native Rust commands or events. Commands should be narrow and use explicit request/response DTOs. Frontend code must not infer structured state by parsing strings.
 
 SvelteKit is configured as a static, client-side SPA because Tauri has no Node server. Vite remains the development and production asset builder.
+
+### Screen organization
+
+The shell is one persistent sidebar (Home, Instances, Accounts, About — plus Developer in development builds only, stripped from the production bundle together with its page) and one scrolling content region; the visual contract is `LAUNCHER_DESIGN_LANGUAGE.md`. Each screen presents only real backend state:
+
+- **Home** — the selected instance, Rust's `PlayReadiness` decision verbatim, and Play as the dominant action; a purposeful empty state when no instance exists.
+- **Instances** — creation from the currently supported release source (the development fixture, labeled as such), then selection, rename, retry, on-demand deep validation, and the managed Java lifecycle for the selected instance. Opaque instance ids, raw readiness dumps, and a second Play button are deliberately absent; full instance configuration (memory, JVM arguments, version pickers, mod management) is the next phase, not this screen.
+- **Accounts** — one obvious primary task when signed out (Sign in with Microsoft through the system browser), restrained selected/unselected account rows when signed in, and concise actionable wording for known failures (internal error codes stay off this screen).
+- **About** — product information only: version, purpose, project/source/license, and legal disclaimers.
+- **Developer** (development builds only) — launcher/platform diagnostics (version, platform, managed data root, persisted-state documents) and the Phase 2–5 pipeline proofs.
+
+Settings, themes, and a Library destination do not exist and are not shown. Instance deletion remains deliberately unimplemented and appears nowhere in the UI.
 
 ## Current native modules
 
@@ -802,9 +814,10 @@ The model supports stable, beta, and nightly channels and keeps each mapping ind
 ## Major Phase 8 decisions
 
 - Microsoft public-client authorization code + PKCE runs in the system browser with a one-shot loopback callback; passwords, embedded login webviews, client secrets, and borrowed registrations are prohibited.
+- The application (client) ID is public configuration committed with the source (no client secret exists to protect), with the `AURORA_MICROSOFT_CLIENT_ID` build-environment variable as an explicit override channel for fork builds; a build with no registration at all fails honestly with `auth_configuration_missing`.
 - Only the rotated Microsoft refresh credential is persisted, through the OS-backed store (Windows implemented); downstream tokens and Minecraft sessions are Rust-only and memory-only.
 - Account records are non-secret, schema-versioned, atomically written, selected independently of instances, and keyed by validated Minecraft profile UUID.
-- Entitlement and profile validation are mandatory, provider errors are sanitized, and a missing build-time client ID remains an honest `auth_configuration_missing` error. The production Aurora Client registration exists, completed the Minecraft Services AppID review, and the full chain was verified live (including secure persistence across restart).
+- Entitlement and profile validation are mandatory and provider errors are sanitized. The production Aurora Client registration exists, completed the Minecraft Services AppID review, and the full chain was verified live (including secure persistence across restart).
 
 ## Major Phase 9 decisions
 

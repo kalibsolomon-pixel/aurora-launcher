@@ -370,11 +370,6 @@
     justify-content: flex-end;
   }
 
-  .group-row-loading {
-    justify-content: flex-start;
-    gap: var(--space-3);
-  }
-
   .group-row-detail.is-error {
     color: var(--color-error);
   }

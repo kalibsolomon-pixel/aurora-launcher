@@ -1,11 +1,20 @@
 <script lang="ts">
   import { launcher } from "$lib/launcher/store.svelte";
+  import { authErrorMessage, authPhaseLabel } from "$lib/authMessages";
+
+  const accounts = $derived(launcher.accountsState?.accounts ?? []);
+  const signedIn = $derived(accounts.length > 0);
+
+  function sessionVerified(id: string): boolean {
+    return launcher.accountSessions[id] !== undefined;
+  }
 </script>
 
 <!--
-  Existing account surface, intentionally not redesigned in the shell/Home
-  pilot: the internal content keeps its established presentation and every
-  control until its own design phase.
+  Account management surface: one obvious primary task when signed out,
+  restrained selected/unselected rows when signed in. The UI speaks in
+  actionable language — internal error codes never appear here (see
+  authMessages.ts), and tokens never leave Rust in the first place.
 -->
 <div class="page">
   <header class="page-header">
@@ -13,317 +22,188 @@
       <h2 class="page-title">Accounts</h2>
       <p class="page-subtitle">Microsoft accounts used to launch Minecraft.</p>
     </div>
+    {#if signedIn && !launcher.signInBusy}
+      <div class="page-header-actions">
+        <button
+          type="button"
+          class="btn btn-primary"
+          onclick={() => launcher.runSignIn()}
+          disabled={launcher.accountsState === null || launcher.accountBusy !== null}
+        >
+          Add account
+        </button>
+      </div>
+    {/if}
   </header>
 
-  <section class="status-card" aria-labelledby="accounts-title" aria-live="polite">
-    <div class="status-heading">
-      <div>
-        <p class="eyebrow">Microsoft &amp; Minecraft authentication</p>
-        <h3 id="accounts-title">Account</h3>
-      </div>
-
-      {#if launcher.signInBusy}
-        <span class="badge loading"><span aria-hidden="true"></span
-          >{launcher.signInProgress ? launcher.signInProgress.phase : "Waiting for Microsoft"}</span
-        >
-      {:else if launcher.accountsState && launcher.accountsState.accounts.length > 0}
-        <span class="badge ready"><span aria-hidden="true"></span>Signed in</span>
-      {:else if launcher.accountsError}
-        <span class="badge error"><span aria-hidden="true"></span>Unavailable</span>
-      {:else}
-        <span class="badge loading"><span aria-hidden="true"></span>Not signed in</span>
-      {/if}
-    </div>
-
-    {#if launcher.accountsError}
-      <div class="error-message" role="alert">
-        <p>{launcher.accountsError.message}</p>
-        <code>{launcher.accountsError.code}</code>
-      </div>
-    {/if}
-
-    {#if launcher.signInBusy}
-      <dl>
+  {#if launcher.accountsError}
+    <section class="group" aria-live="polite">
+      <div class="group-heading">
         <div>
-          <dt>Sign-in</dt>
-          <dd>
-            Complete the Microsoft sign-in in your browser, then return here.
-            {#if launcher.signInProgress}Current step: {launcher.signInProgress.phase}{/if}
-          </dd>
+          <h3 class="group-title">Accounts could not be loaded</h3>
+          <p class="group-subtitle">The persisted account list could not be read.</p>
         </div>
-      </dl>
-      <form class="acquire-form" onsubmit={(event) => launcher.runCancelSignIn(event)}>
-        <button type="submit">Cancel sign-in</button>
-      </form>
-    {:else}
-      <form class="acquire-form" onsubmit={(event) => launcher.runSignIn(event)}>
-        <button type="submit" disabled={launcher.accountsState === null}>
-          {launcher.accountsState && launcher.accountsState.accounts.length > 0
-            ? "Add another account"
-            : "Sign in with Microsoft"}
-        </button>
-      </form>
-    {/if}
-
-    {#if launcher.signInError}
-      <div class="error-message" role="alert">
-        <p>{launcher.signInError.message}</p>
-        <code>{launcher.signInError.code}</code>
       </div>
-    {/if}
+      <p class="inline-message inline-message-error group-row" role="alert">
+        {launcher.accountsError.message}
+      </p>
+    </section>
+  {/if}
 
-    {#if launcher.accountError}
-      <div class="error-message" role="alert">
-        <p>{launcher.accountError.message}</p>
-        <code>{launcher.accountError.code}</code>
+  {#if launcher.signInBusy}
+    <section class="group" aria-live="polite">
+      <div class="group-heading">
+        <div>
+          <h3 class="group-title">Signing in with Microsoft</h3>
+          <p class="group-subtitle">
+            {launcher.signInProgress
+              ? authPhaseLabel(launcher.signInProgress.phase)
+              : "Opening the Microsoft sign-in in your browser…"}
+          </p>
+        </div>
+        <span class="status-badge status-working">In progress</span>
       </div>
-    {/if}
+      <div class="group-row group-row-loading">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="group-row-detail">
+          Finish the sign-in in your browser, then return here. The sign-in happens entirely in
+          your browser — Aurora never asks for your password.
+        </span>
+      </div>
+      <div class="group-row">
+        <span class="group-row-detail">You can cancel if you changed your mind.</span>
+        <div class="group-row-actions">
+          <button type="button" class="btn" onclick={() => launcher.runCancelSignIn()}>
+            Cancel sign-in
+          </button>
+        </div>
+      </div>
+      {#if launcher.signInError}
+        <p class="inline-message inline-message-error group-row" role="alert">
+          {authErrorMessage(launcher.signInError)}
+        </p>
+      {/if}
+    </section>
+  {:else if launcher.accountsState === null && !launcher.accountsError}
+    <section class="group" aria-live="polite">
+      <div class="group-row group-row-loading">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="group-row-detail">Loading accounts…</span>
+      </div>
+    </section>
+  {:else if !signedIn}
+    <section class="empty-state" aria-live="polite">
+      <h3 class="empty-title">No account signed in</h3>
+      <p class="empty-detail">
+        Sign in with your Microsoft account to launch Minecraft. Aurora opens the sign-in in your
+        system browser and only stores the refresh credential, in the operating system's credential
+        store.
+      </p>
+      <button
+        type="button"
+        class="btn btn-primary"
+        onclick={() => launcher.runSignIn()}
+        disabled={launcher.accountsState === null}
+      >
+        Sign in with Microsoft
+      </button>
+      {#if launcher.signInError}
+        <p class="inline-message inline-message-error" role="alert">
+          {authErrorMessage(launcher.signInError)}
+        </p>
+      {/if}
+      {#if launcher.accountError}
+        <p class="inline-message inline-message-error" role="alert">
+          {authErrorMessage(launcher.accountError)}
+        </p>
+      {/if}
+    </section>
+  {:else}
+    <section class="group" aria-live="polite">
+      <div class="group-heading">
+        <div>
+          <h3 class="group-title">Your accounts</h3>
+          <p class="group-subtitle">The selected account is the one Play launches with.</p>
+        </div>
+      </div>
 
-    {#if launcher.accountsState && launcher.accountsState.accounts.length === 0 && !launcher.signInBusy}
-      <p class="footnote">Not signed in.</p>
-    {/if}
-
-    {#if launcher.accountsState}
-      {#each launcher.accountsState.accounts as account (account.accountId)}
-      <div class="instance-row">
-        <div class="instance-main">
-          <div class="instance-title">
-            <strong>{account.minecraftName}</strong>
-            {#if launcher.accountsState.selectedAccountId === account.accountId}
-              <span class="badge ready"><span aria-hidden="true"></span>Selected</span>
-            {/if}
+      {#each accounts as account (account.accountId)}
+        {@const selected = launcher.accountsState?.selectedAccountId === account.accountId}
+        {@const busy = launcher.accountBusy === account.accountId}
+        <div class="group-row" class:group-row-selected={selected}>
+          <div class="group-row-main">
+            <span class="account-name-line">
+              <span class="group-row-title">{account.minecraftName}</span>
+              {#if selected}<span class="row-marker">Selected</span>{/if}
+            </span>
             {#if account.status === "reauthenticationRequired"}
-              <span class="badge error"><span aria-hidden="true"></span>Sign-in required</span>
-            {:else}
-              <span class="badge ready"><span aria-hidden="true"></span>Signed in</span>
+              <span class="group-row-detail">
+                This account's stored credential is no longer valid — sign in again to use it.
+              </span>
+            {:else if sessionVerified(account.accountId)}
+              <span class="group-row-detail">Session verified — ready to launch.</span>
             {/if}
           </div>
-          {#if launcher.accountSessions[account.accountId]}
-            <div class="instance-meta validation-line">
-              Session: ready
-            </div>
-          {/if}
-        </div>
-
-        <div class="instance-actions">
-          {#if launcher.accountsState.selectedAccountId !== account.accountId}
+          <div class="group-row-actions">
+            {#if account.status === "reauthenticationRequired"}
+              <span class="status-badge status-warning">Sign-in required</span>
+            {/if}
+            {#if !selected}
+              <button
+                type="button"
+                class="btn"
+                onclick={() => launcher.runSelectAccount(account.accountId)}
+                disabled={busy || launcher.signInBusy}
+              >
+                Select
+              </button>
+            {/if}
             <button
               type="button"
-              onclick={() => launcher.runSelectAccount(account.accountId)}
-              disabled={launcher.accountBusy === account.accountId || launcher.signInBusy}
+              class="btn"
+              onclick={() => launcher.runRefreshAccountSession(account.accountId)}
+              disabled={busy || launcher.signInBusy}
             >
-              Select
+              {busy ? "Checking…" : "Check session"}
             </button>
-          {/if}
-          <button
-            type="button"
-            onclick={() => launcher.runRefreshAccountSession(account.accountId)}
-            disabled={launcher.accountBusy === account.accountId || launcher.signInBusy}
-          >
-            Check session
-          </button>
-          <button
-            type="button"
-            onclick={() => launcher.runRemoveAccount(account.accountId)}
-            disabled={launcher.accountBusy === account.accountId || launcher.signInBusy}
-          >
-            Remove account
-          </button>
+            <button
+              type="button"
+              class="btn btn-danger"
+              onclick={() => launcher.runRemoveAccount(account.accountId)}
+              disabled={busy || launcher.signInBusy}
+            >
+              Remove
+            </button>
+          </div>
         </div>
-      </div>
       {/each}
-    {/if}
 
-    <p class="footnote">
-      Sign-in uses your system browser, and only the Microsoft refresh credential is stored —
-      in the operating system's credential store, never in plain files. Accounts are separate
-      from instances and the selected account is supplied to Play without exposing its token.
-    </p>
-  </section>
+      {#if launcher.signInError}
+        <p class="inline-message inline-message-error group-row" role="alert">
+          {authErrorMessage(launcher.signInError)}
+        </p>
+      {/if}
+      {#if launcher.accountError}
+        <p class="inline-message inline-message-error group-row" role="alert">
+          {authErrorMessage(launcher.accountError)}
+        </p>
+      {/if}
+
+      <p class="group-footer">
+        Sign-in uses your system browser. Aurora stores only the Microsoft refresh credential, in
+        the operating system's credential store — never in plain files — and removing an account
+        here only removes it from Aurora.
+      </p>
+    </section>
+  {/if}
 </div>
 
 <style>
-  .status-card {
-    overflow: hidden;
-    border: 1px solid #252b3f;
-    border-radius: 16px;
-    background: rgba(18, 22, 35, 0.84);
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.24);
-  }
-
-  .status-heading {
+  .account-name-line {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 1.4rem 1.5rem;
-    border-bottom: 1px solid #252b3f;
-  }
-
-  .eyebrow {
-    margin: 0 0 0.45rem;
-    color: #a99dff;
-    font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-  }
-
-  h3 {
-    margin: 0;
-    font-size: 1.25rem;
-    letter-spacing: -0.02em;
-  }
-
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.42rem 0.7rem;
-    border-radius: 999px;
-    font-size: 0.8rem;
-    font-weight: 700;
-  }
-
-  .badge span {
-    width: 0.46rem;
-    height: 0.46rem;
-    border-radius: 50%;
-    background: currentColor;
-  }
-
-  .ready {
-    color: #78e6ba;
-    background: rgba(50, 172, 125, 0.12);
-  }
-
-  .error {
-    color: #ff9a9a;
-    background: rgba(201, 68, 68, 0.13);
-  }
-
-  .loading {
-    color: #b8c0d3;
-    background: rgba(132, 143, 168, 0.11);
-  }
-
-  dl {
-    margin: 0;
-  }
-
-  dl div {
-    display: grid;
-    grid-template-columns: minmax(9rem, 0.55fr) minmax(0, 1fr);
-    gap: 1.5rem;
-    padding: 1rem 1.5rem;
-    border-bottom: 1px solid #20263a;
-  }
-
-  dt {
-    color: #818ca4;
-    font-size: 0.86rem;
-  }
-
-  dd {
+    align-items: baseline;
+    gap: var(--space-2);
     min-width: 0;
-    margin: 0;
-    color: #e7ecf7;
-    font-size: 0.9rem;
-    font-weight: 600;
-    overflow-wrap: anywhere;
-  }
-
-  .footnote,
-  .error-message {
-    margin: 0;
-    padding: 1rem 1.5rem;
-    color: #818ca4;
-    font-size: 0.82rem;
-  }
-
-  .acquire-form {
-    display: grid;
-    gap: 0.9rem;
-    padding: 1.25rem 1.5rem 0.5rem;
-  }
-
-  .acquire-form button {
-    justify-self: start;
-    padding: 0.55rem 1.1rem;
-    border: none;
-    border-radius: 8px;
-    background: #6f5df2;
-    color: #ffffff;
-    font: inherit;
-    font-size: 0.88rem;
-    font-weight: 700;
-    cursor: pointer;
-  }
-
-  .acquire-form button:disabled {
-    opacity: 0.6;
-    cursor: progress;
-  }
-
-  .instance-row {
-    display: flex;
     flex-wrap: wrap;
-    justify-content: space-between;
-    gap: 1rem;
-    padding: 1rem 1.5rem;
-    border-bottom: 1px solid #20263a;
-  }
-
-  .instance-main {
-    min-width: 0;
-    flex: 1 1 18rem;
-  }
-
-  .instance-title {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    flex-wrap: wrap;
-  }
-
-  .instance-meta {
-    margin-top: 0.35rem;
-    color: #818ca4;
-    font-size: 0.84rem;
-    overflow-wrap: anywhere;
-  }
-
-  .instance-actions {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-
-  .instance-actions button {
-    padding: 0.4rem 0.85rem;
-    border: 1px solid #2a3149;
-    border-radius: 8px;
-    background: #1a2032;
-    color: #e7ecf7;
-    font: inherit;
-    font-size: 0.82rem;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .instance-actions button:hover:not(:disabled) {
-    border-color: #6f5df2;
-  }
-
-  .instance-actions button:disabled {
-    opacity: 0.55;
-    cursor: progress;
-  }
-
-  .error-message code {
-    display: inline-block;
-    margin-top: 0.7rem;
-    color: #ff9a9a;
   }
 </style>

@@ -1418,9 +1418,10 @@ pub fn get_accounts(app: AppHandle) -> Result<AccountsStateDto, CommandError> {
 /// authentication chain. The command stays in flight (bounded by the login
 /// timeout) while the user signs in; `cancel_microsoft_login` aborts it.
 ///
-/// Requires Aurora's real Microsoft application registration
-/// (`AURORA_MICROSOFT_CLIENT_ID` at build time); without it the command
-/// fails deliberately instead of pretending.
+/// Requires Aurora's real Microsoft application registration (the committed
+/// public client ID, optionally overridden through the
+/// `AURORA_MICROSOFT_CLIENT_ID` build-environment variable); without it the
+/// command fails deliberately instead of pretending.
 #[tauri::command]
 pub async fn begin_microsoft_login(app: AppHandle) -> Result<AccountSummaryDto, CommandError> {
     let managed = managed_paths(&app)?;

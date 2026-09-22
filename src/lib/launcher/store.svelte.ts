@@ -282,8 +282,7 @@ class LauncherStore {
     }
   }
 
-  async runCreateInstance(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runCreateInstance(): Promise<void> {
     this.createBusy = true;
     this.createProgress = null;
     this.createError = null;
@@ -320,8 +319,7 @@ class LauncherStore {
     }
   }
 
-  async runRename(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runRename(): Promise<void> {
     if (!this.renaming) return;
     this.instanceBusy = this.renaming.id;
     this.instanceError = null;
@@ -401,8 +399,7 @@ class LauncherStore {
     }
   }
 
-  async runSignIn(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runSignIn(): Promise<void> {
     this.signInBusy = true;
     this.signInProgress = null;
     this.signInError = null;
@@ -418,8 +415,7 @@ class LauncherStore {
     }
   }
 
-  async runCancelSignIn(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runCancelSignIn(): Promise<void> {
     try {
       await cancelMicrosoftLogin();
     } catch {
@@ -468,8 +464,7 @@ class LauncherStore {
     }
   }
 
-  async runAcquisition(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runAcquisition(): Promise<void> {
     this.acquisitionBusy = true;
     this.acquisition = null;
     this.acquisitionError = null;
@@ -488,8 +483,7 @@ class LauncherStore {
     }
   }
 
-  async runPlanning(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runPlanning(): Promise<void> {
     this.planningBusy = true;
     this.planSummary = null;
     this.planningError = null;
@@ -503,8 +497,7 @@ class LauncherStore {
     }
   }
 
-  async runFabricPlanning(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runFabricPlanning(): Promise<void> {
     this.fabricPlanningBusy = true;
     this.fabricPlanSummary = null;
     this.fabricPlanningError = null;
@@ -521,8 +514,7 @@ class LauncherStore {
     }
   }
 
-  async runInstall(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runInstall(): Promise<void> {
     this.installBusy = true;
     this.installProgress = null;
     this.installSummary = null;
@@ -543,8 +535,7 @@ class LauncherStore {
     }
   }
 
-  async runValidation(event: SubmitEvent): Promise<void> {
-    event.preventDefault();
+  async runValidation(): Promise<void> {
     this.validationBusy = true;
     this.validation = null;
     this.validationError = null;

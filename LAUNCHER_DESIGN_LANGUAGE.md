@@ -264,7 +264,10 @@ Every reusable interactive component defines all applicable states:
 - **disabled** — reduced opacity (~50%), `cursor: progress` for in-flight operations,
   no hover effects;
 - **selected** (navigation, instances, accounts) — filled selected background,
-  full-strength text, accent edge marker where the component type warrants it.
+  full-strength text, accent edge marker where the component type warrants it;
+- **destructive** (remove/sign-out) — visually secondary and unmistakably not the
+  primary action: a quiet outline button with error-tinted text, never accent-filled
+  and never the largest control on the screen.
 
 ## L. Status semantics
 

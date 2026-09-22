@@ -43,7 +43,14 @@
 
     <div class="sidebar-spacer"></div>
 
-    <button type="button" class="account-chip" onclick={() => onNavigate("accounts")}>
+    <button
+      type="button"
+      class="account-chip"
+      onclick={() => onNavigate("accounts")}
+      aria-label={account
+        ? `Accounts — signed in as ${account.minecraftName}`
+        : "Accounts — not signed in"}
+    >
       {#if account}
         <span
           class="status-dot"
@@ -51,7 +58,9 @@
           class:status-warning={account.status === "reauthenticationRequired"}
           aria-hidden="true"
         ></span>
-        <span class="account-chip-name">{account.minecraftName}</span>
+        <span class="account-chip-name" title={account.minecraftName}>
+          {account.minecraftName}
+        </span>
       {:else}
         <span class="status-dot status-muted" aria-hidden="true"></span>
         <span class="account-chip-name">Not signed in</span>

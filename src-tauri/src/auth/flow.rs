@@ -105,18 +105,37 @@ pub struct AuthContext<'a> {
     pub browser: &'a (dyn Fn(&str) -> Result<(), BrowserOpenError> + Send + Sync),
 }
 
-/// Aurora's production Microsoft application registration, if the build was
-/// given one.
+/// Aurora's approved Microsoft application registration (public client ID).
 ///
-/// A client ID is public configuration supplied by the release process via
-/// the `AURORA_MICROSOFT_CLIENT_ID` build-environment variable. No
-/// registration exists yet, so production sign-in fails deliberately with
-/// `auth_configuration_missing` rather than borrowing or inventing an ID.
-/// The registration must also be approved for Minecraft Services (Microsoft
-/// requires new applications to request access) before live sign-in can
-/// succeed end to end.
+/// This is public application configuration, not a secret: Aurora is a
+/// desktop public client — authorization code + PKCE, and no client secret
+/// exists anywhere — and Microsoft designs the application (client) ID of a
+/// public client to be distributed with the application. The ID is committed
+/// so ordinary development and official builds carry the approved
+/// registration without any manual environment setup. A fork that wants no
+/// registration blanks this constant; sign-in then fails deliberately with
+/// `auth_configuration_missing` instead of borrowing or inventing an ID.
+const AURORA_MICROSOFT_APPLICATION_ID: &str = "c841fb52-a82b-49bd-be84-0e2f56239757";
+
+/// Aurora's production Microsoft application registration, if the build
+/// resolved one.
+///
+/// The client ID normally comes from the checked-in constant above; the
+/// optional `AURORA_MICROSOFT_CLIENT_ID` build-environment variable
+/// overrides it for fork/CI builds that want a different registration. An
+/// empty resolved value means no registration. The registration must also be
+/// approved for Minecraft Services (Microsoft requires new applications to
+/// request access) before live sign-in can succeed end to end.
 pub fn production_registration() -> Option<OAuthClientConfig> {
-    option_env!("AURORA_MICROSOFT_CLIENT_ID").map(OAuthClientConfig::new)
+    let client_id = option_env!("AURORA_MICROSOFT_CLIENT_ID")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(AURORA_MICROSOFT_APPLICATION_ID);
+    if client_id.is_empty() {
+        None
+    } else {
+        Some(OAuthClientConfig::new(client_id))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,11 +1581,12 @@ mod tests {
 
     #[test]
     fn the_production_registration_is_never_invented() {
-        // When the release process provides no registration the value is
-        // absent; when it does, it must be the real configuration, non-empty.
+        // The registration is either absent (a fork build with no committed
+        // registration and no override) or the real committed configuration:
+        // a non-empty GUID-shaped client ID, never a guessed or borrowed one.
         match production_registration() {
             None => {}
-            Some(config) => assert!(!config.client_id().is_empty()),
+            Some(config) => assert!(uuid::Uuid::parse_str(config.client_id()).is_ok()),
         }
     }
 }
