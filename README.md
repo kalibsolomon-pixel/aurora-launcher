@@ -2,6 +2,10 @@
 
 Aurora Launcher is a standalone launcher for the Aurora client mod for Minecraft: Java Edition. It is designed around isolated installations, transparent behavior, low background overhead, and user control.
 
+This repository is the canonical public repository for Aurora Launcher. It contains the launcher implementation (Tauri, Rust, and Svelte) and serves as the public release location. The Aurora client mod itself is developed as a separate project.
+
+Aurora Launcher does **not** provide Minecraft accounts, bypass Minecraft ownership requirements, or distribute authentication credentials. Playing requires the user's own Microsoft account and a legitimate Minecraft: Java Edition entitlement.
+
 ## Development status
 
 This repository contains the launcher foundation through Phase 9: Tauri/Svelte desktop boundaries and versioned state; verified SHA-256, official SHA-1, and transport-observed artifact stores; official Minecraft and Fabric planning; safe staged game installation; persistent isolated Aurora instances; launcher-managed Java runtime provisioning; Microsoft → Xbox → Minecraft authentication; and native launch assembly/process supervision. Signing in uses the system browser with public-client OAuth (authorization code + PKCE), verifies Minecraft ownership and profile, stores only the Microsoft refresh credential in the operating system's credential store (the real Windows Credential Manager; Linux/macOS persistence is not implemented yet and fails deliberately), and restores Rust-only sessions with refresh-token rotation.
@@ -11,6 +15,12 @@ This repository contains the launcher foundation through Phase 9: Tauri/Svelte d
 Aurora releases still come from a checked-in development fixture because no production release infrastructure exists.
 
 Instances can be created, selected, renamed, retried, and completely validated. The selected content-ready instance can install, validate, and reuse its official managed Java runtime. Rust owns Play readiness, exact classpath/native/logging/asset argument assembly, token redaction, structured process spawning, and exit supervision. Custom/system Java selection, instance deletion, Aurora updates, and real Aurora release distribution are **not implemented**.
+
+## Authentication and privacy
+
+Aurora Launcher signs players in through the Microsoft OAuth 2.0 authorization-code flow with PKCE in the user's system browser and never collects or stores Microsoft account passwords. After Microsoft sign-in it follows the standard Xbox Live, XSTS, and Minecraft Services flow required of third-party Minecraft: Java Edition launchers: it verifies Minecraft: Java Edition ownership, retrieves the authenticated player's Minecraft profile, and obtains the Minecraft access token required to launch the game. Authorization requests Xbox Live sign-in and offline access so a returning user can restore their session without repeating sign-in. The only persisted credential is the Microsoft refresh credential, held in operating-system secure credential storage, never in plaintext launcher configuration.
+
+The launcher is designed around local operation and minimal data collection. It does not require an Aurora account and does not include unnecessary analytics or telemetry. Microsoft/Xbox/Minecraft credentials are used only for authentication and game-launch functionality. Downloaded game and client artifacts are integrity-checked before activation, and Minecraft instances are kept isolated from the user's default `.minecraft` installation.
 
 ## Prerequisites
 
@@ -58,3 +68,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for implemented boundaries and future direction. Contributions are licensed under the [MIT License](LICENSE).
+
+## Disclaimer
+
+Aurora Launcher and Aurora are independent projects and are not affiliated with, endorsed by, or sponsored by Microsoft, Mojang Studios, or Fabric.
+
+Minecraft is a trademark of Microsoft Corporation.
