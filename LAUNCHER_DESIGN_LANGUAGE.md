@@ -19,10 +19,16 @@ invent a new visual language. It synthesizes three inputs:
    section labels are quiet; metadata is secondary text. No giant hero headings —
    this is a tool, not a landing page.
 3. **Grouping over scattering.** Related information lives in one grouped surface with
-   hairline-separated rows, not a wall of independent cards.
-4. **Contextual explanation, not constant clutter.** An explanation appears where it
-   is needed (a row subtitle only when the state is not visible at a glance, a group
-   footer only when the group needs one). Restraint is a rule, not an afterthought.
+   hairline-separated rows, not a wall of independent cards. A major surface is a
+   quiet elevation step above the canvas — its silhouette comes from fill and
+   shadow, never from a thick or dominant outline — and controls inside a group
+   stay flat: no card-on-card nesting.
+4. **Contextual explanation, contextual action.** An explanation appears where it
+   is needed (a row subtitle only when the state is not visible at a glance, a
+   group footer only when the group needs one). A maintenance or diagnostic
+   action likewise appears only when the current state makes it the relevant next
+   step — a missing Java runtime offers *Install*, a healthy one offers nothing —
+   never as a permanent utility. Restraint is a rule, not an afterthought.
 5. **Consistency.** Spacing, radii, type roles, status colors, and interaction states
    come from the tokens in this document. New screens use tokens; they do not add
    one-off values.
@@ -93,8 +99,10 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
 └──────────┴──────────────────────────────────────┘
 ```
 
-- **Shell**: one persistent left sidebar (fixed width, its own visual treatment) and
-  one content region (the page). The shell never scrolls; only page content scrolls.
+- **Shell**: one persistent left sidebar (fixed width, ≈204 px — compact enough that
+  the content region keeps visual priority, wide enough that the wordmark, full nav
+  labels, selected/focus states, and account identity never feel cramped) and one
+  content region (the page). The shell never scrolls; only page content scrolls.
 - **Navigation** reflects *actual current capabilities only*: Home, Instances,
   Accounts, About (real backend state), plus a Developer page in development builds.
   Future destinations (Library, Settings) are documented in this file, not built.
@@ -144,6 +152,19 @@ all-caps except the single small brand label where needed:
 Line height ~1.5 for body text. Version strings and identifiers use the metadata role
 in running text (not pills).
 
+Two hard rules learned from the pilot review:
+
+- **No decorative uppercase "eyebrow" headings.** A small violet uppercase category
+  label stacked above a title (`PERSISTENT INSTANCES` over *Instances*) reads as a
+  themed web dashboard and an AI-generated aesthetic. Hierarchy is page title →
+  section title → body/metadata — never decorative-category → big-title → subtitle →
+  card-title stacks. The single tolerated all-caps exception is the small brand
+  label where genuinely needed.
+- **Opaque technical identifiers stay out of primary product UI.** UUIDs, internal
+  instance/account ids, digests, hashes, and cache paths belong in details,
+  advanced, or developer contexts, and only when the user's immediate task needs
+  them. Primary surfaces show names, versions, and states.
+
 ## G. Color / surface hierarchy
 
 Semantic roles only (defined once as CSS custom properties in `src/app.css`); tokens
@@ -151,10 +172,13 @@ are the contract, components never hard-code hex values:
 
 | Role | Token family | Value (dark theme) |
 | --- | --- | --- |
-| Application background | `--color-background` | deep ink `#0b0e16`→`#111524` with a very faint aurora wash |
-| Primary surface (groups) | `--color-surface` | `#12172a` panel |
-| Elevated/interactive surface | `--color-surface-raised` | one step above surface |
-| Border/divider | `--color-border`, `--color-border-strong` | hairlines `#242c42` / `#323d5a` |
+| Application background (content canvas) | `--color-background` | neutral dark ink `#101116` |
+| Sidebar | `--color-sidebar` | near-black `#0a0b0e` |
+| Primary surface (groups) | `--color-surface` | `#16171d` — one quiet step above the canvas |
+| Elevated/interactive surface | `--color-surface-raised` | `#1d1f27` |
+| Sunken surface (inputs) | `--color-surface-sunken` | `#0d0e13` |
+| Border/divider | `--color-border`, `--color-border-strong` | hairlines `#24262f` / `#343743` |
+| Surface edge (elevation outline) | `--color-surface-edge` | barely-visible `rgba(255,255,255,0.05)` |
 | Primary text | `--color-text` | `#edf1fb` |
 | Secondary text | `--color-text-secondary` | `#a7b0c5` |
 | Muted text | `--color-text-muted` | `#76819a` |
@@ -164,8 +188,19 @@ are the contract, components never hard-code hex values:
 | Error / failed | `--color-error` | rose `#ff9a9a` |
 | Working / in progress | `--color-working` | secondary accent `#8fb7ff` |
 
-Status colors appear as tinted dot + label text on a faint tinted background — never
-as large filled regions. Only status uses badges; metadata never does.
+Rules from the pilot review, binding for every future screen:
+
+- **The canvas and the surface stack are neutral.** A restrained near-black gray
+  family — not blue, not violet, not a gradient wash. The sidebar and the content
+  canvas distinguish themselves through a subtle depth step (near-black sidebar,
+  slightly lighter canvas and groups), never through different hues. Not pure
+  black either: layering must remain legible.
+- **The accent is rare, and therefore valuable.** Aurora violet communicates
+  selection, keyboard focus, primary actions, progress, and identity accents. It
+  is never the dominant page background, never a canvas wash, never a decorative
+  gradient. If a screen reads as purple, it is wrong.
+- Status colors appear as tinted dot + label text on a faint tinted background — never
+  as large filled regions. Only status uses badges; metadata never does.
 
 ## H. Depth / glass
 
@@ -175,13 +210,20 @@ Preferred depth chain (at most one translucent layer deep):
 background → major surface → interactive surface → focus/accent
 ```
 
-- The application background may carry a single, very faint aurora wash.
-- Major surfaces (sidebar, grouped panels) are near-opaque panels with hairline
-  borders and at most one soft, low-alpha shadow.
+- The application background is flat, neutral ink. It carries no aurora wash — a
+  violet-tinted canvas was reviewed and rejected; ambient color belongs to the
+  icon and the accent, not to the room the UI sits in.
+- Major surfaces (sidebar, grouped panels) are quiet elevation steps above the
+  canvas: an opaque fill one step lighter, one soft low-alpha shadow, and at most
+  a barely-visible edge (`--color-surface-edge`). A border must never dominate a
+  major surface's silhouette — if the outline is what makes a panel read as a
+  panel, the design has failed. Avoid the web-dashboard pattern of
+  page → giant outlined card → section → nested controls.
 - Interactive surfaces (buttons, rows, nav items) are flat fills; **no nested
-  translucency**: never glass panels containing glass cards containing glass buttons
-  (the mod's glass-budget principle: chrome may be glass; small elements inside stay
-  flat).
+  translucency and no card-on-card elevation**: never glass panels containing
+  glass cards containing glass buttons, and never an outlined card inside an
+  outlined card (the mod's glass-budget principle: chrome may be glass; small
+  elements inside stay flat).
 - Focus is expressed by the accent (outline/ring), not by adding shadow layers.
 
 ## I. Shape language
@@ -247,9 +289,13 @@ These are intentional product states, not raw backend text:
 
 - **Loading**: a small spinner plus one plain sentence ("Requesting status from the
   native launcher core…") in a reserved area — no layout jump.
-- **Empty**: state the situation in one sentence and offer the single next action
-  ("No instances yet — create one in Instances", with a navigation action). Empty
-  states are honest, never illustrated mascots or filler cards.
+- **Empty**: state the situation **once**, in one sentence, and offer the single
+  next action as a primary button that navigates to where the work happens
+  (Home with no instances: "No instances yet" / "Create an isolated Minecraft
+  installation to get started." / **Create instance** → Instances). The same
+  condition is never repeated as a second status line beneath the explanation,
+  the state is never boxed in a card, and the launcher never performs the action
+  automatically. Empty states are honest, never illustrated mascots or filler.
 - **Error**: the backend's user-readable message plus its structured code in subdued
   monospace; errors are `role="alert"` and live in the group where the action
   happened. Malformed persisted state is reported, never hidden or auto-repaired.
@@ -258,7 +304,7 @@ These are intentional product states, not raw backend text:
 
 - Intended normal window: the Tauri default **920×640**; design target for Home.
 - Minimum supported: **720×520** (the configured window minimum). Everything remains
-  usable: sidebar keeps its width (content ≥ ~480 px), groups collapse to a single
+  usable: sidebar keeps its width (content ≥ ~516 px), groups collapse to a single
   column, the page header wraps the primary action below the title when needed.
 - Only the content region scrolls — vertically, with the standard overlay scrollbar;
   the sidebar and page title area stay put. **No horizontal scrolling at any
@@ -272,14 +318,23 @@ These are intentional product states, not raw backend text:
 - The canonical Aurora icon is `static/aurora-icon.png` — a byte-for-byte copy of the
   developer-created artwork (`Aurora Icon.png`, 3162×3162 PNG, monochrome white
   flame-in-ring mark on full transparency, SHA-256
-  `faba1af24b964cfd085505c63e9e43d7abedebd70794e841a3251d0fa5a19`).
+  `faba1af24b964cfd085505c63e9e43d7abedebd70d70794e841a3251d0fa5a19`).
 - It must not be regenerated, redrawn, recolored, cropped, given a background, or
   otherwise visually modified without explicit developer direction. It renders
   directly on dark surfaces (its transparency is part of the design).
 - The application shell uses it at small brand sizes (sidebar) at 1:1 geometry —
-  scaled only, never restyled. Derivative window/taskbar icon sizes
-  (`src-tauri/icons/`) remain the existing tracked assets until the developer
-  decides how the monochrome mark should be adapted for platform packaging.
+  scaled only, never restyled.
+- **The canonical icon is the product mark.** All platform packaging derivatives
+  (`src-tauri/icons/` — the window/taskbar `.ico`, `.icns`, and PNG sizes) and the
+  SPA favicon (`static/favicon.png`) are *mechanical* derivatives of the canonical
+  artwork: exact geometry, scaled only (currently generated with
+  `tauri icon static/aurora-icon.png`). Regenerating them must remain a mechanical
+  transform — never a redraw, recolor, or reinterpretation.
+- **Known, deliberate trade-off**: the monochrome white mark is
+  transparent-background by design, so on light OS surfaces (light title bars,
+  light taskbars) its visibility is imperfect. Do not "fix" this by recoloring the
+  mark, adding a background to the canonical source, or inventing a new logo
+  treatment; the resolution is an explicit developer decision that remains open.
 - Identity is otherwise typographic: the "Aurora" wordmark, hierarchy, and the
   restrained accent — not aurora gradients across the UI.
 

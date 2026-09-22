@@ -202,35 +202,25 @@
       </div>
     </section>
   {:else if !instance}
-    <section class="group">
-      <div class="group-heading">
-        <div>
-          <h3 class="group-title">
-            {launcher.launcherState.instances.length === 0 ? "No instances yet" : "No instance selected"}
-          </h3>
-          <p class="group-subtitle">
-            {launcher.launcherState.instances.length === 0
-              ? "Aurora launches from isolated instances. Create your first one to get started."
-              : "Choose an instance to launch from."}
-          </p>
-        </div>
-      </div>
-      <div class="group-row">
-        <div class="group-row-main">
-          <span class="group-row-title">Instances</span>
-          <span class="group-row-detail">
-            {launcher.launcherState.instances.length === 0
-              ? "No instances exist yet."
-              : `${launcher.launcherState.instances.length} instance${launcher.launcherState.instances.length === 1 ? "" : "s"} available.`}
-          </span>
-        </div>
-        <div class="group-row-actions">
-          <button type="button" class="btn" onclick={() => onNavigate("instances")}>
-            Go to Instances
-          </button>
-        </div>
-      </div>
-    </section>
+    {#if launcher.launcherState.instances.length === 0}
+      <section class="empty-state" aria-live="polite">
+        <h3 class="empty-title">No instances yet</h3>
+        <p class="empty-detail">
+          Create an isolated Minecraft installation to get started.
+        </p>
+        <button type="button" class="btn btn-primary" onclick={() => onNavigate("instances")}>
+          Create instance
+        </button>
+      </section>
+    {:else}
+      <section class="empty-state" aria-live="polite">
+        <h3 class="empty-title">No instance selected</h3>
+        <p class="empty-detail">Choose an instance to launch from.</p>
+        <button type="button" class="btn btn-primary" onclick={() => onNavigate("instances")}>
+          Go to Instances
+        </button>
+      </section>
+    {/if}
   {:else}
     <section class="group" aria-live="polite">
       <div class="group-heading">
@@ -284,24 +274,14 @@
         </div>
         <div class="group-row-actions">
           <span class="status-badge {javaStatus.tone}">{javaStatus.label}</span>
-          {#if instance.state === "ready" && !launcher.runtimeBusy}
-            {#if runtimeForInstance && runtimeForInstance.status !== "ready"}
-              <button
-                type="button"
-                class="btn"
-                onclick={() => launcher.runEnsureRuntime(instance.id)}
-              >
-                {runtimeForInstance.status === "damaged" ? "Repair Java" : "Install Java"}
-              </button>
-            {:else}
-              <button
-                type="button"
-                class="btn btn-quiet"
-                onclick={() => launcher.runRuntimeStatus(instance.id)}
-              >
-                Check Java
-              </button>
-            {/if}
+          {#if instance.state === "ready" && !launcher.runtimeBusy && runtimeForInstance && runtimeForInstance.status !== "ready"}
+            <button
+              type="button"
+              class="btn"
+              onclick={() => launcher.runEnsureRuntime(instance.id)}
+            >
+              {runtimeForInstance.status === "damaged" ? "Repair Java" : "Install Java"}
+            </button>
           {/if}
         </div>
       </div>

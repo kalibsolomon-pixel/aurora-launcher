@@ -98,7 +98,6 @@
               <span class="badge ready"><span aria-hidden="true"></span>Signed in</span>
             {/if}
           </div>
-          <div class="instance-meta instance-id">id: {account.accountId}</div>
           {#if launcher.accountSessions[account.accountId]}
             <div class="instance-meta validation-line">
               Session: ready
@@ -292,10 +291,6 @@
     color: #818ca4;
     font-size: 0.84rem;
     overflow-wrap: anywhere;
-  }
-
-  .instance-meta.instance-id {
-    font-size: 0.76rem;
   }
 
   .instance-actions {
