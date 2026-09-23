@@ -1704,6 +1704,81 @@ pub async fn install_instance_configuration(
     Ok(InstanceSummary::from_record(&record))
 }
 
+/// Typed request for opening one instance's managed folder in the operating
+/// system's file browser.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenInstanceFolderRequest {
+    instance_id: String,
+}
+
+/// Resolves the managed root folder of one registered instance for opening
+/// in the operating system's file browser.
+///
+/// Pure registry/path logic with no side effects: the identifier must be a
+/// valid [`crate::instances::InstanceId`] that exists in the registry, and
+/// the folder is derived through [`ManagedPaths`] — a validated identifier
+/// inside the managed instances directory, never a frontend-supplied path.
+fn resolve_instance_folder(
+    managed: &ManagedPaths,
+    registry: &InstanceRegistry,
+    instance_id: &str,
+) -> Result<PathBuf, CommandError> {
+    let instance = crate::instances::InstanceId::new(instance_id.trim())?;
+    if registry.find(&instance).is_none() {
+        return Err(CommandError::new(
+            "instance_not_found",
+            format!("no instance '{instance}' exists in the launcher's registry"),
+        ));
+    }
+
+    let folder = managed.instance_paths(&instance).root().to_path_buf();
+    // Containment holds by construction; the check documents and defends it
+    // without trusting the construction site.
+    if !folder.starts_with(managed.instances_dir()) {
+        return Err(CommandError::new(
+            "instance_id_invalid",
+            "the derived instance folder escaped the managed instances directory",
+        ));
+    }
+    Ok(folder)
+}
+
+/// Opens one instance's managed root folder in the operating system's file
+/// browser.
+///
+/// The folder is always derived, never supplied: only an instance id that
+/// exists in the registry is accepted, the root is derived from validated
+/// managed paths, and the folder must exist before the OS opener receives it
+/// as structured data. There is no arbitrary-path surface and no shell
+/// command string anywhere in this path.
+#[tauri::command]
+pub fn open_instance_folder(
+    app: AppHandle,
+    request: OpenInstanceFolderRequest,
+) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+
+    let folder = resolve_instance_folder(&managed, &registry, &request.instance_id)?;
+    if !folder.is_dir() {
+        return Err(CommandError::new(
+            "instance_folder_missing",
+            format!(
+                "the managed folder for this instance does not exist yet: {}",
+                folder.display()
+            ),
+        ));
+    }
+
+    tauri_plugin_opener::open_path(&folder, None::<&str>).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("the instance folder could not be opened: {error}"),
+        )
+    })
+}
+
 /// One Minecraft version offered for instance configuration, from the
 /// official Mojang manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2655,6 +2730,49 @@ pub async fn play_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_folder_resolution_follows_the_registry_and_managed_paths() {
+        let root = std::env::temp_dir().join("AuroraLauncherFolderResolutionTest");
+        let managed = ManagedPaths::from_app_local_data_dir(root.clone()).unwrap();
+
+        let mut registry = InstanceRegistry::empty();
+        registry.instances_mut().push(
+            InstanceRecord::new(
+                crate::instances::InstanceId::new("aurora-folder-test").unwrap(),
+                "Folder Fixture",
+                crate::instances::InstanceState::Ready,
+                crate::instances::PinnedRelease::new(
+                    ReleaseChannel::Stable,
+                    "0.3.0",
+                    "26.2",
+                    "0.19.5",
+                )
+                .unwrap(),
+                crate::instances::settings::InstanceConfiguration::for_minecraft_version("26.2"),
+            )
+            .unwrap(),
+        );
+
+        let folder = resolve_instance_folder(&managed, &registry, " aurora-folder-test ").unwrap();
+        assert_eq!(folder, root.join("instances").join("aurora-folder-test"));
+        assert!(folder.starts_with(managed.instances_dir()));
+    }
+
+    #[test]
+    fn instance_folder_resolution_refuses_unknown_and_invalid_ids() {
+        let managed = ManagedPaths::from_app_local_data_dir(
+            std::env::temp_dir().join("AuroraLauncherFolderResolutionTestUnknown"),
+        )
+        .unwrap();
+        let registry = InstanceRegistry::empty();
+
+        let unknown = resolve_instance_folder(&managed, &registry, "aurora-missing").unwrap_err();
+        assert_eq!(unknown.code, "instance_not_found");
+
+        let invalid = resolve_instance_folder(&managed, &registry, "../escape").unwrap_err();
+        assert_eq!(invalid.code, "instance_id_invalid");
+    }
 
     #[test]
     fn launch_failures_map_to_stable_machine_codes() {

@@ -15,6 +15,7 @@ import {
   listAuroraReleases,
   listFabricLoaderVersions,
   listMinecraftVersions,
+  openInstanceFolder,
   planFabricInstall,
   planMinecraftInstall,
   playInstance,
@@ -96,15 +97,19 @@ class LauncherStore {
   instanceValidations = $state<Record<string, InstanceValidationDto>>({});
   instanceError = $state<LauncherBackendError | null>(null);
 
-  // Per-instance detail editing. The draft is a copy of the instance's
-  // desired configuration; Save sends the whole proposed configuration
-  // atomically.
-  detailId = $state<string | null>(null);
-  detailDraft = $state<InstanceConfiguration | null>(null);
-  detailDirty = $state(false);
-  detailBusy = $state(false);
+  // Per-instance configuration editing (the workspace Settings tab). Each
+  // draft is a copy of that instance's desired configuration; Save sends the
+  // whole proposed configuration atomically. Drafts live per instance id, so
+  // opening another instance or leaving the workspace never discards unsaved
+  // edits silently.
+  detailDrafts = $state<Record<string, InstanceConfiguration>>({});
+  detailBusy = $state<string | null>(null);
   detailError = $state<LauncherBackendError | null>(null);
-  detailInstallBusy = $state(false);
+  detailInstallBusy = $state<string | null>(null);
+
+  // Instance folder opening (the workspace header's contextual action).
+  folderBusy = $state<string | null>(null);
+  folderError = $state<LauncherBackendError | null>(null);
 
   // Managed Java runtime for the selected instance.
   runtimeStatus = $state<RuntimeStatusDto | null>(null);
@@ -358,69 +363,109 @@ class LauncherStore {
     }
   }
 
-  /** Opens the detail editor with a copy of the instance's configuration. */
+  /**
+   * Seeds one instance's settings draft from its current desired
+   * configuration. An existing draft is left untouched, so unsaved edits
+   * survive moving between instances and tabs.
+   */
   openDetail(id: string): void {
     const instance = this.launcherState?.instances.find((entry) => entry.id === id);
     if (!instance) return;
-    this.detailId = id;
-    this.detailDraft = $state.snapshot(instance.configuration);
-    this.detailDirty = false;
+    if (this.detailDrafts[id] === undefined) {
+      this.detailDrafts[id] = $state.snapshot(instance.configuration);
+    }
     this.detailError = null;
-    this.detailInstallBusy = false;
     if (this.loaderVersions === null) {
       void this.loadLoaderVersions(instance.configuration.minecraftVersion);
     }
   }
 
-  closeDetail(): void {
-    if (this.detailBusy || this.detailInstallBusy) return;
-    this.detailId = null;
-    this.detailDraft = null;
-    this.detailDirty = false;
-    this.detailError = null;
+  /** The instance's live draft, or null before the editor has opened it. */
+  draftFor(id: string): InstanceConfiguration | null {
+    return this.detailDrafts[id] ?? null;
   }
 
-  /** Saves the whole proposed configuration atomically. */
-  async runSaveConfiguration(): Promise<void> {
-    if (!this.detailId || !this.detailDraft) return;
-    this.detailBusy = true;
+  /** Drops one instance's unsaved draft by reseeding it from saved state. */
+  discardDraft(id: string): void {
+    const instance = this.launcherState?.instances.find((entry) => entry.id === id);
+    if (!instance) {
+      delete this.detailDrafts[id];
+      return;
+    }
+    this.detailDrafts[id] = $state.snapshot(instance.configuration);
+  }
+
+  /** Saves one instance's whole proposed configuration atomically. */
+  async runSaveConfiguration(id: string): Promise<void> {
+    const draft = this.detailDrafts[id];
+    if (!draft || this.detailBusy !== null) return;
+    this.detailBusy = id;
     this.detailError = null;
     try {
-      await updateInstanceConfiguration(this.detailId, this.detailDraft);
-      this.detailDirty = false;
+      await updateInstanceConfiguration(id, draft);
       await this.refreshState();
       void this.refreshPlayReadiness();
       // Reflect the persisted draft back from Rust-owned state.
-      const updated = this.launcherState?.instances.find(
-        (entry) => entry.id === this.detailId,
-      );
-      if (updated) this.detailDraft = $state.snapshot(updated.configuration);
+      const updated = this.launcherState?.instances.find((entry) => entry.id === id);
+      if (updated) this.detailDrafts[id] = $state.snapshot(updated.configuration);
     } catch (cause: unknown) {
       this.detailError = backendError(cause, "The configuration could not be saved.");
     } finally {
-      this.detailBusy = false;
+      this.detailBusy = null;
     }
   }
 
-  /** Installs the instance's saved configuration (install-affecting changes). */
-  async runInstallConfiguration(): Promise<void> {
-    if (!this.detailId) return;
-    this.detailInstallBusy = true;
+  /**
+   * Installs one instance's saved configuration (install-affecting changes).
+   */
+  async runInstallConfiguration(id: string): Promise<void> {
+    if (this.detailInstallBusy !== null) return;
+    this.detailInstallBusy = id;
     this.detailError = null;
     try {
-      await installInstanceConfiguration(this.detailId);
+      await installInstanceConfiguration(id);
       await this.refreshState();
       void this.refreshPlayReadiness();
-      const updated = this.launcherState?.instances.find(
-        (entry) => entry.id === this.detailId,
-      );
-      if (updated) this.detailDraft = $state.snapshot(updated.configuration);
-      this.detailDirty = false;
+      const updated = this.launcherState?.instances.find((entry) => entry.id === id);
+      if (updated) this.detailDrafts[id] = $state.snapshot(updated.configuration);
     } catch (cause: unknown) {
       this.detailError = backendError(cause, "The new configuration could not be installed.");
       await this.refreshState();
     } finally {
-      this.detailInstallBusy = false;
+      this.detailInstallBusy = null;
+    }
+  }
+
+  /**
+   * Opens one instance's managed folder in the OS file browser. The folder
+   * is derived entirely by Rust from the validated instance id.
+   */
+  async runOpenFolder(id: string): Promise<void> {
+    if (this.folderBusy !== null) return;
+    this.folderBusy = id;
+    this.folderError = null;
+    try {
+      await openInstanceFolder(id);
+    } catch (cause: unknown) {
+      this.folderError = backendError(cause, "The instance folder could not be opened.");
+    } finally {
+      this.folderBusy = null;
+    }
+  }
+
+  /**
+   * The workspace header's contextual Play. It composes the same single
+   * launch pipeline Home uses — select (when this instance is not the
+   * selected one), refresh Rust's readiness decision, then launch only if
+   * that decision says ready. There is no second readiness or launch path.
+   */
+  async runWorkspacePlay(instanceId: string): Promise<void> {
+    if (instanceId !== this.launcherState?.config.selectedInstanceId) {
+      await this.runSelect(instanceId);
+    }
+    await this.refreshPlayReadiness();
+    if (this.playReadiness?.instanceId === instanceId && this.playReadiness.ready) {
+      await this.runPlay(instanceId);
     }
   }
 

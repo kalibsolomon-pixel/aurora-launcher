@@ -654,6 +654,26 @@ export async function selectInstance(instanceId: string): Promise<void> {
   }
 }
 
+/**
+ * Opens one instance's managed root folder in the operating system's file
+ * browser. Rust derives the folder from the validated instance id and the
+ * managed paths — no frontend-supplied path exists on this surface.
+ */
+export async function openInstanceFolder(instanceId: string): Promise<void> {
+  try {
+    await invoke<void>("open_instance_folder", { request: { instanceId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance folder could not be opened.",
+    );
+  }
+}
+
 export type InstanceValidationStatus =
   | "ready"
   | "damaged"

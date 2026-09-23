@@ -77,7 +77,15 @@ Pandora (Moulberry's open-source launcher) informs **workflow and structure only
   click away; advanced operations (logs, output, kill) are contextual to a running
   instance rather than permanent navigation;
 - master–detail browsing with tabs inside a detail view;
-- practical use of desktop space: medium information density, comfortable rows.
+- practical use of desktop space: medium information density, comfortable rows;
+- a clear separation between launcher-level settings and one instance's settings.
+
+The instance-workspace phase adapted exactly these structural ideas — the sidebar
+instance shortcuts, the contextual instance header (breadcrumb, immediate launch
+and open-folder actions), the compact secondary tab row inside the workspace, dense
+instance rows on the Instances page, and the explicit global-vs-instance Settings
+split — while Pandora's branding, colors, typography, shapes, dimensions, and
+layouts remain untouched.
 
 **Non-cloning rule**: Pandora's branding, icons, styling, exact layouts, and code are
 never copied. Where a Pandora pattern does not fit Aurora's state or principles, the
@@ -88,12 +96,17 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
 
 ```text
 ┌──────────┬──────────────────────────────────────┐
-│ brand    │  page title            [contextual   │
-│ ──────   │                          action]     │
-│ Home     │                                      │
-│ Instances│   page content (scrolls vertically)  │
-│ Accounts │                                      │
-│ About    │                                      │
+│ brand    │  Instances ›                [Open    │
+│ ──────   │  Instance name  [status]    folder]  │
+│ Home     │                  [Play]              │
+│ Instances│  Overview │ Settings                  │
+│ Accounts│  ────────────────────────             │
+│ Settings │                                      │
+│ About    │   grouped content (scrolls           │
+│ ──────   │   vertically)                        │
+│ Instances│                                      │
+│  A  ·B   │                                      │
+│  All…    │                                      │
 │ ──────   │                                      │
 │ account  │                                      │
 └──────────┴──────────────────────────────────────┘
@@ -104,9 +117,17 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
   labels, selected/focus states, and account identity never feel cramped) and one
   content region (the page). The shell never scrolls; only page content scrolls.
 - **Navigation** reflects *actual current capabilities only*: Home, Instances,
-  Accounts, Settings (launcher-wide preferences — today, appearance), About
-  (real backend state), plus a Developer page in development builds.
-  Future destinations (Library) are documented in this file, not built.
+  Accounts, Settings (launcher-wide preferences — today, appearance and desktop
+  integration), About (real backend state), plus a Developer page in development
+  builds. Future destinations (Library) are documented in this file, not built.
+  Instance-local content (Mods, Resource Packs, Shaders, Logs) is **never** a global
+  destination — it belongs to an instance workspace.
+- **Sidebar instance shortcuts**: beneath the destinations, a quiet "Instances"
+  section lists up to four entries (registry/creation order — the launcher records
+  no recency data, so the label never claims "Recent") with an "All instances" link
+  when the list is capped. Selecting an entry opens that instance's workspace. The
+  launcher-*selected* instance carries a muted "Selected" text marker; the
+  workspace-*open* instance carries the nav selected treatment and the page marker.
 - **Account identity/access**: a compact account chip pinned at the bottom of the
   sidebar showing the selected Minecraft name and sign-in state; it navigates to
   Accounts. With no account it offers sign-in.
@@ -114,7 +135,49 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
   the content it acts on (Play on Home), with obvious hierarchy but modest size —
   never an oversized promotional object.
 - Navigation items are buttons with `aria-current="page"`, visible keyboard focus,
-  and a clear selected state. The current page never disappears behind mode switches.
+  and a clear selected state. The current page never disappears behind mode
+  switches. While an instance workspace is open, its own sidebar entry carries
+  `aria-current="page"` and the global destinations return to their resting state —
+  exactly one page marker exists at a time.
+
+### Contextual instance workspace
+
+Opening an instance replaces the global page with a stable contextual shell:
+
+1. **Instance header** — a small breadcrumb back to Instances, the instance name as
+   the page title with a compact readiness badge beside it, the installed versions
+   as a quiet subtitle, and the contextual actions **Open folder** (secondary) and
+   **Play** (primary) at the top-right. The header is information-dense, never a
+   hero card: no UUIDs, raw paths, hashes, or release internals.
+2. **Secondary tab row** — a compact horizontal `tablist` (Overview, Settings)
+   directly under the header, keyboard-operable (roving tabindex, arrow keys), with
+   the active tab marked by weight and an accent underline plus `aria-selected` —
+   selection is never color-alone. An unsaved Settings draft shows a text "Unsaved"
+   marker inside the Settings tab.
+3. **Active tab content** — grouped surfaces; the shell (header, tabs) stays
+   mounted while tabs switch.
+
+There are never three simultaneous navigation columns: the global sidebar plus the
+instance tab row is the whole navigation surface. Instance tabs may later grow
+Mods, Resource Packs, Shaders, and Logs; placeholder tabs for unbuilt features are
+prohibited.
+
+### Compact information density
+
+Aurora's density rules, learned from the workspace phase:
+
+- The hierarchy is page/workspace header → local navigation → grouped content →
+  rows/controls; spacing communicates which level something belongs to.
+- Instance rows are compact: identity, one quiet configuration line, at most one
+  state detail line, a status badge, and the row's contextual actions. Avoid giant
+  cards, oversized headings, excessive padding, nested cards, and decorative
+  metric tiles.
+- Large blank areas exist because content is concise — not because every component
+  has generous padding. Reduce vertical consumption inside groups; keep controls at
+  their normal size (never shrink text or targets to fit).
+- Duplicate information is a defect: one fact appears in one place per surface
+  (Home shows the selected instance's readiness; the workspace Overview shows the
+  open instance's — the same derivation, not a copy-paste).
 
 ## E. Spacing system
 
@@ -380,10 +443,16 @@ operating-system surfaces only, and the two are never swapped for each other.
 
 ## Future information architecture (documented, not built)
 
+- **Instance workspace tabs** — Mods, Resource Packs, Shaders, and Logs are the
+  intended next tabs inside an instance's workspace (and Worlds/Servers a possible
+  later stage). No backend capability exists for them yet; they must not be fake
+  tabs. The typed `InstanceTab` model is the extension point.
 - **Library** — a content/mod browsing destination. No backend capability exists
   (no mod management, no content sources); it must not be a fake screen.
-- **Settings** is now built (launcher-wide appearance preferences: theme and
-  accent). Further launcher-wide preferences belong there as real behavior
-  arrives; About remains the status/version surface.
-- Advanced instance operations (logs viewing, repair, runtime details, folders)
-  arrive contextual to instances, not as top-level navigation.
+- **Settings** is built (launcher-wide appearance preferences and Windows desktop
+  integration). Further launcher-wide preferences belong there as real behavior
+  arrives; About remains the status/version surface. Instance-specific settings
+  belong to the instance workspace's Settings tab, never here.
+- Advanced instance operations (logs viewing, repair, runtime details) arrive
+  contextual to instances — as workspace tabs or workspace actions — not as
+  top-level navigation.

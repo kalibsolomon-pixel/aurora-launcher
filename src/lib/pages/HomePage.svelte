@@ -1,10 +1,9 @@
 <script lang="ts">
   import { launcher } from "$lib/launcher/store.svelte";
-
-  let { onNavigate }: { onNavigate: (page: string) => void } = $props();
+  import { navigation } from "$lib/launcher/navigation.svelte";
+  import ReadinessRows from "$lib/instances/ReadinessRows.svelte";
 
   const instance = $derived(launcher.selectedInstance);
-  const account = $derived(launcher.selectedAccount);
   const readiness = $derived(
     launcher.playReadiness && launcher.playReadiness.instanceId === instance?.id
       ? launcher.playReadiness
@@ -13,12 +12,6 @@
   const process = $derived(
     launcher.playProcess && launcher.playProcess.instanceId === instance?.id
       ? launcher.playProcess
-      : null,
-  );
-  const validation = $derived(instance ? launcher.instanceValidations[instance.id] : undefined);
-  const runtimeForInstance = $derived(
-    launcher.runtimeStatus && launcher.runtimeStatus.instanceId === instance?.id
-      ? launcher.runtimeStatus
       : null,
   );
 
@@ -32,166 +25,14 @@
   const playDisabled = $derived(
     launcher.playBusy || launcher.playReadinessBusy || !readiness?.ready,
   );
-
-  const contentStatus = $derived.by(() => {
-    if (!instance) return null;
-    if (instance.state === "installing") {
-      return {
-        tone: "status-working" as const,
-        label: "Installing",
-        detail: launcher.createProgress ? launcher.createProgress.phase : null,
-      };
-    }
-    if (validation?.status === "damaged") {
-      return {
-        tone: "status-error" as const,
-        label: "Damaged",
-        detail: validation.problems[0]
-          ? `${validation.problems[0].component}: ${validation.problems[0].reason}`
-          : "Deep validation found problems.",
-      };
-    }
-    if (validation?.status === "stale") {
-      return {
-        tone: "status-warning" as const,
-        label: "Needs install",
-        detail:
-          "The configuration changed — install the new configuration from the instance's settings.",
-      };
-    }
-    if (
-      instance.configuration.minecraftVersion !== instance.minecraftVersion ||
-      (instance.configuration.loader.policy.type === "pinned" &&
-        instance.configuration.loader.policy.version !== instance.fabricLoaderVersion)
-    ) {
-      return {
-        tone: "status-warning" as const,
-        label: "Needs install",
-        detail:
-          "The configuration changed — install the new configuration from the instance's settings.",
-      };
-    }
-    if (validation?.status === "ready") {
-      return {
-        tone: "status-success" as const,
-        label: "Ready",
-        detail: "Deep validation passed.",
-      };
-    }
-    return {
-      tone: "status-success" as const,
-      label: "Ready",
-      detail: "Installed and complete.",
-    };
-  });
-
-  const javaStatus = $derived.by(() => {
-    if (launcher.runtimeBusy) {
-      return {
-        tone: "status-working" as const,
-        label: "Checking…",
-        detail: launcher.runtimeProgress
-          ? `${launcher.runtimeProgress.phase} ${launcher.runtimeProgress.completedItems}/${launcher.runtimeProgress.totalItems}`
-          : null,
-      };
-    }
-    if (launcher.runtimeError) {
-      return {
-        tone: "status-error" as const,
-        label: "Status failed",
-        detail: launcher.runtimeError.message,
-      };
-    }
-    if (!runtimeForInstance) {
-      return { tone: "status-muted" as const, label: "Not checked", detail: null };
-    }
-    if (runtimeForInstance.status === "ready") {
-      return {
-        tone: "status-success" as const,
-        label: "Ready",
-        detail:
-          `${runtimeForInstance.component} · Java ${runtimeForInstance.requiredMajorVersion}` +
-          (runtimeForInstance.runtimeVersion ? ` · ${runtimeForInstance.runtimeVersion}` : "") +
-          (runtimeForInstance.reused === true ? " · reused verified runtime" : ""),
-      };
-    }
-    if (runtimeForInstance.status === "damaged") {
-      return {
-        tone: "status-error" as const,
-        label: "Damaged",
-        detail: runtimeForInstance.problems[0] ?? "The managed runtime failed validation.",
-      };
-    }
-    return {
-      tone: "status-warning" as const,
-      label: "Not installed",
-      detail: `${runtimeForInstance.component} · Java ${runtimeForInstance.requiredMajorVersion}`,
-    };
-  });
-
-  const accountStatus = $derived.by(() => {
-    if (!account) {
-      return { tone: "status-muted" as const, label: "Not signed in", detail: null };
-    }
-    if (account.status === "reauthenticationRequired") {
-      return {
-        tone: "status-warning" as const,
-        label: "Sign-in required",
-        detail: account.minecraftName,
-      };
-    }
-    return {
-      tone: "status-success" as const,
-      label: "Signed in",
-      detail: account.minecraftName,
-    };
-  });
-
-  const processStatus = $derived.by(() => {
-    if (launcher.playBusy && !process) {
-      return {
-        tone: "status-working" as const,
-        label: launcher.playProgress ? launcher.playProgress.phase : "Preparing…",
-        detail: null,
-      };
-    }
-    if (!process) return { tone: "status-muted" as const, label: "Not running", detail: null };
-    if (process.status === "starting") {
-      return {
-        tone: "status-working" as const,
-        label: "Starting…",
-        detail: launcher.playProgress ? launcher.playProgress.phase : null,
-      };
-    }
-    if (process.status === "running") {
-      return {
-        tone: "status-success" as const,
-        label: "Running",
-        detail:
-          process.startedAtUnixSeconds !== null
-            ? `Process ${process.processId ?? "?"} · started ${new Date(
-                process.startedAtUnixSeconds * 1000,
-              ).toLocaleTimeString()}`
-            : `Process ${process.processId ?? "?"}`,
-      };
-    }
-    if (process.status === "failed") {
-      return {
-        tone: "status-error" as const,
-        label: "Failed",
-        detail: process.message ?? "Minecraft exited unsuccessfully.",
-      };
-    }
-    return {
-      tone: "status-muted" as const,
-      label: "Exited",
-      detail: process.exitCode !== null ? `Exit code ${process.exitCode}` : null,
-    };
-  });
-
-  const blockers = $derived(readiness && !readiness.ready ? readiness.blockers : []);
 </script>
 
+<!--
+  Aurora's fast launch surface: the selected instance and everything Play
+  needs, with the readiness decision Rust owns rendered verbatim. The full
+  per-instance workspace lives behind Instances — Home stays a launch
+  surface, sharing its readiness rows with the workspace Overview.
+-->
 <div class="page">
   <header class="page-header">
     <div>
@@ -228,7 +69,7 @@
         <p class="empty-detail">
           Create an isolated Minecraft installation to get started.
         </p>
-        <button type="button" class="btn btn-primary" onclick={() => onNavigate("instances")}>
+        <button type="button" class="btn btn-primary" onclick={() => navigation.goTo("instances")}>
           Create instance
         </button>
       </section>
@@ -236,7 +77,7 @@
       <section class="empty-state" aria-live="polite">
         <h3 class="empty-title">No instance selected</h3>
         <p class="empty-detail">Choose an instance to launch from.</p>
-        <button type="button" class="btn btn-primary" onclick={() => onNavigate("instances")}>
+        <button type="button" class="btn btn-primary" onclick={() => navigation.goTo("instances")}>
           Go to Instances
         </button>
       </section>
@@ -271,89 +112,7 @@
         </div>
       </div>
 
-      {#if contentStatus}
-        <div class="group-row">
-          <div class="group-row-main">
-            <span class="group-row-title">Game content</span>
-            {#if contentStatus.detail}
-              <span class="group-row-detail">{contentStatus.detail}</span>
-            {/if}
-          </div>
-          <span class="status-badge {contentStatus.tone}">{contentStatus.label}</span>
-        </div>
-      {/if}
-
-      <div class="group-row">
-        <div class="group-row-main">
-          <span class="group-row-title">Java runtime</span>
-          {#if javaStatus.detail}
-            <span class="group-row-detail" class:is-error={javaStatus.tone === "status-error"}
-              >{javaStatus.detail}</span
-            >
-          {/if}
-        </div>
-        <div class="group-row-actions">
-          <span class="status-badge {javaStatus.tone}">{javaStatus.label}</span>
-          {#if instance.state === "ready" && !launcher.runtimeBusy && runtimeForInstance && runtimeForInstance.status !== "ready"}
-            <button
-              type="button"
-              class="btn"
-              onclick={() => launcher.runEnsureRuntime(instance.id)}
-            >
-              {runtimeForInstance.status === "damaged" ? "Repair Java" : "Install Java"}
-            </button>
-          {/if}
-        </div>
-      </div>
-
-      <div class="group-row">
-        <div class="group-row-main">
-          <span class="group-row-title">Account</span>
-          {#if accountStatus.detail}
-            <span class="group-row-detail">{accountStatus.detail}</span>
-          {/if}
-        </div>
-        <div class="group-row-actions">
-          <span class="status-badge {accountStatus.tone}">{accountStatus.label}</span>
-          {#if !account || account.status === "reauthenticationRequired"}
-            <button type="button" class="btn btn-quiet" onclick={() => onNavigate("accounts")}>
-              {account ? "Fix sign-in" : "Sign in"}
-            </button>
-          {/if}
-        </div>
-      </div>
-
-      <div class="group-row">
-        <div class="group-row-main">
-          <span class="group-row-title">Minecraft</span>
-          {#if processStatus.detail}
-            <span
-              class="group-row-detail"
-              class:is-error={processStatus.tone === "status-error"}
-              >{processStatus.detail}</span
-            >
-          {/if}
-        </div>
-        <span class="status-badge {processStatus.tone}">{processStatus.label}</span>
-      </div>
-
-      {#if blockers.length > 0}
-        {#each blockers as blocker (blocker.code)}
-          <div class="group-row blocker-row">
-            <div class="group-row-main">
-              <span class="group-row-title blocker-text">{blocker.message}</span>
-              <span class="group-row-detail">{blocker.code}</span>
-            </div>
-          </div>
-        {/each}
-      {/if}
-
-      {#if launcher.playError}
-        <p class="inline-message inline-message-error group-row" role="alert">
-          {launcher.playError.message}
-          <code>{launcher.playError.code}</code>
-        </p>
-      {/if}
+      <ReadinessRows {instance} />
 
       <p class="group-footer">
         Readiness is decided by Aurora from validated content, the exact managed Java runtime,
@@ -388,17 +147,5 @@
     gap: var(--space-2);
     flex-wrap: wrap;
     justify-content: flex-end;
-  }
-
-  .group-row-detail.is-error {
-    color: var(--color-error);
-  }
-
-  .blocker-row {
-    background: var(--color-warning-soft);
-  }
-
-  .blocker-text {
-    color: var(--color-warning);
   }
 </style>

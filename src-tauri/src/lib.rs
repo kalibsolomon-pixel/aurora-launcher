@@ -46,6 +46,7 @@ pub fn run() {
             application::list_minecraft_versions,
             application::list_fabric_loader_versions,
             application::select_instance,
+            application::open_instance_folder,
             application::validate_instance,
             application::get_instance_runtime_status,
             application::ensure_instance_runtime,

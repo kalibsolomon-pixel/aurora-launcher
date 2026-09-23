@@ -322,6 +322,58 @@ p {
   background: var(--color-accent);
 }
 
+/* ------------------------------------------------------------------ */
+/* Sidebar instance shortcuts                                          */
+/*                                                                     */
+/* A short list of instances beneath the global destinations, in       */
+/* registry (creation) order — the registry records no recency data,   */
+/* so the label stays honest. Opening an entry enters that instance's  */
+/* workspace; the workspace's own entry carries the page marker while  */
+/* the global Instances destination returns to its normal state.      */
+/* ------------------------------------------------------------------ */
+
+.sidebar-instances {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--color-surface-edge);
+  min-width: 0;
+}
+
+.sidebar-label {
+  margin: 0;
+  padding: 0 var(--space-3);
+  color: var(--color-text-muted);
+  font-size: var(--text-label);
+  font-weight: 500;
+}
+
+.sidebar-instance-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sidebar-instance-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-instance-marker {
+  flex: none;
+  color: var(--color-text-muted);
+  font-size: var(--text-label);
+}
+
+.sidebar-all-instances {
+  color: var(--color-text-muted);
+}
+
 .sidebar-spacer {
   flex: 1;
 }
