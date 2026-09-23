@@ -74,8 +74,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Credentials",
 ] }
 
+# Deterministic asset-invariant tests (external icon phase): the PNG decoder
+# already resolved in the dependency tree through Tauri, used in tests only
+# to verify the generated external identity pixels directly.
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "process", "rt", "time"] }
+png = "0.17"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

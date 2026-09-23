@@ -213,6 +213,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "getrandom 0.3.4",
+ "png 0.17.16",
  "reqwest",
  "rustls",
  "serde",

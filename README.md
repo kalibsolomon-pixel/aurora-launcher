@@ -18,6 +18,8 @@ Instances are fully configurable: each one carries the desired Minecraft version
 
 The launcher's appearance is customizable from the Settings page: three built-in dark themes (the default Aurora Dark, the cooler Midnight, and true-black OLED) and an accent color chosen from a curated palette or a custom color, validated natively so text, focus, and status colors stay readable. The choice applies live and is remembered across restarts. Custom/system Java selection, instance deletion, Aurora updates, and real Aurora release distribution are **not implemented**.
 
+Aurora's external application identity — the Windows executable, taskbar, title-bar, installer, and shortcut icon — is a rounded-square dark neutral gradient with the exact white Aurora mark, kept separate from the transparent internal mark used inside the UI, and generated deterministically from it by repository-owned tooling.
+
 ## Authentication and privacy
 
 Aurora Launcher signs players in through the Microsoft OAuth 2.0 authorization-code flow with PKCE in the user's system browser and never collects or stores Microsoft account passwords. After Microsoft sign-in it follows the standard Xbox Live, XSTS, and Minecraft Services flow required of third-party Minecraft: Java Edition launchers: it verifies Minecraft: Java Edition ownership, retrieves the authenticated player's Minecraft profile, and obtains the Minecraft access token required to launch the game. Authorization requests Xbox Live sign-in and offline access so a returning user can restore their session without repeating sign-in. The only persisted credential is the Microsoft refresh credential, held in operating-system secure credential storage, never in plaintext launcher configuration.

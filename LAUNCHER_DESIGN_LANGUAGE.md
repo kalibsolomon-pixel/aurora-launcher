@@ -360,16 +360,23 @@ These are intentional product states, not raw backend text:
 - Identity is otherwise typographic: the "Aurora" wordmark, hierarchy, and the
   restrained accent — not aurora gradients across the UI.
 
-**Two Aurora asset roles (documented distinction).** The canonical transparent
+**Two Aurora asset roles (implemented distinction).** The canonical transparent
 white mark above is the **internal/UI mark**: it renders directly on existing
-surfaces inside the launcher and the Aurora client. The **external application
-icon** — the intended OS-facing identity for the executable, taskbar, shortcuts,
-Start menu, and installer — is planned as the Aurora mark on a rounded-square
-dark black→gray background. That external asset is **not implemented**: the
-final canonical source image has not been selected or supplied, current
-packaging derivatives remain mechanical transforms of the internal mark, and
-replacement belongs to the desktop/OS-integration phase once the developer
-approves the final asset.
+surfaces inside the launcher (the sidebar brand) and the Aurora client, and it
+never gains a background or a restyle. The **external application icon** is the
+separate OS-facing identity — the exact internal mark composited onto a
+rounded-square dark neutral vertical gradient (charcoal at the top darkening to
+near-black) with the canvas transparent outside the rounded square. Its
+canonical source is `static/aurora-app-icon.png` (1024×1024), generated
+deterministically from the internal mark by the repository-owned
+`tools/generate_external_icon.py` (documented canvas, corner radius, gradient
+stops, mark scale, and compositing — byte-for-byte reproducible). Every
+platform packaging derivative (`src-tauri/icons/` — the window/taskbar `.ico`
+with its load-bearing 40×40-first frame order, `.icns`, PNG sizes) and the SPA
+favicon are mechanical single-pass resamples of that external master; the
+internal mark itself is never modified. Inside the UI, branding continues to
+use the transparent internal mark — the external rounded-square icon is for
+operating-system surfaces only, and the two are never swapped for each other.
 
 ## Future information architecture (documented, not built)
 
