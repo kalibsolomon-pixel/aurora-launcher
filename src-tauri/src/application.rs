@@ -305,6 +305,12 @@ impl From<crate::auth::accounts::InvalidAccount> for CommandError {
     }
 }
 
+impl From<crate::shortcuts::ShortcutError> for CommandError {
+    fn from(error: crate::shortcuts::ShortcutError) -> Self {
+        Self::new(error.code(), error.to_string())
+    }
+}
+
 impl From<InvalidArtifactSource> for CommandError {
     fn from(error: InvalidArtifactSource) -> Self {
         Self::new("artifact_source_invalid", error.to_string())
@@ -626,6 +632,197 @@ pub fn set_appearance(
     crate::config::save(&managed_paths.config_file(), &config)?;
 
     Ok(AppearanceDto::of(config.appearance())?)
+}
+
+/// The status of one Windows shortcut slot, as Settings renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutStatusDto {
+    /// `present`, `absent`, `conflict`, or `unknown` (the OS state could not
+    /// be queried right now).
+    state: &'static str,
+    /// Who owns the slot: `aurora` (launcher-managed) or `installer`
+    /// (created and removed by the Aurora installers, reported read-only).
+    managed_by: &'static str,
+}
+
+impl ShortcutStatusDto {
+    fn for_presence(
+        presence: crate::shortcuts::ShortcutPresence,
+        managed_by: &'static str,
+    ) -> Self {
+        let state = match presence {
+            crate::shortcuts::ShortcutPresence::Present => "present",
+            crate::shortcuts::ShortcutPresence::Absent => "absent",
+            crate::shortcuts::ShortcutPresence::Conflict => "conflict",
+        };
+        Self { state, managed_by }
+    }
+
+    fn unknown(managed_by: &'static str) -> Self {
+        Self {
+            state: "unknown",
+            managed_by,
+        }
+    }
+}
+
+/// The Windows desktop-integration state for the Settings page: live,
+/// filesystem-derived shortcut status (never persisted), whether this
+/// platform supports shortcut integration at all, and whether this build
+/// may manage shortcuts (installed production builds only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopIntegrationDto {
+    supported: bool,
+    manageable: bool,
+    desktop_shortcut: ShortcutStatusDto,
+    start_menu_shortcut: ShortcutStatusDto,
+}
+
+impl DesktopIntegrationDto {
+    /// Queries the real OS state: known folders, current executable, and the
+    /// shortcut slots inside them. Failure to resolve any input degrades to
+    /// an honest `unknown` status rather than a guess.
+    fn assess() -> Self {
+        let (desktop_dir, programs_dir) = (
+            crate::shortcuts::desktop_known_folder(),
+            crate::shortcuts::programs_known_folder(),
+        );
+        let current_exe = std::env::current_exe().ok();
+        let manageable = current_exe
+            .as_ref()
+            .is_some_and(|exe| crate::shortcuts::shortcut_manageable(exe, !cfg!(debug_assertions)));
+
+        match (desktop_dir, programs_dir, current_exe) {
+            (Ok(desktop), Ok(programs), Some(exe)) => {
+                let context = crate::shortcuts::ShortcutContext {
+                    desktop_dir: desktop,
+                    programs_dir: programs,
+                    // Best-effort: the machine-wide Programs folder widens
+                    // Start-menu reporting to per-machine MSI installs; a
+                    // resolution failure only narrows reporting.
+                    common_programs_dir: crate::shortcuts::common_programs_known_folder().ok(),
+                    target_exe: exe,
+                };
+                Self {
+                    supported: true,
+                    manageable,
+                    desktop_shortcut: ShortcutStatusDto::for_presence(
+                        context.desktop_presence(),
+                        "aurora",
+                    ),
+                    start_menu_shortcut: ShortcutStatusDto::for_presence(
+                        context.start_menu_presence(),
+                        "installer",
+                    ),
+                }
+            }
+            _ => Self {
+                supported: true,
+                manageable,
+                desktop_shortcut: ShortcutStatusDto::unknown("aurora"),
+                start_menu_shortcut: ShortcutStatusDto::unknown("installer"),
+            },
+        }
+    }
+
+    /// The non-Windows shape: shortcut integration does not exist on this
+    /// platform and nothing is claimed about any slot.
+    #[cfg(not(windows))]
+    fn unsupported() -> Self {
+        Self {
+            supported: false,
+            manageable: false,
+            desktop_shortcut: ShortcutStatusDto::unknown("aurora"),
+            start_menu_shortcut: ShortcutStatusDto::unknown("installer"),
+        }
+    }
+}
+
+/// Reports the live Windows shortcut state for the Settings page.
+///
+/// Status is queried from the filesystem on every call — a user may delete
+/// a shortcut outside Aurora, and nothing is persisted in its place.
+#[tauri::command]
+pub fn get_desktop_integration() -> Result<DesktopIntegrationDto, CommandError> {
+    #[cfg(windows)]
+    {
+        Ok(DesktopIntegrationDto::assess())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(DesktopIntegrationDto::unsupported())
+    }
+}
+
+/// Creates (or refreshes) the Aurora-owned desktop shortcut.
+///
+/// Refuses development builds and shortcuts slots Aurora cannot prove it
+/// owns; conflicts surface as `shortcut_conflict` and the existing file is
+/// never touched.
+#[tauri::command]
+pub fn create_desktop_shortcut() -> Result<DesktopIntegrationDto, CommandError> {
+    #[cfg(windows)]
+    {
+        let context = shortcut_context_for_management()?;
+        context
+            .create_desktop_shortcut()
+            .map_err(CommandError::from)?;
+        Ok(DesktopIntegrationDto::assess())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ShortcutStatusDto::unknown("aurora");
+        Err(CommandError::from(
+            crate::shortcuts::ShortcutError::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Removes the Aurora-owned desktop shortcut.
+///
+/// Only a shortcut proven to target this executable is removed; anything
+/// else at the slot is a reported conflict and survives untouched.
+#[tauri::command]
+pub fn remove_desktop_shortcut() -> Result<DesktopIntegrationDto, CommandError> {
+    #[cfg(windows)]
+    {
+        let context = shortcut_context_for_management()?;
+        context
+            .remove_desktop_shortcut()
+            .map_err(CommandError::from)?;
+        Ok(DesktopIntegrationDto::assess())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ShortcutStatusDto::unknown("aurora");
+        Err(CommandError::from(
+            crate::shortcuts::ShortcutError::UnsupportedPlatform,
+        ))
+    }
+}
+
+/// Resolves the live shortcut context for a management action, applying the
+/// installed-production-build gate first.
+#[cfg(windows)]
+fn shortcut_context_for_management() -> Result<crate::shortcuts::ShortcutContext, CommandError> {
+    let current_exe = std::env::current_exe().map_err(|error| {
+        CommandError::from(crate::shortcuts::ShortcutError::Io(error.to_string()))
+    })?;
+    if !crate::shortcuts::shortcut_manageable(&current_exe, !cfg!(debug_assertions)) {
+        return Err(CommandError::from(
+            crate::shortcuts::ShortcutError::ManagementUnavailable,
+        ));
+    }
+    let desktop_dir = crate::shortcuts::desktop_known_folder().map_err(CommandError::from)?;
+    let programs_dir = crate::shortcuts::programs_known_folder().map_err(CommandError::from)?;
+    Ok(crate::shortcuts::ShortcutContext {
+        desktop_dir,
+        programs_dir,
+        common_programs_dir: crate::shortcuts::common_programs_known_folder().ok(),
+        target_exe: current_exe,
+    })
 }
 
 /// Typed artifact metadata accepted by the acquisition command.
@@ -3276,5 +3473,74 @@ mod tests {
         let error = AppearanceDto::of(&bad_accent).unwrap_err();
         assert_eq!(error.code, "appearance_invalid");
         assert!(error.message.contains("too dark"));
+    }
+
+    #[test]
+    fn shortcut_errors_map_to_stable_machine_codes() {
+        let cases = [
+            (
+                crate::shortcuts::ShortcutError::UnsupportedPlatform,
+                "shortcut_unsupported_platform",
+            ),
+            (
+                crate::shortcuts::ShortcutError::ManagementUnavailable,
+                "shortcut_management_unavailable",
+            ),
+            (
+                crate::shortcuts::ShortcutError::Conflict,
+                "shortcut_conflict",
+            ),
+            (
+                crate::shortcuts::ShortcutError::Io("io".into()),
+                "shortcut_io_failure",
+            ),
+            (
+                crate::shortcuts::ShortcutError::Shell("shell".into()),
+                "shortcut_shell_failure",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let command_error = CommandError::from(error);
+            assert_eq!(command_error.code, expected_code);
+            assert!(
+                !command_error.message.is_empty(),
+                "every structured error carries a readable message"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_integration_dtos_serialize_the_live_status_vocabulary() {
+        let present =
+            ShortcutStatusDto::for_presence(crate::shortcuts::ShortcutPresence::Present, "aurora");
+        let json = serde_json::to_string(&present).unwrap();
+        assert_eq!(json, r#"{"state":"present","managedBy":"aurora"}"#);
+
+        let conflict = ShortcutStatusDto::for_presence(
+            crate::shortcuts::ShortcutPresence::Conflict,
+            "installer",
+        );
+        assert_eq!(
+            serde_json::to_string(&conflict).unwrap(),
+            r#"{"state":"conflict","managedBy":"installer"}"#
+        );
+
+        let unknown = ShortcutStatusDto::unknown("aurora");
+        assert_eq!(
+            serde_json::to_string(&unknown).unwrap(),
+            r#"{"state":"unknown","managedBy":"aurora"}"#
+        );
+
+        // The non-Windows shape stays honest: nothing is claimed present.
+        #[cfg(not(windows))]
+        {
+            let dto = DesktopIntegrationDto::unsupported();
+            assert!(!dto.supported);
+            assert!(!dto.manageable);
+            assert_eq!(dto.desktop_shortcut.state, "unknown");
+            assert_eq!(dto.start_menu_shortcut.managed_by, "installer");
+            let json = serde_json::to_string(&dto).unwrap();
+            assert!(!json.contains("present"));
+        }
     }
 }

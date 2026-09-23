@@ -14,6 +14,7 @@ pub mod launch;
 pub mod minecraft;
 pub mod paths;
 pub mod runtime;
+pub mod shortcuts;
 
 #[cfg(test)]
 mod test_support;
@@ -28,6 +29,9 @@ pub fn run() {
             application::get_launcher_state,
             application::get_appearance,
             application::set_appearance,
+            application::get_desktop_integration,
+            application::create_desktop_shortcut,
+            application::remove_desktop_shortcut,
             application::acquire_artifact,
             application::plan_minecraft_install,
             application::plan_fabric_install,

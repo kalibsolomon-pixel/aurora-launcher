@@ -1,11 +1,14 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { appearance } from "$lib/launcher/appearance.svelte";
-  import type { AccentSelection } from "$lib/backend";
+  import { desktopIntegration } from "$lib/launcher/desktopIntegration.svelte";
+  import type { AccentSelection, ShortcutStatus } from "$lib/backend";
 
   const appearanceState = $derived(appearance.state);
   const themes = $derived(appearanceState?.themes ?? []);
   const accents = $derived(appearanceState?.accents ?? []);
   const isCustomAccent = $derived(appearance.accent.type === "custom");
+  const integrationState = $derived(desktopIntegration.state);
 
   // The custom picker's resting value: the active custom color, or a
   // reasonable starting point when a preset is active.
@@ -13,6 +16,12 @@
   $effect(() => {
     const accent = appearance.accent;
     if (accent.type === "custom") customHex = accent.hex;
+  });
+
+  // Shortcut status is live OS state: query it whenever Settings is shown so
+  // a shortcut deleted outside Aurora is reflected immediately.
+  onMount(() => {
+    void desktopIntegration.refresh();
   });
 
   function selectTheme(event: Event): void {
@@ -29,12 +38,54 @@
     const value = (event.currentTarget as HTMLInputElement).value;
     void appearance.setAccent({ type: "custom", hex: value });
   }
+
+  const desktopStatusText = $derived.by(() => {
+    const status = integrationState?.desktopShortcut;
+    if (!status || status.state === "unknown") {
+      return "Status unavailable right now.";
+    }
+    switch (status.state) {
+      case "present":
+        return "Aurora's shortcut is on the desktop.";
+      case "absent":
+        return "No Aurora shortcut on the desktop.";
+      case "conflict":
+        return "Another item is already using this name, so Aurora left it untouched.";
+    }
+  });
+
+  const startMenuStatusText = $derived.by(() => {
+    const status = integrationState?.startMenuShortcut;
+    if (!status || status.state === "unknown") {
+      return "Status unavailable right now.";
+    }
+    switch (status.state) {
+      case "present":
+        return "Present — created and removed by the Aurora installer.";
+      case "absent":
+        return "Created when Aurora is installed with its setup.";
+      case "conflict":
+        return "An item is using the Aurora name, but Aurora did not create it.";
+    }
+  });
+
+  function shortcutStatusLabel(status: ShortcutStatus | undefined): string {
+    if (!status || status.state === "unknown") return "Unknown";
+    switch (status.state) {
+      case "present":
+        return "Present";
+      case "absent":
+        return "Not present";
+      case "conflict":
+        return "Name in use";
+    }
+  }
 </script>
 
 <!--
-  Launcher-wide preferences. Today that is appearance only — the page stays
-  sparse and purposeful rather than inventing settings; future launcher-wide
-  preferences belong here.
+  Launcher-wide preferences. Appearance and Windows desktop integration are
+  the implemented preferences; the page stays sparse and purposeful rather
+  than inventing settings; future launcher-wide preferences belong here.
 -->
 <div class="page">
   <header class="page-header">
@@ -158,11 +209,114 @@
       every theme.
     </p>
   </section>
+
+  <section class="group" aria-labelledby="desktop-integration-title">
+    <div class="group-heading">
+      <div>
+        <h3 class="group-title" id="desktop-integration-title">
+          Desktop integration
+        </h3>
+        <p class="group-subtitle">
+          Windows shortcuts for launching Aurora, reflecting the system as it
+          is right now.
+        </p>
+      </div>
+    </div>
+
+    {#if integrationState === null && desktopIntegration.error === null}
+      <div class="group-row group-row-loading">
+        <span class="spinner" aria-hidden="true"></span>
+        <span class="group-row-detail">Reading shortcut status…</span>
+      </div>
+    {:else if integrationState !== null && !integrationState.supported}
+      <div class="group-row">
+        <div class="group-row-main">
+          <span class="group-row-title">Windows shortcuts</span>
+          <span class="group-row-detail">
+            Shortcut integration is not available on this platform.
+          </span>
+        </div>
+      </div>
+    {:else if integrationState !== null}
+      <div class="group-row integration-row">
+        <div class="group-row-main">
+          <span class="group-row-title">Desktop shortcut</span>
+          <span class="group-row-detail" role="status">
+            {desktopStatusText}
+          </span>
+          {#if integrationState.desktopShortcut.state === "conflict"}
+            <span class="status-badge status-warning">
+              {shortcutStatusLabel(integrationState.desktopShortcut)}
+            </span>
+          {/if}
+        </div>
+        <div class="group-row-actions">
+          {#if !integrationState.manageable}
+            <span class="integration-note">Requires an installed production build.</span>
+          {:else if integrationState.desktopShortcut.state === "absent"}
+            <button
+              type="button"
+              class="btn"
+              onclick={() => void desktopIntegration.create()}
+              disabled={desktopIntegration.busy}
+            >
+              Create desktop shortcut
+            </button>
+          {:else if integrationState.desktopShortcut.state === "present"}
+            <button
+              type="button"
+              class="btn btn-danger"
+              onclick={() => void desktopIntegration.remove()}
+              disabled={desktopIntegration.busy}
+            >
+              Remove desktop shortcut
+            </button>
+          {/if}
+        </div>
+      </div>
+
+      <div class="group-row integration-row">
+        <div class="group-row-main">
+          <span class="group-row-title">Start menu</span>
+          <span class="group-row-detail" role="status">
+            {startMenuStatusText}
+          </span>
+        </div>
+        <div class="group-row-actions">
+          {#if integrationState.startMenuShortcut.state === "present"}
+            <span class="integration-note">Managed by the installer.</span>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
+    {#if desktopIntegration.error}
+      <p class="inline-message inline-message-error group-row" role="alert">
+        {desktopIntegration.error.message}
+      </p>
+    {/if}
+
+    <p class="group-footer">
+      Aurora only manages shortcuts it created; anything else with the same
+      name is left alone. Pinning Aurora to the taskbar stays a Windows choice.
+    </p>
+  </section>
 </div>
 
 <style>
   .appearance-row {
     align-items: flex-start;
+  }
+
+  /* Desktop-integration rows: the status text wraps under the title on
+     narrow widths while actions keep their own line. */
+  .integration-row {
+    align-items: center;
+  }
+
+  .integration-note {
+    font-size: var(--text-metadata);
+    color: var(--color-text-muted);
   }
 
   /* Theme choices: one stacked radio per built-in theme. */
@@ -297,6 +451,12 @@
     .theme-picker,
     .accent-picker {
       width: 100%;
+    }
+
+    .integration-row {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: var(--space-2);
     }
   }
 

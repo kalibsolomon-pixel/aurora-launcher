@@ -18,7 +18,7 @@ Instances are fully configurable: each one carries the desired Minecraft version
 
 The launcher's appearance is customizable from the Settings page: three built-in dark themes (the default Aurora Dark, the cooler Midnight, and true-black OLED) and an accent color chosen from a curated palette or a custom color, validated natively so text, focus, and status colors stay readable. The choice applies live and is remembered across restarts. Custom/system Java selection, instance deletion, Aurora updates, and real Aurora release distribution are **not implemented**.
 
-Aurora's external application identity — the Windows executable, taskbar, title-bar, installer, and shortcut icon — is a rounded-square dark neutral gradient with the exact white Aurora mark, kept separate from the transparent internal mark used inside the UI, and generated deterministically from it by repository-owned tooling.
+Aurora's external application identity — the Windows executable, taskbar, title-bar, installer, and shortcut icon — is a rounded-square dark neutral gradient with the exact white Aurora mark, kept separate from the transparent internal mark used inside the UI, and generated deterministically from it by repository-owned tooling. On Windows, Settings also shows live desktop-integration state: an Aurora-owned desktop shortcut can be created and removed from there (only Aurora's own shortcut is ever touched), while the Start-menu shortcut that the installer creates is reported read-only. Shortcut status always reflects the operating system as it is right now. Linux/macOS desktop integration, taskbar pinning, file associations, and URI registration are **not implemented**.
 
 ## Authentication and privacy
 

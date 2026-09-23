@@ -68,10 +68,21 @@ zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # builds compile the portable trait only and fail deliberately until their
 # platform phases own a backed store. Version pinned to the copy already in
 # the dependency tree.
+# Windows shell shortcuts (desktop integration): the same official Microsoft
+# bindings family, restricted to the shell link COM API (IShellLinkW /
+# IPersistFile), COM initialization, known-folder resolution, and the
+# WIN32_FIND_DATAW the shell link reader requires. Already resolved in the
+# dependency tree via Tauri's WebView2 bindings, so no new code is added.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Credentials",
+] }
+windows = { version = "0.61", default-features = false, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
 ] }
 
 # Deterministic asset-invariant tests (external icon phase): the PNG decoder

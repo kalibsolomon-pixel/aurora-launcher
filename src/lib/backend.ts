@@ -152,6 +152,69 @@ export async function setAppearance(
   }
 }
 
+/** Live Windows shortcut status for one slot, as Settings renders it. */
+export interface ShortcutStatus {
+  state: "present" | "absent" | "conflict" | "unknown";
+  managedBy: "aurora" | "installer";
+}
+
+/**
+ * Live Windows desktop-integration state. Every field is queried from the
+ * operating system on demand — shortcut status is never persisted, so it
+ * always reflects reality when Settings is opened or refreshed.
+ */
+export interface DesktopIntegrationState {
+  supported: boolean;
+  manageable: boolean;
+  desktopShortcut: ShortcutStatus;
+  startMenuShortcut: ShortcutStatus;
+}
+
+export async function getDesktopIntegration(): Promise<DesktopIntegrationState> {
+  try {
+    return await invoke<DesktopIntegrationState>("get_desktop_integration");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "Windows shortcut status could not be read.",
+    );
+  }
+}
+
+export async function createDesktopShortcut(): Promise<DesktopIntegrationState> {
+  try {
+    return await invoke<DesktopIntegrationState>("create_desktop_shortcut");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The desktop shortcut could not be created.",
+    );
+  }
+}
+
+export async function removeDesktopShortcut(): Promise<DesktopIntegrationState> {
+  try {
+    return await invoke<DesktopIntegrationState>("remove_desktop_shortcut");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The desktop shortcut could not be removed.",
+    );
+  }
+}
+
 export type AcquisitionOrigin = "downloaded" | "cacheHit";
 
 export interface AcquireArtifactRequest {
