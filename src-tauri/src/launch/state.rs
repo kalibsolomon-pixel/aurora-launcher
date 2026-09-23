@@ -5,6 +5,9 @@ pub enum LaunchInstanceStatus {
     Ready,
     Missing,
     Installing,
+    /// The desired configuration no longer matches the installed content;
+    /// installing the new configuration restores launchability.
+    Stale,
     Damaged,
 }
 
@@ -14,6 +17,7 @@ impl LaunchInstanceStatus {
             Self::Ready => "ready",
             Self::Missing => "missing",
             Self::Installing => "installing",
+            Self::Stale => "stale",
             Self::Damaged => "damaged",
         }
     }
@@ -114,6 +118,10 @@ impl PlayReadiness {
             LaunchInstanceStatus::Installing => blockers.push(LaunchBlocker {
                 code: "launch_instance_not_ready",
                 message: "The selected instance has not finished installing.".to_owned(),
+            }),
+            LaunchInstanceStatus::Stale => blockers.push(LaunchBlocker {
+                code: "launch_instance_not_ready",
+                message: "The selected instance's configuration changed; install the new configuration before playing.".to_owned(),
             }),
             LaunchInstanceStatus::Damaged => blockers.push(LaunchBlocker {
                 code: "launch_instance_damaged",

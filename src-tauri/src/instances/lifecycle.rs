@@ -44,6 +44,9 @@ use crate::install::{
     ValidationStatus as GameValidationStatus, install_game as execute_game_install,
     validate_installed_game as validate_game_install,
 };
+use crate::instances::settings::{
+    InstanceConfiguration, InvalidInstanceConfiguration, LoaderCandidate, LoaderPolicy,
+};
 use crate::instances::{
     InstanceId, InstanceRecord, InstanceRegistry, InstanceRegistryError, InstanceState,
     InvalidInstanceRecord, PinnedRelease, generate_instance_id,
@@ -103,24 +106,27 @@ impl InstanceEndpoints {
 }
 
 /// A typed instance-creation request.
+///
+/// Creation asks for the essentials only: a display name and the desired
+/// configuration (Minecraft version, loader kind and policy; everything else
+/// takes safe defaults). The Aurora release and concrete loader version are
+/// resolved by the lifecycle, never chosen by the frontend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateInstanceRequest {
     display_name: String,
-    channel: ReleaseChannel,
-    aurora_version: String,
+    configuration: InstanceConfiguration,
 }
 
 impl CreateInstanceRequest {
-    pub fn new(
-        display_name: impl Into<String>,
-        channel: ReleaseChannel,
-        aurora_version: impl Into<String>,
-    ) -> Self {
+    pub fn new(display_name: impl Into<String>, configuration: InstanceConfiguration) -> Self {
         Self {
             display_name: display_name.into(),
-            channel,
-            aurora_version: aurora_version.into(),
+            configuration,
         }
+    }
+
+    pub fn configuration(&self) -> &InstanceConfiguration {
+        &self.configuration
     }
 }
 
@@ -176,6 +182,10 @@ pub enum InstanceStatus {
     Ready,
     Damaged,
     Installing,
+    /// The desired configuration and the installed content disagree: an
+    /// install-affecting setting changed after the content was installed.
+    /// Stale is never "ready"; installing the new configuration restores it.
+    Stale,
     NotInstalled,
 }
 
@@ -185,6 +195,7 @@ impl InstanceStatus {
             Self::Ready => "ready",
             Self::Damaged => "damaged",
             Self::Installing => "installing",
+            Self::Stale => "stale",
             Self::NotInstalled => "notInstalled",
         }
     }
@@ -221,24 +232,22 @@ pub async fn create_instance(
     progress: &mut (dyn FnMut(InstanceProgress) + Send),
     faults: InstanceFaults,
 ) -> Result<InstanceRecord, InstanceError> {
+    request.configuration().validate()?;
+
     progress(report(InstancePhase::ResolvingRelease, None));
-    let release = endpoints
-        .release_manifest()
-        .resolve_exact(&request.aurora_version, Some(request.channel))
-        .ok_or_else(|| InstanceError::AuroraReleaseNotFound {
-            channel: request.channel,
-            aurora_version: request.aurora_version.clone(),
-        })?;
+    let release =
+        resolve_release_for_configuration(endpoints.release_manifest(), request.configuration())?;
+    let loader_version = resolve_loader_version(endpoints, request.configuration()).await?;
 
     let pin = PinnedRelease::new(
         release.channel(),
         release.aurora_version(),
-        release.minecraft_version(),
-        release.fabric_loader_version(),
+        request.configuration().minecraft_version(),
+        loader_version,
     )?;
 
     // Allocate the identity and persist the explicit installing record.
-    // Display-name validation happens in record construction â€” before
+    // Display-name validation happens in record construction — before
     // anything is written.
     let instance_id = allocate_instance_id(managed, registry_path)?;
     let record = InstanceRecord::new(
@@ -246,6 +255,7 @@ pub async fn create_instance(
         request.display_name,
         InstanceState::Installing,
         pin,
+        request.configuration,
     )?;
 
     {
@@ -317,6 +327,203 @@ pub async fn retry_instance_install(
 
     select_instance_if_unselected(config_path, record.id())?;
 
+    Ok(record)
+}
+
+/// Resolves the Aurora release a configuration's Minecraft version requires.
+///
+/// The release manifest maps each release to one Minecraft version; when
+/// several releases target the same version, the most stable channel wins
+/// deterministically. No release matching the version is an explicit,
+/// honest error — game configuration and Aurora release compatibility stay
+/// separate concepts, and an unavailable combination is never silently
+/// substituted.
+fn resolve_release_for_configuration(
+    manifest: &ReleaseManifest,
+    configuration: &InstanceConfiguration,
+) -> Result<crate::distribution::AuroraRelease, InstanceError> {
+    fn channel_preference(channel: ReleaseChannel) -> u8 {
+        match channel {
+            ReleaseChannel::Stable => 0,
+            ReleaseChannel::Beta => 1,
+            ReleaseChannel::Nightly => 2,
+        }
+    }
+
+    let mut matching: Vec<&crate::distribution::AuroraRelease> = manifest
+        .releases()
+        .iter()
+        .filter(|release| release.minecraft_version() == configuration.minecraft_version())
+        .collect();
+    matching.sort_by_key(|release| channel_preference(release.channel()));
+
+    matching
+        .into_iter()
+        .next()
+        .cloned()
+        .ok_or_else(|| InstanceError::ReleaseUnavailable {
+            minecraft_version: configuration.minecraft_version().to_owned(),
+            available: manifest
+                .releases()
+                .iter()
+                .map(|release| release.minecraft_version().to_owned())
+                .collect::<Vec<_>>()
+                .join(", "),
+        })
+}
+
+/// Resolves the concrete Fabric Loader version a configuration's loader
+/// policy selects, from the official per-game list (newest first).
+async fn resolve_loader_version(
+    endpoints: &InstanceEndpoints,
+    configuration: &InstanceConfiguration,
+) -> Result<String, InstanceError> {
+    let game =
+        crate::minecraft::metadata::MinecraftVersionId::new(configuration.minecraft_version())
+            .map_err(|error| {
+                InstanceError::ConfigurationInvalid(InvalidInstanceConfiguration::MinecraftVersion(
+                    error,
+                ))
+            })?;
+    let entries = crate::fabric::metadata::fetch_game_loader_versions(
+        &endpoints.fabric,
+        &game,
+        endpoints.install.download_options(),
+    )
+    .await
+    .map_err(InstanceError::FabricMetadata)?;
+    let candidates: Vec<LoaderCandidate> = entries
+        .iter()
+        .map(|entry| LoaderCandidate {
+            version: entry.version.clone(),
+            stable: entry.stable,
+        })
+        .collect();
+    configuration
+        .loader()
+        .policy()
+        .resolve(&candidates)
+        .map(str::to_owned)
+        .ok_or_else(|| InstanceError::LoaderResolution {
+            game: configuration.minecraft_version().to_owned(),
+            reason: match configuration.loader().policy() {
+                LoaderPolicy::Automatic => {
+                    "no stable Fabric Loader version is available for this Minecraft version"
+                        .to_owned()
+                }
+                LoaderPolicy::Pinned { version } => {
+                    format!("Fabric Loader {version} is not available for this Minecraft version")
+                }
+            },
+        })
+}
+
+/// Atomically persists a new desired configuration for one ready instance.
+///
+/// The persisted change is metadata only: identifiers, filesystem paths, and
+/// installed content are untouched. The release fixture must support the
+/// configured Minecraft version (an offline, honest compatibility check);
+/// loader-version compatibility is verified when the configuration is
+/// installed. Readiness reflects the change immediately: deep validation
+/// reports the instance as stale until the content is reinstalled.
+pub fn update_instance_configuration(
+    registry_path: &Path,
+    endpoints: &InstanceEndpoints,
+    instance_id: &InstanceId,
+    configuration: InstanceConfiguration,
+) -> Result<InstanceRecord, InstanceError> {
+    configuration.validate()?;
+    resolve_release_for_configuration(endpoints.release_manifest(), &configuration)?;
+
+    let _guard = registry_lock();
+    let mut registry = InstanceRegistry::load(registry_path)?;
+    let record = registry
+        .find_mut(instance_id)
+        .ok_or_else(|| InstanceError::NotFound {
+            instance_id: instance_id.to_string(),
+        })?;
+    if record.state() != InstanceState::Ready {
+        return Err(InstanceError::NotReady {
+            instance_id: instance_id.to_string(),
+            reason: "finish or retry the current installation before changing the configuration"
+                .to_owned(),
+        });
+    }
+    record.set_configuration(configuration);
+    let updated = record.clone();
+    registry.save(registry_path)?;
+    Ok(updated)
+}
+
+/// Resolves an existing instance's desired configuration into a new release
+/// pin and (re)installs the content to match it.
+///
+/// This is the deliberate path for install-affecting configuration changes:
+/// the new pin and an `installing` state are persisted before the long
+/// installation runs (identical failure semantics to creation), the Phase 5
+/// staged replacement swaps the previous complete installation only at
+/// commit, and user data is never touched. On failure the record stays
+/// retryable with the new pin; the previous installation remains on disk
+/// until a successful replacement commits over it.
+pub async fn install_instance_configuration(
+    managed: &ManagedPaths,
+    registry_path: &Path,
+    config_path: &Path,
+    endpoints: &InstanceEndpoints,
+    instance_id: &InstanceId,
+    progress: &mut (dyn FnMut(InstanceProgress) + Send),
+    faults: InstanceFaults,
+) -> Result<InstanceRecord, InstanceError> {
+    let configuration = {
+        let _guard = registry_lock();
+        let registry = InstanceRegistry::load(registry_path)?;
+        let record =
+            registry
+                .find(instance_id)
+                .cloned()
+                .ok_or_else(|| InstanceError::NotFound {
+                    instance_id: instance_id.to_string(),
+                })?;
+        if record.state() == InstanceState::Installing {
+            return Err(InstanceError::NotReady {
+                instance_id: instance_id.to_string(),
+                reason: "this instance is already installing; retry it instead".to_owned(),
+            });
+        }
+        record.configuration().clone()
+    };
+    configuration.validate()?;
+
+    progress(report(InstancePhase::ResolvingRelease, None));
+    let release = resolve_release_for_configuration(endpoints.release_manifest(), &configuration)?;
+    let loader_version = resolve_loader_version(endpoints, &configuration).await?;
+    let pin = PinnedRelease::new(
+        release.channel(),
+        release.aurora_version(),
+        configuration.minecraft_version(),
+        loader_version,
+    )?;
+
+    let mut record = {
+        let _guard = registry_lock();
+        let mut registry = InstanceRegistry::load(registry_path)?;
+        let stored = registry
+            .find_mut(instance_id)
+            .ok_or_else(|| InstanceError::NotFound {
+                instance_id: instance_id.to_string(),
+            })?;
+        stored.set_release(pin.clone());
+        stored.set_state(InstanceState::Installing);
+        let updated = stored.clone();
+        registry.save(registry_path)?;
+        updated
+    };
+
+    install_instance_components(managed, registry_path, endpoints, &record, progress, faults)
+        .await?;
+
+    record.set_state(InstanceState::Ready);
+    select_instance_if_unselected(config_path, record.id())?;
     Ok(record)
 }
 
@@ -705,6 +912,30 @@ pub fn validate_instance(
 
     let mut problems: Vec<InstanceProblem> = Vec::new();
 
+    // Desired configuration versus installed content. This is the deliberate
+    // stale gate: an install-affecting configuration change means the record
+    // is never ready until matching content is installed. Launch-only
+    // settings (memory, JVM arguments, window, name) never participate.
+    let pin = record.release();
+    let configuration_matches = record
+        .configuration()
+        .matches_release_pin(pin.minecraft_version(), pin.fabric_loader_version());
+    if !configuration_matches {
+        problems.push(InstanceProblem {
+            component: "configuration",
+            reason: format!(
+                "the desired configuration (Minecraft {}{}) does not match the installed content (Minecraft {} + Fabric Loader {}); install the new configuration to restore readiness",
+                record.configuration().minecraft_version(),
+                match record.configuration().loader().policy() {
+                    LoaderPolicy::Automatic => String::new(),
+                    LoaderPolicy::Pinned { version } => format!(" + Fabric Loader {version}"),
+                },
+                pin.minecraft_version(),
+                pin.fabric_loader_version(),
+            ),
+        });
+    }
+
     // Game installation.
     let game_root = managed.instance_paths(record.id()).game().to_path_buf();
     let game_manifest = match validate_game_install(managed, record.id())? {
@@ -758,7 +989,6 @@ pub fn validate_instance(
         };
 
     // Cross-component consistency.
-    let pin = record.release();
     if let Some(aurora) = &aurora_state {
         if aurora.aurora_version() != pin.aurora_version()
             || aurora.channel() != pin.channel()
@@ -798,8 +1028,33 @@ pub fn validate_instance(
         }
     }
 
+    // Desired configuration versus installed content. This is the deliberate
+    // stale gate: an install-affecting configuration change means the record
+    // is never ready until matching content is installed. Launch-only
+    // settings (memory, JVM arguments, window, name) never participate.
+    let configuration_matches = record
+        .configuration()
+        .matches_release_pin(pin.minecraft_version(), pin.fabric_loader_version());
+    if !configuration_matches {
+        problems.push(InstanceProblem {
+            component: "configuration",
+            reason: format!(
+                "the desired configuration (Minecraft {}{}) does not match the installed content (Minecraft {} + Fabric Loader {}); install the new configuration to restore readiness",
+                record.configuration().minecraft_version(),
+                match record.configuration().loader().policy() {
+                    LoaderPolicy::Automatic => String::new(),
+                    LoaderPolicy::Pinned { version } => format!(" + Fabric Loader {version}"),
+                },
+                pin.minecraft_version(),
+                pin.fabric_loader_version(),
+            ),
+        });
+    }
+
     let status = if record.state() == InstanceState::Installing {
         InstanceStatus::Installing
+    } else if !configuration_matches {
+        InstanceStatus::Stale
     } else if problems.is_empty() {
         InstanceStatus::Ready
     } else {
@@ -838,6 +1093,24 @@ pub enum InstanceError {
         reason: String,
     },
     NameInvalid(InvalidInstanceRecord),
+    /// A desired configuration failed validation.
+    ConfigurationInvalid(InvalidInstanceConfiguration),
+    /// The desired configuration does not match the installed content; the
+    /// new configuration must be installed before launch-affecting use.
+    ConfigurationStale {
+        instance_id: String,
+        reason: String,
+    },
+    /// No Aurora release supports the configured Minecraft version.
+    ReleaseUnavailable {
+        minecraft_version: String,
+        available: String,
+    },
+    /// The configured loader policy resolved to no concrete loader version.
+    LoaderResolution {
+        game: String,
+        reason: String,
+    },
     Registry(InstanceRegistryError),
     Config(ConfigError),
     ReleaseInvalid(String),
@@ -847,6 +1120,9 @@ pub enum InstanceError {
     },
     Platform(crate::minecraft::rules::UnsupportedPlatform),
     GameResolution(crate::fabric::GameResolutionError),
+    /// A Fabric Meta document failed to fetch or parse while selecting a
+    /// loader version.
+    FabricMetadata(crate::fabric::metadata::FabricMetadataError),
     GameInstall(InstallError),
     /// Reading a game installed-state manifest failed structurally.
     GameInstallState(crate::install::state::InstalledStateError),
@@ -875,6 +1151,25 @@ impl fmt::Display for InstanceError {
                 )
             }
             Self::NameInvalid(error) => write!(formatter, "{error}"),
+            Self::ConfigurationInvalid(error) => write!(formatter, "{error}"),
+            Self::ConfigurationStale {
+                instance_id,
+                reason,
+            } => write!(
+                formatter,
+                "instance '{instance_id}' has a configuration that no longer matches its installed content: {reason}; install the new configuration to restore readiness"
+            ),
+            Self::ReleaseUnavailable {
+                minecraft_version,
+                available,
+            } => write!(
+                formatter,
+                "no Aurora release supports Minecraft {minecraft_version}; the release source supports: {available}"
+            ),
+            Self::LoaderResolution { game, reason } => write!(
+                formatter,
+                "no Fabric Loader version could be selected for Minecraft {game}: {reason}"
+            ),
             Self::Registry(error) => write!(formatter, "{error}"),
             Self::Config(error) => write!(formatter, "{error}"),
             Self::ReleaseInvalid(reason) => {
@@ -890,6 +1185,7 @@ impl fmt::Display for InstanceError {
             ),
             Self::Platform(error) => write!(formatter, "{error}"),
             Self::GameResolution(error) => write!(formatter, "{error}"),
+            Self::FabricMetadata(error) => write!(formatter, "{error}"),
             Self::GameInstall(error) => write!(formatter, "{error}"),
             Self::GameInstallState(error) => write!(formatter, "{error}"),
             Self::Aurora(error) => write!(formatter, "{error}"),
@@ -912,6 +1208,12 @@ impl std::error::Error for InstanceError {}
 impl From<InvalidInstanceRecord> for InstanceError {
     fn from(error: InvalidInstanceRecord) -> Self {
         Self::NameInvalid(error)
+    }
+}
+
+impl From<InvalidInstanceConfiguration> for InstanceError {
+    fn from(error: InvalidInstanceConfiguration) -> Self {
+        Self::ConfigurationInvalid(error)
     }
 }
 
@@ -1187,6 +1489,15 @@ mod tests {
                     "/v2/versions/loader".to_owned(),
                     loader_list.as_bytes().to_vec(),
                 ),
+                // The per-game loader listing the desired-configuration
+                // resolution consumes (the same single stable entry).
+                (
+                    "/v2/versions/loader/26.2".to_owned(),
+                    format!(
+                        r#"[ {{ "loader": {{ "separator": ".", "build": 5, "maven": "net.fabricmc:fabric-loader:0.19.5", "version": "0.19.5", "stable": true }}, "intermediary": {{ "maven": "net.fabricmc:intermediary:0.0.0", "version": "0.0.0", "stable": true }}, "launcherMeta": {{ "version": 2, "min_java_version": 8, "libraries": {{ "client": [], "common": [], "server": [], "development": [] }}, "mainClass": {{ "client": "net.fabricmc.loader.impl.launch.knot.KnotClient", "server": "net.fabricmc.loader.impl.launch.knot.KnotServer" }} }} }}]"#
+                    )
+                    .into_bytes(),
+                ),
                 (
                     "/v2/versions/loader/26.2/0.19.5".to_owned(),
                     profile_document.replace("@BASE@", &base).into_bytes(),
@@ -1265,12 +1576,24 @@ mod tests {
         }
 
         async fn create(&self, display_name: &str) -> Result<InstanceRecord, InstanceError> {
+            self.create_with_configuration(
+                display_name,
+                InstanceConfiguration::for_minecraft_version("26.2"),
+            )
+            .await
+        }
+
+        async fn create_with_configuration(
+            &self,
+            display_name: &str,
+            configuration: InstanceConfiguration,
+        ) -> Result<InstanceRecord, InstanceError> {
             create_instance(
                 &self.managed,
                 &self.registry_path(),
                 &self.config_path(),
                 &self.endpoints(),
-                CreateInstanceRequest::new(display_name, ReleaseChannel::Stable, "0.3.0"),
+                CreateInstanceRequest::new(display_name, configuration),
                 &mut |_| {},
                 InstanceFaults::default(),
             )
@@ -1287,7 +1610,10 @@ mod tests {
                 &self.registry_path(),
                 &self.config_path(),
                 &self.endpoints(),
-                CreateInstanceRequest::new(display_name, ReleaseChannel::Stable, "0.3.0"),
+                CreateInstanceRequest::new(
+                    display_name,
+                    InstanceConfiguration::for_minecraft_version("26.2"),
+                ),
                 &mut |_| {},
                 faults,
             )
@@ -1369,30 +1695,20 @@ mod tests {
             &world.registry_path(),
             &world.config_path(),
             &world.endpoints(),
-            CreateInstanceRequest::new("Missing", ReleaseChannel::Stable, "0.9.9"),
+            CreateInstanceRequest::new(
+                "Missing",
+                InstanceConfiguration::for_minecraft_version("9.9.9"),
+            ),
             &mut |_| {},
             InstanceFaults::default(),
         )
         .await
-        .expect_err("an unknown release must fail");
+        .expect_err("an unknown Minecraft version must fail");
 
         assert!(
-            matches!(error, InstanceError::AuroraReleaseNotFound { .. }),
+            matches!(error, InstanceError::ReleaseUnavailable { .. }),
             "{error}"
         );
-        // Wrong channel for an existing version is equally refused.
-        let error = create_instance(
-            &world.managed,
-            &world.registry_path(),
-            &world.config_path(),
-            &world.endpoints(),
-            CreateInstanceRequest::new("Wrong Channel", ReleaseChannel::Nightly, "0.3.0"),
-            &mut |_| {},
-            InstanceFaults::default(),
-        )
-        .await
-        .expect_err("a channel mismatch must fail");
-        assert!(matches!(error, InstanceError::AuroraReleaseNotFound { .. }));
 
         assert_eq!(world.load_registry().instances().len(), 0);
         assert!(!world.managed.instances_dir().exists());
@@ -1799,7 +2115,10 @@ mod tests {
             &registry_path,
             &config_path,
             &endpoints,
-            CreateInstanceRequest::new("Progress", ReleaseChannel::Stable, "0.3.0"),
+            CreateInstanceRequest::new(
+                "Progress",
+                InstanceConfiguration::for_minecraft_version("26.2"),
+            ),
             &mut |progress| {
                 if phases.last() != Some(&progress.phase.as_str()) {
                     phases.push(progress.phase.as_str());
@@ -1828,6 +2147,347 @@ mod tests {
             saw_game_progress,
             "the installer's own item progress is embedded, not duplicated"
         );
+    }
+
+    #[tokio::test]
+    async fn launch_only_configuration_changes_never_invalidate_content() {
+        let world = SyntheticWorld::new("launch-only-changes");
+        let record = world.create("Configurable").await.unwrap();
+        let manifest_before = std::fs::read(
+            world
+                .managed
+                .instance_paths(record.id())
+                .game()
+                .join("installed-game.json"),
+        )
+        .unwrap();
+
+        // Memory, JVM arguments, window, and rename: all persisted, none
+        // install-affecting.
+        let mut configuration = record.configuration().clone();
+        configuration.set_memory_mib(8192);
+        configuration.set_additional_jvm_arguments("-Dexample=value");
+        configuration.set_window(Some(crate::instances::settings::WindowConfiguration::new(
+            1280, 720,
+        )));
+        let updated = update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            record.id(),
+            configuration,
+        )
+        .unwrap();
+        assert_eq!(updated.configuration().memory_mib(), 8192);
+        assert_eq!(
+            updated.configuration().additional_jvm_arguments(),
+            "-Dexample=value"
+        );
+
+        rename_instance(&world.registry_path(), record.id(), "Renamed Configurable").unwrap();
+
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+        assert_eq!(
+            std::fs::read(
+                world
+                    .managed
+                    .instance_paths(record.id())
+                    .game()
+                    .join("installed-game.json"),
+            )
+            .unwrap(),
+            manifest_before,
+            "launch-only changes never rewrite installed state"
+        );
+
+        // Round-trip: the registry persists the new values.
+        let stored = world.load_registry().find(record.id()).unwrap().clone();
+        assert_eq!(stored.display_name(), "Renamed Configurable");
+        assert_eq!(stored.configuration().memory_mib(), 8192);
+    }
+
+    #[tokio::test]
+    async fn an_install_affecting_change_makes_the_instance_stale_until_reinstalled() {
+        let world = SyntheticWorld::new("stale-cycle");
+        let record = world.create("Stale Me").await.unwrap();
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+
+        // Change to the other Minecraft version the synthetic release
+        // fixture... does not have. The release manifest here pins 26.2, so
+        // an unsupported version is refused up front by the honest
+        // compatibility gate.
+        let mut unsupported = record.configuration().clone();
+        unsupported.set_minecraft_version("9.9.9");
+        let error = update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            record.id(),
+            unsupported,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, InstanceError::ReleaseUnavailable { .. }),
+            "{error}"
+        );
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+
+        // A pinned loader change stays within release compatibility and is
+        // accepted — then reported stale until installed. The synthetic
+        // Fabric Meta only lists 0.19.5, so use it as both old and new pin
+        // through the automatic policy flip: pin to the same version.
+        let mut configuration = record.configuration().clone();
+        configuration.set_loader(crate::instances::settings::LoaderConfiguration::fabric(
+            crate::instances::settings::LoaderPolicy::Pinned {
+                version: "0.19.5".to_owned(),
+            },
+        ));
+        // Same resolved versions: this is a no-op, still ready.
+        update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            record.id(),
+            configuration.clone(),
+        )
+        .unwrap();
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+
+        // Now make it genuinely stale: pin a loader the record does not have.
+        // Build a second Fabric Meta document set by editing the registry pin
+        // directly would bypass the API; instead change the Minecraft version
+        // through a second synthetic release entry. The world serves one
+        // release (26.2), so the supported in-world path to staleness is a
+        // registry-level configuration edit mirroring what
+        // update_instance_configuration persists for a matching release but
+        // a different loader — represented here through the pinned policy
+        // against the installed pin.
+        configuration.set_loader(crate::instances::settings::LoaderConfiguration::fabric(
+            crate::instances::settings::LoaderPolicy::Pinned {
+                version: "0.18.9".to_owned(),
+            },
+        ));
+        // 0.18.9 does not exist in the synthetic loader list; updating must
+        // still persist (compatibility is verified at install), then report
+        // stale.
+        let updated = update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            record.id(),
+            configuration,
+        )
+        .unwrap();
+        assert_eq!(
+            world.validate(record.id()).status,
+            InstanceStatus::Stale,
+            "a pinned loader mismatch must be stale"
+        );
+        // ...but the previous installation is intact and user data is safe.
+        assert!(
+            world
+                .managed
+                .instance_paths(record.id())
+                .game()
+                .join("installed-game.json")
+                .is_file()
+        );
+        let _ = updated;
+
+        // Installing the stale configuration resolves its loader against the
+        // synthetic list: 0.18.9 is not available, so the install fails
+        // honestly before anything is mutated — the record stays exactly as
+        // it was (ready, stale) and the install can be re-attempted after
+        // repairing the configuration.
+        let error = install_instance_configuration(
+            &world.managed,
+            &world.registry_path(),
+            &world.config_path(),
+            &world.endpoints(),
+            record.id(),
+            &mut |_| {},
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, InstanceError::LoaderResolution { .. }),
+            "{error}"
+        );
+        let registry = world.load_registry();
+        assert_eq!(
+            registry.find(record.id()).unwrap().state(),
+            InstanceState::Ready,
+            "a resolution failure mutates nothing"
+        );
+        assert_eq!(
+            world.validate(record.id()).status,
+            InstanceStatus::Stale,
+            "the configuration mismatch is still reported"
+        );
+
+        // Repair the configuration back to the installed pin and install:
+        // readiness is restored without destroying anything.
+        let mut repaired = record.configuration().clone();
+        repaired.set_loader(crate::instances::settings::LoaderConfiguration::fabric(
+            crate::instances::settings::LoaderPolicy::Pinned {
+                version: "0.19.5".to_owned(),
+            },
+        ));
+        update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            record.id(),
+            repaired,
+        )
+        .unwrap();
+        let ready = install_instance_configuration(
+            &world.managed,
+            &world.registry_path(),
+            &world.config_path(),
+            &world.endpoints(),
+            record.id(),
+            &mut |_| {},
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.state(), InstanceState::Ready);
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn invalid_configurations_are_refused_before_anything_is_persisted() {
+        let world = SyntheticWorld::new("invalid-config");
+        let record = world.create("Guarded").await.unwrap();
+
+        // Memory out of range.
+        let mut bad_memory = record.configuration().clone();
+        bad_memory.set_memory_mib(64);
+        assert!(matches!(
+            update_instance_configuration(
+                &world.registry_path(),
+                &world.endpoints(),
+                record.id(),
+                bad_memory
+            ),
+            Err(InstanceError::ConfigurationInvalid(
+                crate::instances::settings::InvalidInstanceConfiguration::MemoryOutOfRange { .. }
+            ))
+        ));
+
+        // Heap-conflicting JVM arguments.
+        let mut bad_arguments = record.configuration().clone();
+        bad_arguments.set_additional_jvm_arguments("-Xmx12G");
+        assert!(matches!(
+            update_instance_configuration(
+                &world.registry_path(),
+                &world.endpoints(),
+                record.id(),
+                bad_arguments
+            ),
+            Err(InstanceError::ConfigurationInvalid(
+                crate::instances::settings::InvalidInstanceConfiguration::JvmArguments(_)
+            ))
+        ));
+
+        // Malformed JVM argument quoting.
+        let mut bad_quotes = record.configuration().clone();
+        bad_quotes.set_additional_jvm_arguments(r#"-Dbroken="unclosed"#);
+        assert!(matches!(
+            update_instance_configuration(
+                &world.registry_path(),
+                &world.endpoints(),
+                record.id(),
+                bad_quotes
+            ),
+            Err(InstanceError::ConfigurationInvalid(
+                crate::instances::settings::InvalidInstanceConfiguration::JvmArguments(_)
+            ))
+        ));
+
+        // A traversal-shaped Minecraft version.
+        let mut bad_version = record.configuration().clone();
+        bad_version.set_minecraft_version("../evil");
+        assert!(matches!(
+            update_instance_configuration(
+                &world.registry_path(),
+                &world.endpoints(),
+                record.id(),
+                bad_version
+            ),
+            Err(InstanceError::ConfigurationInvalid(
+                crate::instances::settings::InvalidInstanceConfiguration::MinecraftVersion(_)
+            ))
+        ));
+
+        // Nothing above reached the registry.
+        let stored = world.load_registry().find(record.id()).unwrap().clone();
+        assert_eq!(
+            stored.configuration(),
+            record.configuration(),
+            "refused updates persist nothing"
+        );
+        assert_eq!(world.validate(record.id()).status, InstanceStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn configuration_updates_require_a_ready_instance() {
+        let world = SyntheticWorld::new("update-guards");
+        world.break_path("/mojang/client.jar");
+        let error = world
+            .create_with_faults("Half Installed", InstanceFaults::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, InstanceError::GameInstall(_)));
+
+        let registry = world.load_registry();
+        let installing = registry.instances()[0].id().clone();
+        let result = update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            &installing,
+            InstanceConfiguration::for_minecraft_version("26.2"),
+        );
+        assert!(matches!(result, Err(InstanceError::NotReady { .. })));
+
+        let ghost = crate::instances::InstanceId::new("ghost").unwrap();
+        let result = update_instance_configuration(
+            &world.registry_path(),
+            &world.endpoints(),
+            &ghost,
+            InstanceConfiguration::for_minecraft_version("26.2"),
+        );
+        assert!(matches!(result, Err(InstanceError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn automatic_loader_policy_resolves_the_newest_stable_loader() {
+        let world = SyntheticWorld::new("automatic-loader");
+        // The synthetic loader list serves 0.19.5 as the single stable entry.
+        let record = world
+            .create_with_configuration(
+                "Automatic",
+                InstanceConfiguration::for_minecraft_version("26.2"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(record.release().fabric_loader_version(), "0.19.5");
+
+        // A pinned policy for an unlisted loader fails at creation before
+        // any record is persisted.
+        let mut pinned = InstanceConfiguration::for_minecraft_version("26.2");
+        pinned.set_loader(crate::instances::settings::LoaderConfiguration::fabric(
+            crate::instances::settings::LoaderPolicy::Pinned {
+                version: "0.99.0".to_owned(),
+            },
+        ));
+        let error = world
+            .create_with_configuration("Pinned Missing", pinned)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, InstanceError::LoaderResolution { .. }),
+            "{error}"
+        );
+        // The failed attempt persisted nothing: one record total.
+        assert_eq!(world.load_registry().instances().len(), 1);
     }
 
     /// Controlled live instance creation against the real official Mojang
@@ -1889,7 +2549,10 @@ mod tests {
             &managed.instance_registry_file(),
             &managed.config_file(),
             &endpoints,
-            CreateInstanceRequest::new("Live Verification", ReleaseChannel::Stable, "0.3.0"),
+            CreateInstanceRequest::new(
+                "Live Verification",
+                InstanceConfiguration::for_minecraft_version("26.2"),
+            ),
             &mut |progress| {
                 events += 1;
                 let game = progress

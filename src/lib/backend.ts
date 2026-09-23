@@ -299,6 +299,32 @@ export async function listAuroraReleases(): Promise<AuroraReleaseSummary[]> {
   }
 }
 
+export interface InstanceLoaderPolicy {
+  type: "automatic" | "pinned";
+  version?: string;
+}
+
+/** The desired loader kind and version policy of one instance. */
+export interface InstanceLoader {
+  kind: "fabric";
+  policy: InstanceLoaderPolicy;
+}
+
+/** A custom windowed resolution, passed to Minecraft's own launch arguments. */
+export interface InstanceWindow {
+  width: number;
+  height: number;
+}
+
+/** The desired configuration of one instance: what the user wants it to be. */
+export interface InstanceConfiguration {
+  minecraftVersion: string;
+  loader: InstanceLoader;
+  memoryMib: number;
+  additionalJvmArguments: string;
+  window: InstanceWindow | null;
+}
+
 export interface InstanceSummary {
   id: string;
   displayName: string;
@@ -307,12 +333,13 @@ export interface InstanceSummary {
   auroraVersion: string;
   minecraftVersion: string;
   fabricLoaderVersion: string;
+  configuration: InstanceConfiguration;
 }
 
 export interface CreateInstanceRequest {
   displayName: string;
-  channel: AuroraChannel;
-  auroraVersion: string;
+  minecraftVersion: string;
+  loaderPolicy: InstanceLoaderPolicy;
 }
 
 /** One lifecycle progress event; game item progress is embedded verbatim. */
@@ -340,6 +367,100 @@ export async function createInstance(
     throw new LauncherBackendError(
       "backend_unavailable",
       "The instance could not be created.",
+    );
+  }
+}
+
+export interface UpdateInstanceConfigurationRequest {
+  instanceId: string;
+  configuration: InstanceConfiguration;
+}
+
+export async function updateInstanceConfiguration(
+  instanceId: string,
+  configuration: InstanceConfiguration,
+): Promise<InstanceSummary> {
+  try {
+    return await invoke<InstanceSummary>("update_instance_configuration", {
+      request: { instanceId, configuration },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The configuration could not be saved.",
+    );
+  }
+}
+
+export async function installInstanceConfiguration(
+  instanceId: string,
+): Promise<InstanceSummary> {
+  try {
+    return await invoke<InstanceSummary>("install_instance_configuration", {
+      request: { instanceId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The new configuration could not be installed.",
+    );
+  }
+}
+
+/** One Minecraft version from the official Mojang manifest. */
+export interface MinecraftVersion {
+  id: string;
+  versionType: "release" | "snapshot";
+}
+
+export async function listMinecraftVersions(
+  includeSnapshots: boolean,
+): Promise<MinecraftVersion[]> {
+  try {
+    return await invoke<MinecraftVersion[]>("list_minecraft_versions", {
+      includeSnapshots,
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The Minecraft version list could not be loaded.",
+    );
+  }
+}
+
+/** One Fabric Loader version available for a Minecraft version. */
+export interface FabricLoaderVersion {
+  version: string;
+  stable: boolean;
+}
+
+export async function listFabricLoaderVersions(
+  minecraftVersion: string,
+): Promise<FabricLoaderVersion[]> {
+  try {
+    return await invoke<FabricLoaderVersion[]>("list_fabric_loader_versions", {
+      minecraftVersion,
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The Fabric Loader versions could not be loaded.",
     );
   }
 }
@@ -396,7 +517,12 @@ export async function selectInstance(instanceId: string): Promise<void> {
   }
 }
 
-export type InstanceValidationStatus = "ready" | "damaged" | "installing" | "notInstalled";
+export type InstanceValidationStatus =
+  | "ready"
+  | "damaged"
+  | "installing"
+  | "stale"
+  | "notInstalled";
 
 export interface InstanceProblem {
   component: string;
@@ -607,7 +733,12 @@ export async function refreshAccountSession(accountId: string): Promise<AccountS
   }
 }
 
-export type LaunchInstanceStatus = "ready" | "missing" | "installing" | "damaged";
+export type LaunchInstanceStatus =
+  | "ready"
+  | "missing"
+  | "installing"
+  | "damaged"
+  | "stale";
 export type LaunchRuntimeStatus = "ready" | "missing" | "damaged" | "unresolved";
 export type LaunchAccountStatus =
   | "ready"

@@ -145,6 +145,19 @@ impl FabricMetaEndpoints {
         self.join("versions/loader")
     }
 
+    /// The per-game loader listing: `/versions/loader/<game>`, whose entries
+    /// combine the loader, intermediary, and launcher metadata.
+    fn game_loader_versions_url(
+        &self,
+        game: &crate::minecraft::metadata::MinecraftVersionId,
+    ) -> Url {
+        let mut url = self.loader_versions_url();
+        url.path_segments_mut()
+            .expect("the Fabric Meta base has path segments")
+            .push(game.as_str());
+        url
+    }
+
     fn loader_profile_url(
         &self,
         game: &crate::minecraft::metadata::MinecraftVersionId,
@@ -435,6 +448,60 @@ pub async fn fetch_loader_versions(
     let bytes = fetch_document(&endpoints.loader_versions_url(), options).await?;
     let text = bytes_to_document_text(&bytes)?;
     LoaderVersionEntry::list_from_json(&text)
+}
+
+/// One entry of the per-game loader listing: only the `loader` identity is
+/// consumed; the per-entry `intermediary` and `launcherMeta` blocks are the
+/// profile document's business and deliberately ignored here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GameLoaderEntry {
+    loader: LoaderVersionEntry,
+}
+
+/// Fetches the loader versions available for one exact Minecraft version,
+/// newest first, with the official `stable` markers preserved.
+///
+/// An unsupported game version is Fabric Meta's own HTTP 400; an empty list
+/// is returned honestly when the combination has no loaders.
+pub async fn fetch_game_loader_versions(
+    endpoints: &FabricMetaEndpoints,
+    game: &crate::minecraft::metadata::MinecraftVersionId,
+    options: &DownloadOptions,
+) -> Result<Vec<LoaderVersionEntry>, FabricMetadataError> {
+    let url = endpoints.game_loader_versions_url(game);
+    let bytes = fetch_document(&url, options).await?;
+    let text = bytes_to_document_text(&bytes)?;
+    let entries: Vec<GameLoaderEntry> =
+        serde_json::from_str(&text).map_err(|error| FabricMetadataError::Malformed {
+            reason: format!(
+                "the Fabric Loader list for Minecraft '{}' is unusable: {error}",
+                game.as_str()
+            ),
+        })?;
+
+    let loaders: Vec<LoaderVersionEntry> = entries.into_iter().map(|entry| entry.loader).collect();
+    for entry in &loaders {
+        if entry.version.trim().is_empty() || entry.version.len() > MAX_LOADER_VERSION_LENGTH {
+            return Err(FabricMetadataError::Malformed {
+                reason: format!(
+                    "a listed loader version must be 1 to {MAX_LOADER_VERSION_LENGTH} non-whitespace characters ('{}' is not)",
+                    entry.version
+                ),
+            });
+        }
+        if entry.maven.trim().is_empty() {
+            return Err(FabricMetadataError::Malformed {
+                reason: format!(
+                    "listed loader version '{}' has no Maven coordinate",
+                    entry.version
+                ),
+            });
+        }
+    }
+
+    // Fabric Meta serves the list newest first; document order is preserved
+    // so the automatic policy's "first stable entry" means newest stable.
+    Ok(loaders)
 }
 
 /// Fetches and parses the loader profile document for one exact combination.

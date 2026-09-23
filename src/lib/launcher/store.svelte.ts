@@ -11,7 +11,10 @@ import {
   getLauncherState,
   getPlayReadiness,
   installGame,
+  installInstanceConfiguration,
   listAuroraReleases,
+  listFabricLoaderVersions,
+  listMinecraftVersions,
   planFabricInstall,
   planMinecraftInstall,
   playInstance,
@@ -21,6 +24,7 @@ import {
   retryInstanceInstall,
   selectAccount,
   selectInstance,
+  updateInstanceConfiguration,
   validateInstance,
   validateInstalledGame,
   LauncherBackendError,
@@ -30,9 +34,10 @@ import {
   type AccountsState,
   type ApplicationStatus,
   type AuroraReleaseSummary,
-  type AuroraChannel,
   type AuthProgressEvent,
+  type FabricLoaderVersion,
   type FabricPlanSummary,
+  type InstanceConfiguration,
   type InstalledGameSummary,
   type InstalledGameValidation,
   type InstanceProgressEvent,
@@ -43,6 +48,7 @@ import {
   type LaunchProcess,
   type LaunchProgressEvent,
   type MinecraftPlanSummary,
+  type MinecraftVersion,
   type PlayReadiness,
   type RuntimeProgressEvent,
   type RuntimeStatusDto,
@@ -71,15 +77,34 @@ class LauncherStore {
 
   // Instance management. All state comes from Rust.
   createDisplayName = $state("");
-  createChannel = $state<AuroraChannel>("stable");
-  createVersion = $state("");
+  createMinecraftVersion = $state("");
+  createLoaderPolicy = $state<{ type: "automatic" | "pinned"; version?: string }>({
+    type: "automatic",
+  });
+  createIncludeSnapshots = $state(false);
   createBusy = $state(false);
   createProgress = $state<InstanceProgressEvent | null>(null);
   createError = $state<LauncherBackendError | null>(null);
+  minecraftVersions = $state<MinecraftVersion[] | null>(null);
+  minecraftVersionsBusy = $state(false);
+  minecraftVersionsError = $state<LauncherBackendError | null>(null);
+  loaderVersions = $state<FabricLoaderVersion[] | null>(null);
+  loaderVersionsBusy = $state(false);
+  loaderVersionsError = $state<LauncherBackendError | null>(null);
   renaming = $state<{ id: string; name: string } | null>(null);
   instanceBusy = $state<string | null>(null);
   instanceValidations = $state<Record<string, InstanceValidationDto>>({});
   instanceError = $state<LauncherBackendError | null>(null);
+
+  // Per-instance detail editing. The draft is a copy of the instance's
+  // desired configuration; Save sends the whole proposed configuration
+  // atomically.
+  detailId = $state<string | null>(null);
+  detailDraft = $state<InstanceConfiguration | null>(null);
+  detailDirty = $state(false);
+  detailBusy = $state(false);
+  detailError = $state<LauncherBackendError | null>(null);
+  detailInstallBusy = $state(false);
 
   // Managed Java runtime for the selected instance.
   runtimeStatus = $state<RuntimeStatusDto | null>(null);
@@ -180,11 +205,6 @@ class LauncherStore {
 
     try {
       this.releases = await listAuroraReleases();
-      const preferred = this.releases.find((release) => release.channel === "stable");
-      if (preferred) {
-        this.createChannel = preferred.channel;
-        this.createVersion = preferred.auroraVersion;
-      }
     } catch (cause: unknown) {
       this.releasesError = backendError(cause, "The Aurora release list failed.");
     }
@@ -282,6 +302,41 @@ class LauncherStore {
     }
   }
 
+  async loadMinecraftVersions(includeSnapshots: boolean): Promise<void> {
+    this.minecraftVersionsBusy = true;
+    this.minecraftVersionsError = null;
+    try {
+      this.minecraftVersions = await listMinecraftVersions(includeSnapshots);
+    } catch (cause: unknown) {
+      this.minecraftVersionsError = backendError(
+        cause,
+        "The Minecraft version list could not be loaded.",
+      );
+    } finally {
+      this.minecraftVersionsBusy = false;
+    }
+  }
+
+  async loadLoaderVersions(minecraftVersion: string): Promise<void> {
+    if (minecraftVersion.trim() === "") {
+      this.loaderVersions = null;
+      return;
+    }
+    this.loaderVersionsBusy = true;
+    this.loaderVersionsError = null;
+    try {
+      this.loaderVersions = await listFabricLoaderVersions(minecraftVersion.trim());
+    } catch (cause: unknown) {
+      this.loaderVersions = null;
+      this.loaderVersionsError = backendError(
+        cause,
+        "The Fabric Loader versions could not be loaded.",
+      );
+    } finally {
+      this.loaderVersionsBusy = false;
+    }
+  }
+
   async runCreateInstance(): Promise<void> {
     this.createBusy = true;
     this.createProgress = null;
@@ -290,8 +345,8 @@ class LauncherStore {
     try {
       await createInstance({
         displayName: this.createDisplayName.trim(),
-        channel: this.createChannel,
-        auroraVersion: this.createVersion,
+        minecraftVersion: this.createMinecraftVersion,
+        loaderPolicy: this.createLoaderPolicy,
       });
       this.createDisplayName = "";
       await this.refreshState();
@@ -300,6 +355,72 @@ class LauncherStore {
       await this.refreshState();
     } finally {
       this.createBusy = false;
+    }
+  }
+
+  /** Opens the detail editor with a copy of the instance's configuration. */
+  openDetail(id: string): void {
+    const instance = this.launcherState?.instances.find((entry) => entry.id === id);
+    if (!instance) return;
+    this.detailId = id;
+    this.detailDraft = $state.snapshot(instance.configuration);
+    this.detailDirty = false;
+    this.detailError = null;
+    this.detailInstallBusy = false;
+    if (this.loaderVersions === null) {
+      void this.loadLoaderVersions(instance.configuration.minecraftVersion);
+    }
+  }
+
+  closeDetail(): void {
+    if (this.detailBusy || this.detailInstallBusy) return;
+    this.detailId = null;
+    this.detailDraft = null;
+    this.detailDirty = false;
+    this.detailError = null;
+  }
+
+  /** Saves the whole proposed configuration atomically. */
+  async runSaveConfiguration(): Promise<void> {
+    if (!this.detailId || !this.detailDraft) return;
+    this.detailBusy = true;
+    this.detailError = null;
+    try {
+      await updateInstanceConfiguration(this.detailId, this.detailDraft);
+      this.detailDirty = false;
+      await this.refreshState();
+      void this.refreshPlayReadiness();
+      // Reflect the persisted draft back from Rust-owned state.
+      const updated = this.launcherState?.instances.find(
+        (entry) => entry.id === this.detailId,
+      );
+      if (updated) this.detailDraft = $state.snapshot(updated.configuration);
+    } catch (cause: unknown) {
+      this.detailError = backendError(cause, "The configuration could not be saved.");
+    } finally {
+      this.detailBusy = false;
+    }
+  }
+
+  /** Installs the instance's saved configuration (install-affecting changes). */
+  async runInstallConfiguration(): Promise<void> {
+    if (!this.detailId) return;
+    this.detailInstallBusy = true;
+    this.detailError = null;
+    try {
+      await installInstanceConfiguration(this.detailId);
+      await this.refreshState();
+      void this.refreshPlayReadiness();
+      const updated = this.launcherState?.instances.find(
+        (entry) => entry.id === this.detailId,
+      );
+      if (updated) this.detailDraft = $state.snapshot(updated.configuration);
+      this.detailDirty = false;
+    } catch (cause: unknown) {
+      this.detailError = backendError(cause, "The new configuration could not be installed.");
+      await this.refreshState();
+    } finally {
+      this.detailInstallBusy = false;
     }
   }
 
@@ -327,6 +448,7 @@ class LauncherStore {
       await renameInstance(this.renaming.id, this.renaming.name.trim());
       this.renaming = null;
       await this.refreshState();
+      void this.refreshPlayReadiness();
     } catch (cause: unknown) {
       this.instanceError = backendError(cause, "The rename failed.");
     } finally {
@@ -341,6 +463,7 @@ class LauncherStore {
     try {
       await retryInstanceInstall(id);
       await this.refreshState();
+      void this.refreshPlayReadiness();
     } catch (cause: unknown) {
       this.instanceError = backendError(cause, "The retry failed.");
       await this.refreshState();
@@ -354,6 +477,7 @@ class LauncherStore {
     this.instanceError = null;
     try {
       this.instanceValidations[id] = await validateInstance(id);
+      void this.refreshPlayReadiness();
     } catch (cause: unknown) {
       this.instanceError = backendError(cause, "The validation failed.");
     } finally {

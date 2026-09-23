@@ -51,6 +51,26 @@
           : "Deep validation found problems.",
       };
     }
+    if (validation?.status === "stale") {
+      return {
+        tone: "status-warning" as const,
+        label: "Needs install",
+        detail:
+          "The configuration changed — install the new configuration from the instance's settings.",
+      };
+    }
+    if (
+      instance.configuration.minecraftVersion !== instance.minecraftVersion ||
+      (instance.configuration.loader.policy.type === "pinned" &&
+        instance.configuration.loader.policy.version !== instance.fabricLoaderVersion)
+    ) {
+      return {
+        tone: "status-warning" as const,
+        label: "Needs install",
+        detail:
+          "The configuration changed — install the new configuration from the instance's settings.",
+      };
+    }
     if (validation?.status === "ready") {
       return {
         tone: "status-success" as const,

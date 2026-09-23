@@ -135,6 +135,9 @@ pub struct InstanceSummary {
     aurora_version: String,
     minecraft_version: String,
     fabric_loader_version: String,
+    /// The desired configuration, verbatim. The UI edits a draft and sends
+    /// the whole proposed configuration to `update_instance_configuration`.
+    configuration: InstanceConfigurationDto,
 }
 
 impl InstanceSummary {
@@ -147,7 +150,91 @@ impl InstanceSummary {
             aurora_version: record.release().aurora_version().to_owned(),
             minecraft_version: record.release().minecraft_version().to_owned(),
             fabric_loader_version: record.release().fabric_loader_version().to_owned(),
+            configuration: InstanceConfigurationDto::from_configuration(record.configuration()),
         }
+    }
+}
+
+/// The desired instance configuration as it crosses the command boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceConfigurationDto {
+    pub minecraft_version: String,
+    pub loader: InstanceLoaderDto,
+    pub memory_mib: u32,
+    pub additional_jvm_arguments: String,
+    pub window: Option<InstanceWindowDto>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceLoaderDto {
+    pub kind: String,
+    pub policy: InstanceLoaderPolicyDto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceWindowDto {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl InstanceConfigurationDto {
+    fn from_configuration(
+        configuration: &crate::instances::settings::InstanceConfiguration,
+    ) -> Self {
+        Self {
+            minecraft_version: configuration.minecraft_version().to_owned(),
+            loader: InstanceLoaderDto {
+                kind: configuration.loader().kind().as_str().to_owned(),
+                policy: match configuration.loader().policy() {
+                    crate::instances::settings::LoaderPolicy::Automatic => {
+                        InstanceLoaderPolicyDto::Automatic
+                    }
+                    crate::instances::settings::LoaderPolicy::Pinned { version } => {
+                        InstanceLoaderPolicyDto::Pinned {
+                            version: version.clone(),
+                        }
+                    }
+                },
+            },
+            memory_mib: configuration.memory_mib(),
+            additional_jvm_arguments: configuration.additional_jvm_arguments().to_owned(),
+            window: configuration.window().map(|window| InstanceWindowDto {
+                width: window.width(),
+                height: window.height(),
+            }),
+        }
+    }
+
+    fn into_configuration(
+        self,
+    ) -> Result<crate::instances::settings::InstanceConfiguration, CommandError> {
+        let kind = match self.loader.kind.as_str() {
+            "fabric" => crate::instances::settings::LoaderKind::Fabric,
+            other => {
+                return Err(CommandError::new(
+                    "instance_configuration_invalid",
+                    format!("mod loader '{other}' is not supported"),
+                ));
+            }
+        };
+        let policy = (&self.loader.policy).try_into()?;
+        Ok(
+            crate::instances::settings::InstanceConfiguration::from_parts(
+                self.minecraft_version.trim(),
+                crate::instances::settings::LoaderConfiguration::from_parts(kind, policy),
+                self.memory_mib,
+                self.additional_jvm_arguments,
+                self.window.map(|window| {
+                    crate::instances::settings::WindowConfiguration::new(
+                        window.width,
+                        window.height,
+                    )
+                }),
+            ),
+        )
     }
 }
 
@@ -856,6 +943,10 @@ impl From<InstanceError> for CommandError {
                     InstanceError::NameInvalid(_) => "instance_name_invalid",
                     InstanceError::ReleaseInvalid(_) => "instance_release_invalid",
                     InstanceError::AuroraReleaseNotFound { .. } => "aurora_release_not_found",
+                    InstanceError::ConfigurationInvalid(_) => "instance_configuration_invalid",
+                    InstanceError::ConfigurationStale { .. } => "instance_not_ready",
+                    InstanceError::ReleaseUnavailable { .. } => "instance_release_invalid",
+                    InstanceError::LoaderResolution { .. } => "fabric_loader_not_found",
                     InstanceError::Platform(_) => "minecraft_platform_unsupported",
                     InstanceError::GameInstallState(_) => "installation_state_invalid",
                     InstanceError::ValidationFailed { .. } => "instance_consistency_failure",
@@ -864,6 +955,7 @@ impl From<InstanceError> for CommandError {
                     | InstanceError::GameInstall(_)
                     | InstanceError::Aurora(_)
                     | InstanceError::GameResolution(_)
+                    | InstanceError::FabricMetadata(_)
                     | InstanceError::RuntimeMetadata(_)
                     | InstanceError::RuntimeInstall(_) => {
                         unreachable!("handled by value above")
@@ -986,26 +1078,43 @@ pub fn list_aurora_releases() -> Result<Vec<AuroraReleaseSummary>, CommandError>
 }
 
 /// Typed request for instance creation.
+///
+/// Creation asks for the essentials: a display name and the desired
+/// configuration's Minecraft version and loader policy; memory, JVM
+/// arguments, and window default safely.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateInstanceRequest {
     display_name: String,
-    channel: ReleaseChannel,
-    aurora_version: String,
+    minecraft_version: String,
+    loader_policy: InstanceLoaderPolicyDto,
 }
 
-/// One lifecycle progress event payload; the game installer's item progress
-/// is embedded verbatim during the game-installation phase.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InstanceProgressEvent {
-    phase: &'static str,
-    game: Option<InstallProgressEvent>,
+/// The loader policy as it crosses the command boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum InstanceLoaderPolicyDto {
+    Automatic,
+    Pinned { version: String },
 }
 
-/// Creates a complete persistent Aurora instance: resolve the release,
-/// install the game through the Phase 5 executor, install Aurora, validate
-/// everything, and mark the instance ready. Progress is reported through
+impl TryFrom<&InstanceLoaderPolicyDto> for crate::instances::settings::LoaderPolicy {
+    type Error = CommandError;
+
+    fn try_from(value: &InstanceLoaderPolicyDto) -> Result<Self, CommandError> {
+        match value {
+            InstanceLoaderPolicyDto::Automatic => Ok(Self::Automatic),
+            InstanceLoaderPolicyDto::Pinned { version } => Ok(Self::Pinned {
+                version: version.trim().to_owned(),
+            }),
+        }
+    }
+}
+
+/// Creates a complete persistent Aurora instance from a desired
+/// configuration: resolve the release and loader version, install the game
+/// through the Phase 5 executor, install Aurora, validate everything, and
+/// mark the instance ready. Progress is reported through
 /// `instance-progress` events.
 #[tauri::command]
 pub async fn create_instance(
@@ -1016,16 +1125,23 @@ pub async fn create_instance(
     let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
 
+    let configuration = crate::instances::settings::InstanceConfiguration::from_parts(
+        request.minecraft_version.trim(),
+        crate::instances::settings::LoaderConfiguration::from_parts(
+            crate::instances::settings::LoaderKind::Fabric,
+            (&request.loader_policy).try_into()?,
+        ),
+        crate::instances::settings::DEFAULT_MEMORY_MIB,
+        String::new(),
+        None,
+    );
+
     let record = crate::instances::lifecycle::create_instance(
         &managed_paths,
         &managed_paths.instance_registry_file(),
         &managed_paths.config_file(),
         &endpoints,
-        LifecycleCreateRequest::new(
-            request.display_name,
-            request.channel,
-            request.aurora_version,
-        ),
+        LifecycleCreateRequest::new(request.display_name.trim(), configuration),
         &mut |progress| {
             let _ = app.emit(
                 "instance-progress",
@@ -1054,6 +1170,15 @@ pub async fn create_instance(
     );
 
     Ok(InstanceSummary::from_record(&record))
+}
+
+/// One lifecycle progress event payload; the game installer's item progress
+/// is embedded verbatim during the game-installation phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceProgressEvent {
+    phase: &'static str,
+    game: Option<InstallProgressEvent>,
 }
 
 /// Typed request for retrying an unfinished instance installation.
@@ -1126,6 +1251,193 @@ pub fn rename_instance(
     )?;
 
     Ok(InstanceSummary::from_record(&record))
+}
+
+/// Typed request for atomically persisting a new desired configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInstanceConfigurationRequest {
+    instance_id: String,
+    configuration: InstanceConfigurationDto,
+}
+
+/// Atomically persists a new desired configuration for one ready instance.
+///
+/// The persisted change is metadata only; installed content, identifiers,
+/// and paths are untouched. Readiness reflects the change immediately — deep
+/// validation reports a stale instance until its new configuration is
+/// installed through `install_instance_configuration`.
+#[tauri::command]
+pub fn update_instance_configuration(
+    app: AppHandle,
+    request: UpdateInstanceConfigurationRequest,
+) -> Result<InstanceSummary, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+    let configuration = request.configuration.into_configuration()?;
+
+    let record = crate::instances::lifecycle::update_instance_configuration(
+        &managed_paths.instance_registry_file(),
+        &endpoints,
+        &instance,
+        configuration,
+    )
+    .map_err(|error| match error {
+        crate::instances::lifecycle::InstanceError::ConfigurationInvalid(reason) => {
+            CommandError::new("instance_configuration_invalid", reason.to_string())
+        }
+        crate::instances::lifecycle::InstanceError::ReleaseUnavailable { .. } => {
+            CommandError::new("instance_release_invalid", error.to_string())
+        }
+        other => CommandError::from(other),
+    })?;
+
+    Ok(InstanceSummary::from_record(&record))
+}
+
+/// Resolves an instance's desired configuration into a new release pin and
+/// (re)installs the content to match it — the deliberate path for
+/// install-affecting configuration changes. Progress is reported through
+/// `instance-progress` events.
+#[tauri::command]
+pub async fn install_instance_configuration(
+    app: AppHandle,
+    request: RetryInstanceRequest,
+) -> Result<InstanceSummary, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+    let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+
+    let record = crate::instances::lifecycle::install_instance_configuration(
+        &managed_paths,
+        &managed_paths.instance_registry_file(),
+        &managed_paths.config_file(),
+        &endpoints,
+        &instance,
+        &mut |progress| {
+            let _ = app.emit(
+                "instance-progress",
+                InstanceProgressEvent {
+                    phase: progress.phase.as_str(),
+                    game: progress.game.map(|game| InstallProgressEvent {
+                        phase: game.phase.as_str(),
+                        completed_items: game.completed_items,
+                        total_items: game.total_items,
+                        current_item: game.current_item,
+                    }),
+                },
+            );
+        },
+        InstanceFaults::default(),
+    )
+    .await
+    .map_err(|error| match error {
+        crate::instances::lifecycle::InstanceError::ConfigurationInvalid(reason) => {
+            CommandError::new("instance_configuration_invalid", reason.to_string())
+        }
+        crate::instances::lifecycle::InstanceError::ReleaseUnavailable { .. } => {
+            CommandError::new("instance_release_invalid", error.to_string())
+        }
+        crate::instances::lifecycle::InstanceError::LoaderResolution { .. } => {
+            CommandError::new("fabric_loader_not_found", error.to_string())
+        }
+        other => CommandError::from(other),
+    })?;
+
+    Ok(InstanceSummary::from_record(&record))
+}
+
+/// One Minecraft version offered for instance configuration, from the
+/// official Mojang manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftVersionDto {
+    id: String,
+    version_type: String,
+}
+
+/// One Fabric Loader version available for a Minecraft version, from the
+/// official Fabric Meta per-game listing (newest first).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FabricLoaderVersionDto {
+    version: String,
+    stable: bool,
+}
+
+/// Lists the Minecraft versions available for instance configuration.
+///
+/// Modern releases and snapshots are served from the pinned official Mojang
+/// manifest, newest first. Historical types are absent because the launcher
+/// deliberately does not support them. `include_snapshots` is an explicit
+/// filter: snapshots never mix into the ordinary release list.
+#[tauri::command]
+pub async fn list_minecraft_versions(
+    include_snapshots: bool,
+) -> Result<Vec<MinecraftVersionDto>, CommandError> {
+    let manifest = crate::minecraft::metadata::fetch_manifest(
+        &MetadataEndpoints::official(),
+        &crate::downloads::DownloadOptions::default(),
+    )
+    .await
+    .map_err(|error| CommandError::from(MinecraftResolutionError::Metadata(error)))?;
+
+    Ok(manifest
+        .versions
+        .iter()
+        .filter(|entry| {
+            matches!(
+                (&entry.kind, include_snapshots),
+                (crate::minecraft::metadata::VersionType::Release, _)
+                    | (crate::minecraft::metadata::VersionType::Snapshot, true)
+            )
+        })
+        .map(|entry| MinecraftVersionDto {
+            id: entry.id.clone(),
+            version_type: entry.kind.as_mojang_str().to_owned(),
+        })
+        .collect())
+}
+
+/// Lists the Fabric Loader versions available for one exact Minecraft
+/// version, newest first, with the official `stable` markers. An
+/// unsupported Minecraft version is Fabric Meta's own answer and surfaces as
+/// `fabric_combination_unsupported`.
+#[tauri::command]
+pub async fn list_fabric_loader_versions(
+    minecraft_version: String,
+) -> Result<Vec<FabricLoaderVersionDto>, CommandError> {
+    let version = MinecraftVersionId::new(minecraft_version.trim())?;
+    let entries = crate::fabric::metadata::fetch_game_loader_versions(
+        &crate::fabric::metadata::FabricMetaEndpoints::official(),
+        &version,
+        &crate::downloads::DownloadOptions::default(),
+    )
+    .await
+    .map_err(FabricMetadataError::from)?;
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| FabricLoaderVersionDto {
+            version: entry.version,
+            stable: entry.stable,
+        })
+        .collect())
+}
+
+impl From<FabricMetadataError> for CommandError {
+    fn from(error: FabricMetadataError) -> Self {
+        // Mirrors the FabricResolutionError mapping for the same conditions.
+        match &error {
+            FabricMetadataError::HttpStatus { status: 400 } => {
+                Self::new("fabric_combination_unsupported", error.to_string())
+            }
+            _ => crate::instances::lifecycle::InstanceError::FabricMetadata(error).into(),
+        }
+    }
 }
 
 /// Typed request for selecting an instance.
@@ -1716,6 +2028,18 @@ async fn calculate_play_readiness(
         Some(record) if record.state() == InstanceState::Installing => {
             (LaunchInstanceStatus::Installing, None)
         }
+        Some(record)
+            if !record.configuration().matches_release_pin(
+                record.release().minecraft_version(),
+                record.release().fabric_loader_version(),
+            ) =>
+        {
+            // The desired configuration no longer matches the installed
+            // content. Stale is distinct from damaged: nothing is wrong with
+            // the installed bytes, they are simply no longer what the user
+            // wants. Installing the new configuration restores launchability.
+            (LaunchInstanceStatus::Stale, None)
+        }
         Some(_) => {
             // This one lifecycle call performs deep content validation and,
             // only after it passes, one exact metadata resolution pass.
@@ -1847,6 +2171,33 @@ pub async fn play_instance(
     .await
     .map_err(launch_plan_error)?;
 
+    // The desired configuration shapes the process: memory, additional JVM
+    // arguments, and the windowed resolution. Stale configuration never
+    // reaches this point — resolve_instance_launch_plans performs the deep
+    // validation that reports staleness as NotReady.
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+    let record = registry
+        .find(&instance)
+        .ok_or_else(|| {
+            CommandError::new("launch_instance_not_ready", "The instance does not exist.")
+        })?
+        .clone();
+    let configuration = record.configuration();
+    configuration
+        .validate()
+        .map_err(|error| CommandError::new("launch_metadata_invalid", error.to_string()))?;
+    let additional_jvm_arguments =
+        crate::instances::settings::parse_jvm_arguments(configuration.additional_jvm_arguments())
+            .map_err(|error| CommandError::new("launch_jvm_arguments_invalid", error.to_string()))?;
+    let launch_options = crate::launch::resolve::LaunchOptions::new(
+        configuration.memory_mib(),
+        additional_jvm_arguments,
+        configuration
+            .window()
+            .map(|window| (window.width(), window.height())),
+    );
+    let features = launch_options.feature_profile();
+
     let runtime = crate::runtime::install::validate_runtime(
         &managed,
         &runtime_plan,
@@ -1930,7 +2281,8 @@ pub async fn play_instance(
         &installed,
         &java_executable,
         &session,
-        &crate::minecraft::rules::FeatureProfile::none(),
+        &features,
+        &launch_options,
     )?;
 
     emit_launch_phase(&app, "startingProcess");

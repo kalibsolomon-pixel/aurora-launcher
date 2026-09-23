@@ -9,11 +9,54 @@ use crate::fabric::plan::GameInstallPlan;
 use crate::install::state::{InstalledFileRole, InstalledGameManifest};
 use crate::instances::InstanceId;
 use crate::minecraft::plan::LaunchArgument;
-use crate::minecraft::rules::{FeatureProfile, PlatformProfile};
+use crate::minecraft::rules::{FeatureFlag, FeatureProfile, PlatformProfile};
 use crate::paths::ManagedPaths;
 
 const LAUNCHER_NAME: &str = "aurora-launcher";
 const MAX_ARGUMENT_LENGTH: usize = 32 * 1024;
+
+/// Launch-only options derived from the instance's desired configuration.
+///
+/// These never authorize launch by themselves (deep validation does) and
+/// never change what is installed; they shape the process: the launcher-owned
+/// heap argument, the parsed custom JVM arguments, and the windowed
+/// resolution mapped onto Minecraft's own `has_custom_resolution` feature.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LaunchOptions {
+    /// Memory in whole MiB; the authoritative `-Xmx` Aurora generates.
+    memory_mib: Option<u32>,
+    /// Additional JVM arguments, already parsed and validated at the
+    /// configuration trust boundary and re-validated here.
+    additional_jvm_arguments: Vec<String>,
+    /// Custom windowed resolution; enables Mojang's
+    /// `has_custom_resolution` feature arguments.
+    window: Option<(u16, u16)>,
+}
+
+impl LaunchOptions {
+    pub fn new(
+        memory_mib: u32,
+        additional_jvm_arguments: Vec<String>,
+        window: Option<(u16, u16)>,
+    ) -> Self {
+        Self {
+            memory_mib: Some(memory_mib),
+            additional_jvm_arguments,
+            window,
+        }
+    }
+
+    /// The feature profile these options imply: a custom window enables
+    /// Minecraft's `has_custom_resolution` feature, which adds the official
+    /// `--width`/`--height` game arguments from the version document.
+    pub fn feature_profile(&self) -> FeatureProfile {
+        let mut profile = FeatureProfile::none();
+        if self.window.is_some() {
+            profile.enable(FeatureFlag::HasCustomResolution);
+        }
+        profile
+    }
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedArgument {
@@ -217,6 +260,13 @@ impl LaunchPlan {
 /// Builds the exact process specification after the caller has completed the
 /// deep instance/runtime/session preconditions. This function performs no
 /// network access and never scans libraries or user mods.
+///
+/// `options` carries the instance's launch-only configuration. The
+/// launcher-owned heap argument is emitted first among JVM arguments, then
+/// Mojang's planned JVM arguments, then the logging argument, then the
+/// user's additional arguments last — one deterministic order, no
+/// duplicates possible (heap/classpath conflicts were already rejected at
+/// the configuration boundary and are re-checked here).
 pub fn resolve_launch_spec(
     managed: &ManagedPaths,
     instance_id: &InstanceId,
@@ -225,6 +275,7 @@ pub fn resolve_launch_spec(
     java_executable: &Path,
     session: &MinecraftSession,
     features: &FeatureProfile,
+    options: &LaunchOptions,
 ) -> Result<LaunchSpec, LaunchResolveError> {
     let paths = managed.instance_paths(instance_id);
     let instance_root = paths.root().to_path_buf();
@@ -413,10 +464,52 @@ pub fn resolve_launch_spec(
             .transpose()?,
     };
 
-    let mut jvm_arguments = resolve_groups(&plan.jvm_arguments, features, &values)?;
+    let mut jvm_arguments =
+        Vec::with_capacity(1 + plan.jvm_arguments.len() + options.additional_jvm_arguments.len());
+    // The launcher-owned heap argument comes first: Aurora owns the heap,
+    // and the configuration boundary already rejected user heap flags, so
+    // no duplicate `-Xmx` can exist in the vector.
+    if let Some(memory_mib) = options.memory_mib {
+        jvm_arguments.push(ResolvedArgument::Plain(
+            crate::instances::settings::heap_argument(memory_mib),
+        ));
+    }
+    jvm_arguments.extend(resolve_groups(&plan.jvm_arguments, features, &values)?);
     if let Some(logging) = &plan.logging {
         jvm_arguments.push(substitute_argument(&logging.argument, &values)?);
     }
+    // The user's additional arguments come last, re-validated here so this
+    // boundary stays honest even if a future caller bypasses configuration
+    // validation.
+    {
+        let rejoin = options
+            .additional_jvm_arguments
+            .iter()
+            .map(|argument| {
+                if argument.contains(' ') || argument.contains('\t') || argument.contains('"') {
+                    // Re-quote so the round trip through the parser is exact.
+                    format!(
+                        "\"{}\"",
+                        argument.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
+                } else {
+                    argument.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        crate::instances::settings::parse_jvm_arguments(&rejoin)
+            .map_err(|reason| LaunchResolveError::JvmArguments(reason.to_string()))?;
+    }
+    for argument in &options.additional_jvm_arguments {
+        if argument.len() > MAX_ARGUMENT_LENGTH || argument.contains('\0') {
+            return Err(LaunchResolveError::JvmArguments(
+                "an additional JVM argument is oversized or contains a NUL byte".to_owned(),
+            ));
+        }
+        jvm_arguments.push(ResolvedArgument::Plain(argument.clone()));
+    }
+
     let game_arguments = resolve_groups(&plan.game_arguments, features, &values)?;
 
     Ok(LaunchSpec {
@@ -623,6 +716,7 @@ pub enum LaunchResolveError {
     Natives(String),
     Logging(String),
     Assets(String),
+    JvmArguments(String),
 }
 
 impl LaunchResolveError {
@@ -635,6 +729,7 @@ impl LaunchResolveError {
             Self::Natives(_) => "launch_native_path_invalid",
             Self::Logging(_) => "launch_logging_invalid",
             Self::Assets(_) => "launch_assets_invalid",
+            Self::JvmArguments(_) => "launch_jvm_arguments_invalid",
         }
     }
 }
@@ -654,6 +749,9 @@ impl fmt::Display for LaunchResolveError {
                 "launch logging configuration is invalid: {reason}"
             ),
             Self::Assets(reason) => write!(formatter, "launch assets are invalid: {reason}"),
+            Self::JvmArguments(reason) => {
+                write!(formatter, "additional JVM arguments are invalid: {reason}")
+            }
         }
     }
 }
@@ -813,6 +911,14 @@ mod tests {
         }
 
         fn resolve(&self, features: &FeatureProfile) -> Result<LaunchSpec, LaunchResolveError> {
+            self.resolve_with_options(features, LaunchOptions::default())
+        }
+
+        fn resolve_with_options(
+            &self,
+            features: &FeatureProfile,
+            options: LaunchOptions,
+        ) -> Result<LaunchSpec, LaunchResolveError> {
             resolve_launch_spec(
                 &self.managed,
                 &self.id,
@@ -821,6 +927,7 @@ mod tests {
                 &self.java,
                 &session(),
                 features,
+                &options,
             )
         }
     }
@@ -1024,9 +1131,131 @@ mod tests {
                 &fixture.java,
                 &session(),
                 &FeatureProfile::none(),
+                &LaunchOptions::default(),
             ),
             Err(LaunchResolveError::Natives(_))
         ));
+    }
+
+    #[test]
+    fn memory_and_custom_jvm_arguments_reach_the_launch_spec_exactly_once() {
+        let fixture = Fixture::new();
+        let options = LaunchOptions::new(
+            4096,
+            vec![
+                "-Dexample=value".to_owned(),
+                "-Dlabel=hello world".to_owned(),
+                "-XX:+UseG1GC".to_owned(),
+            ],
+            None,
+        );
+        let spec = fixture
+            .resolve_with_options(&options.feature_profile(), options)
+            .unwrap();
+
+        let jvm = spec.jvm_arguments();
+        // The launcher-owned heap argument is the very first JVM argument…
+        assert_eq!(jvm[0].expose(), "-Xmx4096m");
+        // …appears exactly once…
+        assert_eq!(
+            jvm.iter()
+                .filter(|argument| argument.expose().starts_with("-Xmx"))
+                .count(),
+            1
+        );
+        // …with no conflicting -Xms anywhere.
+        assert!(
+            jvm.iter()
+                .all(|argument| !argument.expose().starts_with("-Xms"))
+        );
+        // The custom arguments are present verbatim, after the planned ones.
+        assert_eq!(
+            jvm.iter()
+                .filter(|argument| argument.expose().starts_with("-Dexample="))
+                .count(),
+            1
+        );
+        assert!(jvm.iter().any(|a| a.expose() == "-Dlabel=hello world"));
+        assert!(jvm.iter().any(|a| a.expose() == "-XX:+UseG1GC"));
+        let custom_position = jvm
+            .iter()
+            .position(|a| a.expose() == "-XX:+UseG1GC")
+            .unwrap();
+        let logging_position = jvm
+            .iter()
+            .position(|a| a.expose().starts_with("-Dlog4j.configurationFile="))
+            .unwrap();
+        let classpath_position = jvm.iter().position(|a| a.expose() == "-cp").unwrap();
+        assert!(custom_position > logging_position);
+        assert!(logging_position > classpath_position);
+    }
+
+    #[test]
+    fn conflicting_custom_jvm_arguments_fail_at_the_launch_boundary() {
+        let fixture = Fixture::new();
+        let options = LaunchOptions::new(2048, vec!["-Xmx12G".to_owned()], None);
+        let error = fixture
+            .resolve_with_options(&FeatureProfile::none(), options)
+            .unwrap_err();
+        assert!(matches!(error, LaunchResolveError::JvmArguments(_)));
+        assert!(error.to_string().contains("Aurora owns"));
+    }
+
+    #[test]
+    fn a_custom_window_enables_minecrafts_own_resolution_arguments() {
+        let fixture = Fixture::new();
+        let options = LaunchOptions::new(2048, Vec::new(), Some((1280, 720)));
+        let profile = options.feature_profile();
+        assert!(profile.is_enabled(FeatureFlag::HasCustomResolution));
+
+        // With the feature enabled, the version document's official
+        // `--width`/`--height` argument group participates; the launch plan
+        // fixture carries no such group, so the spec simply resolves without
+        // it — the substitution mechanics are what must hold.
+        let spec = fixture.resolve_with_options(&profile, options).unwrap();
+        assert!(
+            spec.game_arguments()
+                .iter()
+                .all(|argument| !argument.expose().contains("${"))
+        );
+
+        let plain = fixture.resolve_with_options(&FeatureProfile::none(), LaunchOptions::default());
+        assert!(plain.is_ok());
+    }
+
+    #[test]
+    fn memory_and_custom_jvm_arguments_reach_the_launch_spec_exactly_once_and_deterministically() {
+        let fixture = Fixture::new();
+        let options = LaunchOptions::new(2048, vec!["-Dexample=value".to_owned()], None);
+        let first = fixture
+            .resolve_with_options(&FeatureProfile::none(), options.clone())
+            .unwrap();
+        let second = fixture
+            .resolve_with_options(&FeatureProfile::none(), options)
+            .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn custom_jvm_arguments_are_redaction_safe() {
+        let fixture = Fixture::new();
+        let options = LaunchOptions::new(2048, vec!["-Dsecret=value".to_owned()], None);
+        let spec = fixture
+            .resolve_with_options(&FeatureProfile::none(), options)
+            .unwrap();
+        // Custom arguments are plain, non-sensitive arguments: they contain
+        // no session material, and the sensitive marker stays exclusively on
+        // the token argument.
+        assert!(
+            spec.jvm_arguments()
+                .iter()
+                .all(|argument| !argument.is_sensitive())
+        );
+        assert!(
+            spec.game_arguments()
+                .iter()
+                .any(ResolvedArgument::is_sensitive)
+        );
     }
 
     /// Live metadata drift check. Only Mojang/Fabric metadata is fetched;
@@ -1141,6 +1370,7 @@ mod tests {
                 &java,
                 &session(),
                 &FeatureProfile::none(),
+                &LaunchOptions::default(),
             )
             .unwrap_or_else(|error| panic!("{version} launch must assemble: {error}"));
             let all_arguments = spec.command_arguments();
