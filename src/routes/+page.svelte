@@ -5,6 +5,7 @@
   import HomePage from "$lib/pages/HomePage.svelte";
   import InstancesPage from "$lib/pages/InstancesPage.svelte";
   import AccountsPage from "$lib/pages/AccountsPage.svelte";
+  import SettingsPage from "$lib/pages/SettingsPage.svelte";
   import AboutPage from "$lib/pages/AboutPage.svelte";
   import DeveloperPage from "$lib/pages/DeveloperPage.svelte";
 
@@ -20,6 +21,7 @@
           { id: "home", label: "Home" },
           { id: "instances", label: "Instances" },
           { id: "accounts", label: "Accounts" },
+          { id: "settings", label: "Settings" },
           { id: "about", label: "About" },
           { id: "developer", label: "Developer" },
         ]
@@ -27,6 +29,7 @@
           { id: "home", label: "Home" },
           { id: "instances", label: "Instances" },
           { id: "accounts", label: "Accounts" },
+          { id: "settings", label: "Settings" },
           { id: "about", label: "About" },
         ],
   );
@@ -52,6 +55,8 @@
     <InstancesPage />
   {:else if page === "accounts"}
     <AccountsPage />
+  {:else if page === "settings"}
+    <SettingsPage />
   {:else if page === "about"}
     <AboutPage />
   {:else if page === "developer" && developerDestination}

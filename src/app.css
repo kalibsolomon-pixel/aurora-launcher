@@ -2,9 +2,20 @@
  * Aurora Launcher design system — tokens and shared primitives.
  * The visual contract is LAUNCHER_DESIGN_LANGUAGE.md; every value here is a
  * token from that document. Components must not introduce one-off literals.
+ *
+ * Layering: THEME → SEMANTIC TOKENS → SHARED PRIMITIVES → PAGES. Themes and
+ * accents are attribute-scoped token sets on the document root
+ * (`data-theme`, `data-accent`); a custom accent is applied as derived
+ * inline custom properties by the appearance store (never user CSS). All
+ * themes are dark and differ only through a coherent surface palette —
+ * never through layout.
  */
 
 :root {
+  /* Every built-in theme is dark; native widgets (select popups, the color
+     picker, number inputs) must render accordingly. */
+  color-scheme: dark;
+
   /* Spacing scale (base 4px) */
   --space-1: 4px;
   --space-2: 8px;
@@ -27,10 +38,28 @@
   --text-metadata: 0.8rem;
   --text-label: 0.75rem;
 
-  /* Surface and color roles (dark theme). Restrained dark-neutral
-     layering: a neutral near-black canvas, quietly elevated surfaces,
-     and the aurora violet reserved for selection, focus, primary
-     actions, and state emphasis — never as a background wash. */
+  /* Shape */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+
+  /* Motion */
+  --motion-fast: 90ms;
+  --motion-base: 150ms;
+  --motion-ease: ease-out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Themes                                                              */
+/*                                                                     */
+/* The default block is the approved Aurora look; the other themes are  */
+/* palette variants of the same visual language. Status colors are      */
+/* semantically stable across themes (they are chosen for dark          */
+/* surfaces, and every theme is dark).                                  */
+/* ------------------------------------------------------------------ */
+
+:root,
+:root[data-theme="aurora-dark"] {
   --color-background: #101116;
   --color-surface: #16171d;
   --color-surface-raised: #1d1f27;
@@ -44,10 +73,7 @@
   --color-text: #edf1fb;
   --color-text-secondary: #a7b0c5;
   --color-text-muted: #76819a;
-  --color-accent: #8b80ff;
-  --color-accent-strong: #6f5df2;
-  --color-accent-soft: rgba(139, 128, 255, 0.14);
-  --color-accent-outline: rgba(139, 128, 255, 0.55);
+  --shadow-group: 0 10px 32px rgba(0, 0, 0, 0.28);
   --color-success: #7ee2b8;
   --color-success-soft: rgba(58, 168, 122, 0.14);
   --color-warning: #ecc36b;
@@ -57,16 +83,121 @@
   --color-working: #8fb7ff;
   --color-working-soft: rgba(96, 134, 214, 0.14);
   --color-muted-soft: rgba(132, 143, 168, 0.12);
+}
 
-  /* Shape */
-  --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
+:root[data-theme="midnight"] {
+  --color-background: #0d1017;
+  --color-surface: #121621;
+  --color-surface-raised: #191e2b;
+  --color-surface-hover: #202636;
+  --color-surface-pressed: #161b26;
+  --color-surface-sunken: #0a0d14;
+  --color-sidebar: #070910;
+  --color-border: #1f2531;
+  --color-border-strong: #2c3444;
+  --color-surface-edge: rgba(200, 215, 255, 0.05);
+  --color-text: #e9edf9;
+  --color-text-secondary: #a3adc4;
+  --color-text-muted: #727d95;
+  --shadow-group: 0 10px 32px rgba(0, 0, 0, 0.4);
+}
 
-  /* Motion */
-  --motion-fast: 90ms;
-  --motion-base: 150ms;
-  --motion-ease: ease-out;
+:root[data-theme="oled"] {
+  --color-background: #000000;
+  --color-surface: #0b0b0e;
+  --color-surface-raised: #141419;
+  --color-surface-hover: #1b1b22;
+  --color-surface-pressed: #101015;
+  --color-surface-sunken: #000000;
+  --color-sidebar: #000000;
+  --color-border: #1c1d23;
+  --color-border-strong: #2b2d35;
+  --color-surface-edge: rgba(255, 255, 255, 0.045);
+  --color-text: #f0f3fc;
+  --color-text-secondary: #a9b2c7;
+  --color-text-muted: #78829b;
+  --shadow-group: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+/* ------------------------------------------------------------------ */
+/* Accent                                                              */
+/*                                                                     */
+/* Curated presets, scoped by `data-accent`. A custom accent is applied */
+/* by the appearance store as derived inline custom properties (see the */
+/* appearance store), which take precedence over these blocks. The     */
+/* accent recolors selection, focus, and primary actions only — never  */
+/* status colors, text, or surfaces.                                   */
+/* ------------------------------------------------------------------ */
+
+:root,
+:root[data-accent="violet"] {
+  --color-accent: #8b80ff;
+  --color-accent-strong: #6f5df2;
+  --color-accent-hover: #6f63e8;
+  --color-accent-pressed: #6152e0;
+  --color-accent-contrast: #ffffff;
+  --color-accent-soft: rgba(139, 128, 255, 0.14);
+  --color-accent-outline: rgba(139, 128, 255, 0.55);
+}
+
+:root[data-accent="blue"] {
+  --color-accent: #7ba4ff;
+  --color-accent-strong: #3a6fd8;
+  --color-accent-hover: #4273d6;
+  --color-accent-pressed: #3563c8;
+  --color-accent-contrast: #ffffff;
+  --color-accent-soft: rgba(123, 164, 255, 0.14);
+  --color-accent-outline: rgba(123, 164, 255, 0.55);
+}
+
+:root[data-accent="cyan"] {
+  --color-accent: #5bd0e0;
+  --color-accent-strong: #37b3c6;
+  --color-accent-hover: #43bccd;
+  --color-accent-pressed: #2fa7b8;
+  --color-accent-contrast: #101116;
+  --color-accent-soft: rgba(91, 208, 224, 0.14);
+  --color-accent-outline: rgba(91, 208, 224, 0.55);
+}
+
+:root[data-accent="green"] {
+  --color-accent: #5ec98f;
+  --color-accent-strong: #3aa96d;
+  --color-accent-hover: #46b177;
+  --color-accent-pressed: #329962;
+  --color-accent-contrast: #101116;
+  --color-accent-soft: rgba(94, 201, 143, 0.14);
+  --color-accent-outline: rgba(94, 201, 143, 0.55);
+}
+
+:root[data-accent="amber"] {
+  --color-accent: #e2b655;
+  --color-accent-strong: #d0a03e;
+  --color-accent-hover: #d7ab4c;
+  --color-accent-pressed: #c2953a;
+  --color-accent-contrast: #101116;
+  --color-accent-soft: rgba(226, 182, 85, 0.14);
+  --color-accent-outline: rgba(226, 182, 85, 0.55);
+}
+
+:root[data-accent="rose"] {
+  --color-accent: #ef8fa5;
+  --color-accent-strong: #b03a58;
+  --color-accent-hover: #c04a68;
+  --color-accent-pressed: #a13350;
+  --color-accent-contrast: #ffffff;
+  --color-accent-soft: rgba(239, 143, 165, 0.14);
+  --color-accent-outline: rgba(239, 143, 165, 0.55);
+}
+
+:root[data-accent="neutral"] {
+  --color-accent: #dfe3ee;
+  --color-accent-strong: #c6ccdb;
+  --color-accent-hover: #d1d7e6;
+  --color-accent-pressed: #bac1d2;
+  --color-accent-contrast: #101116;
+  --color-accent-soft: rgba(223, 227, 238, 0.12);
+  --color-accent-outline: rgba(223, 227, 238, 0.5);
 }
 
 * {
@@ -298,7 +429,7 @@ p {
   border: 1px solid var(--color-surface-edge);
   border-radius: var(--radius-lg);
   background: var(--color-surface);
-  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--shadow-group);
 }
 
 .group + .group {
@@ -486,17 +617,17 @@ p {
 .btn-primary {
   border-color: var(--color-accent-strong);
   background: var(--color-accent-strong);
-  color: #ffffff;
+  color: var(--color-accent-contrast);
 }
 
 .btn-primary:hover:not(:disabled) {
-  border-color: #8274f6;
-  background: #8274f6;
+  border-color: var(--color-accent-hover);
+  background: var(--color-accent-hover);
 }
 
 .btn-primary:active:not(:disabled) {
-  border-color: var(--color-accent-strong);
-  background: #6455e0;
+  border-color: var(--color-accent-pressed);
+  background: var(--color-accent-pressed);
 }
 
 .btn-primary:disabled {
@@ -651,6 +782,13 @@ p {
   color: var(--color-text);
   font: inherit;
   font-size: var(--text-body);
+}
+
+/* Native checkboxes and radios pick up the accent so their checked state
+   follows the appearance preference. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--color-accent);
 }
 
 /* Responsive multi-field layout: fields share a row while the content

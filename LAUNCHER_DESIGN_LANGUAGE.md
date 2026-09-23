@@ -104,8 +104,9 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
   labels, selected/focus states, and account identity never feel cramped) and one
   content region (the page). The shell never scrolls; only page content scrolls.
 - **Navigation** reflects *actual current capabilities only*: Home, Instances,
-  Accounts, About (real backend state), plus a Developer page in development builds.
-  Future destinations (Library, Settings) are documented in this file, not built.
+  Accounts, Settings (launcher-wide preferences — today, appearance), About
+  (real backend state), plus a Developer page in development builds.
+  Future destinations (Library) are documented in this file, not built.
 - **Account identity/access**: a compact account chip pinned at the bottom of the
   sidebar showing the selected Minecraft name and sign-in state; it navigates to
   Accounts. With no account it offers sign-in.
@@ -170,7 +171,7 @@ Two hard rules learned from the pilot review:
 Semantic roles only (defined once as CSS custom properties in `src/app.css`); tokens
 are the contract, components never hard-code hex values:
 
-| Role | Token family | Value (dark theme) |
+| Role | Token family | Value (aurora-dark, the default theme) |
 | --- | --- | --- |
 | Application background (content canvas) | `--color-background` | neutral dark ink `#101116` |
 | Sidebar | `--color-sidebar` | near-black `#0a0b0e` |
@@ -201,6 +202,24 @@ Rules from the pilot review, binding for every future screen:
   gradient. If a screen reads as purple, it is wrong.
 - Status colors appear as tinted dot + label text on a faint tinted background — never
   as large filled regions. Only status uses badges; metadata never does.
+
+**Themes and accent customization** extend this system without changing it. The
+token layer is the theme system: themes and the accent are attribute-scoped sets
+of the same semantic custom properties (`data-theme`, `data-accent` on the
+document root; a custom accent applies Rust-derived inline custom properties —
+never user CSS). The built-in themes are `aurora-dark` (the default, above),
+`midnight` (cooler, deeper graphite/slate surfaces), and `oled` (true-black major
+surfaces); all three are dark and differ only through palette — never layout,
+hierarchy, or motion. Status colors are semantically stable across every theme.
+The accent recolors only selection, focus, selected-state markers, and primary
+actions; it never recolors status colors, ordinary text, or surfaces. The
+primary button's text color is a token (`--color-accent-contrast`) so bright
+accents (cyan, green, amber, neutral) use near-black ink while deep accents use
+white — every built-in preset keeps ≥ 4.5:1 button-text contrast in resting,
+hover, and pressed states, and stays visible on true black, enforced by
+deterministic tests rather than visual judgment. There is deliberately no
+"follow system" mode: no light theme exists, so a selector that always resolves
+to dark would be dishonest.
 
 ## H. Depth / glass
 
@@ -341,12 +360,23 @@ These are intentional product states, not raw backend text:
 - Identity is otherwise typographic: the "Aurora" wordmark, hierarchy, and the
   restrained accent — not aurora gradients across the UI.
 
+**Two Aurora asset roles (documented distinction).** The canonical transparent
+white mark above is the **internal/UI mark**: it renders directly on existing
+surfaces inside the launcher and the Aurora client. The **external application
+icon** — the intended OS-facing identity for the executable, taskbar, shortcuts,
+Start menu, and installer — is planned as the Aurora mark on a rounded-square
+dark black→gray background. That external asset is **not implemented**: the
+final canonical source image has not been selected or supplied, current
+packaging derivatives remain mechanical transforms of the internal mark, and
+replacement belongs to the desktop/OS-integration phase once the developer
+approves the final asset.
+
 ## Future information architecture (documented, not built)
 
 - **Library** — a content/mod browsing destination. No backend capability exists
   (no mod management, no content sources); it must not be a fake screen.
-- **Settings** — launcher-level settings. No settings backend exists yet; when real
-  preferences are implemented they belong here, and About remains the status/version
-  surface.
+- **Settings** is now built (launcher-wide appearance preferences: theme and
+  accent). Further launcher-wide preferences belong there as real behavior
+  arrives; About remains the status/version surface.
 - Advanced instance operations (logs viewing, repair, runtime details, folders)
   arrive contextual to instances, not as top-level navigation.

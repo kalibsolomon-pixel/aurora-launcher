@@ -471,6 +471,163 @@ pub fn get_launcher_state(app: AppHandle) -> Result<LauncherState, CommandError>
     LauncherState::from_parts(loaded.into_config(), registry)
 }
 
+/// Typed request for updating the launcher-wide appearance preferences.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAppearanceRequest {
+    theme: String,
+    accent: crate::appearance::AccentSelection,
+}
+
+/// The accent-family CSS token values for the current accent, as applied by
+/// the frontend to the `--color-accent*` custom properties.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccentPaletteDto {
+    accent: String,
+    accent_strong: String,
+    accent_hover: String,
+    accent_pressed: String,
+    accent_contrast: String,
+    accent_soft: String,
+    accent_outline: String,
+}
+
+impl From<&crate::appearance::AccentPalette> for AccentPaletteDto {
+    fn from(palette: &crate::appearance::AccentPalette) -> Self {
+        Self {
+            accent: palette.base.as_hex(),
+            accent_strong: palette.strong.as_hex(),
+            accent_hover: palette.hover.as_hex(),
+            accent_pressed: palette.pressed.as_hex(),
+            accent_contrast: palette.on_accent.as_hex(),
+            accent_soft: palette.soft_css(),
+            accent_outline: palette.outline_css(),
+        }
+    }
+}
+
+/// One selectable built-in theme.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemeOptionDto {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+}
+
+/// One curated accent preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccentOptionDto {
+    id: &'static str,
+    label: &'static str,
+    /// The preset's base color, for the swatch preview.
+    hex: String,
+}
+
+/// The launcher-wide appearance state plus the catalogs the Settings page
+/// renders. Every value is validated Rust-owned state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppearanceDto {
+    theme: &'static str,
+    accent: crate::appearance::AccentSelection,
+    palette: AccentPaletteDto,
+    themes: Vec<ThemeOptionDto>,
+    accents: Vec<AccentOptionDto>,
+}
+
+impl AppearanceDto {
+    fn of(preferences: &crate::appearance::AppearancePreferences) -> Result<Self, CommandError> {
+        let palette = preferences
+            .accent
+            .palette()
+            .map_err(|error| CommandError::new("appearance_invalid", error.to_string()))?;
+
+        Ok(Self {
+            theme: preferences.theme_id().as_str(),
+            accent: preferences.accent.clone(),
+            palette: AccentPaletteDto::from(&palette),
+            themes: crate::appearance::ThemeId::all()
+                .into_iter()
+                .map(|theme| ThemeOptionDto {
+                    id: theme.as_str(),
+                    label: theme.label(),
+                    description: theme.description(),
+                })
+                .collect(),
+            accents: crate::appearance::accent_presets()
+                .iter()
+                .map(|preset| AccentOptionDto {
+                    id: preset.id,
+                    label: preset.label,
+                    hex: preset.palette.base.as_hex(),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Loads the persisted launcher-wide appearance preferences.
+///
+/// These are cosmetic launcher preferences: unknown stored values were
+/// already normalized to safe defaults at load, and this command never
+/// blocks the rest of the launcher.
+#[tauri::command]
+pub fn get_appearance(app: AppHandle) -> Result<AppearanceDto, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+
+    let config = match crate::config::load(&managed_paths.config_file())? {
+        Some(config) => config,
+        None => crate::config::LauncherConfig::default(),
+    };
+
+    Ok(AppearanceDto::of(config.appearance())?)
+}
+
+/// Validates and persists new launcher-wide appearance preferences.
+///
+/// The whole proposed appearance is validated first — an unknown theme or an
+/// unusable accent color is rejected with an explanation and nothing is
+/// written — then saved atomically with the rest of the launcher
+/// configuration.
+#[tauri::command]
+pub fn set_appearance(
+    app: AppHandle,
+    request: SetAppearanceRequest,
+) -> Result<AppearanceDto, CommandError> {
+    let managed_paths = managed_paths(&app)?;
+
+    let theme = crate::appearance::ThemeId::parse(&request.theme).ok_or_else(|| {
+        CommandError::new(
+            "appearance_invalid",
+            format!(
+                "'{}' is not a known theme; choose one of the built-in themes",
+                request.theme.trim()
+            ),
+        )
+    })?;
+    request
+        .accent
+        .palette()
+        .map_err(|error| CommandError::new("appearance_invalid", error.to_string()))?;
+
+    let preferences = crate::appearance::AppearancePreferences {
+        theme: theme.as_str().to_owned(),
+        accent: request.accent,
+    };
+
+    let mut config = match crate::config::load(&managed_paths.config_file())? {
+        Some(config) => config,
+        None => crate::config::LauncherConfig::default(),
+    };
+    config.set_appearance(preferences);
+    crate::config::save(&managed_paths.config_file(), &config)?;
+
+    Ok(AppearanceDto::of(config.appearance())?)
+}
+
 /// Typed artifact metadata accepted by the acquisition command.
 ///
 /// The native layer re-validates everything: the URL must be HTTPS, the
@@ -3036,7 +3193,9 @@ mod tests {
 
         let state = LauncherState::from_parts(config, registry).unwrap();
 
-        assert_eq!(state.config.schema_version, 1);
+        // The schema-1 input migrated deterministically to schema 2 with the
+        // selection preserved and default appearance.
+        assert_eq!(state.config.schema_version, 2);
         assert_eq!(
             state.config.selected_instance_id.as_deref(),
             Some("aurora-default")
@@ -3068,5 +3227,54 @@ mod tests {
     fn no_selection_or_a_valid_selection_loads_normally() {
         let unselected = crate::config::LauncherConfig::default();
         assert!(LauncherState::from_parts(unselected, InstanceRegistry::empty()).is_ok());
+    }
+
+    #[test]
+    fn appearance_dtos_expose_the_catalog_and_the_derived_palette() {
+        let preferences = crate::appearance::AppearancePreferences::new();
+        let dto = AppearanceDto::of(&preferences).unwrap();
+
+        assert_eq!(dto.theme, "aurora-dark");
+        assert_eq!(
+            dto.accent,
+            crate::appearance::AccentSelection::Preset {
+                id: "violet".to_owned()
+            }
+        );
+        assert_eq!(dto.themes.len(), 3);
+        assert_eq!(dto.themes[0].id, "aurora-dark");
+        assert_eq!(dto.accents.len(), 7);
+        assert_eq!(dto.accents[0].id, "violet");
+        assert_eq!(dto.palette.accent, "#8b80ff");
+        assert_eq!(dto.palette.accent_strong, "#6f5df2");
+        assert_eq!(dto.palette.accent_contrast, "#ffffff");
+        assert_eq!(dto.palette.accent_soft, "rgba(139, 128, 255, 0.14)");
+
+        // The DTO never carries secrets or machine paths.
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(!json.contains("accessToken"));
+        assert!(!json.contains("C:\\"));
+    }
+
+    #[test]
+    fn invalid_appearance_requests_map_to_a_stable_machine_code() {
+        // An unknown theme id is already normalized by the time the DTO is
+        // built (config load normalizes); only an unusable accent fails here.
+        let bad_theme = crate::appearance::AppearancePreferences {
+            theme: "neon".to_owned(),
+            accent: crate::appearance::AccentSelection::default(),
+        };
+        let dto = AppearanceDto::of(&bad_theme).unwrap();
+        assert_eq!(dto.theme, "aurora-dark");
+
+        let bad_accent = crate::appearance::AppearancePreferences {
+            theme: "oled".to_owned(),
+            accent: crate::appearance::AccentSelection::Custom {
+                hex: "#000000".to_owned(),
+            },
+        };
+        let error = AppearanceDto::of(&bad_accent).unwrap_err();
+        assert_eq!(error.code, "appearance_invalid");
+        assert!(error.message.contains("too dark"));
     }
 }

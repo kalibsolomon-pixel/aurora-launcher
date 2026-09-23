@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="aurora-dark">
   <head>
     <meta charset="utf-8" />
     <link rel="icon" type="image/png" href="%sveltekit.assets%/favicon.png" />
@@ -9,6 +9,15 @@
       content="Aurora Launcher — launcher for the Aurora client mod for Minecraft: Java Edition"
     />
     <title>Aurora Launcher</title>
+    <!-- Pre-JS paint guard: Aurora is dark under every theme; this keeps the
+         first frame dark before the stylesheet and the persisted appearance
+         load. The appearance store sets the real theme before the app shell
+         renders. -->
+    <style>
+      html {
+        background-color: #101116;
+      }
+    </style>
     %sveltekit.head%
   </head>
   <body>

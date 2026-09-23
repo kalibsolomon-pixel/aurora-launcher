@@ -78,6 +78,80 @@ export async function getLauncherState(): Promise<LauncherState> {
   }
 }
 
+/** One selectable built-in launcher theme. */
+export interface ThemeOption {
+  id: string;
+  label: string;
+  description: string;
+}
+
+/** One curated accent preset (the hex is the swatch preview color). */
+export interface AccentOption {
+  id: string;
+  label: string;
+  hex: string;
+}
+
+/** The accent selection as persisted: a curated preset or a custom color. */
+export type AccentSelection =
+  | { type: "preset"; id: string }
+  | { type: "custom"; hex: string };
+
+/** The accent-family CSS token values Rust derived for the current accent. */
+export interface AccentPalette {
+  accent: string;
+  accentStrong: string;
+  accentHover: string;
+  accentPressed: string;
+  accentContrast: string;
+  accentSoft: string;
+  accentOutline: string;
+}
+
+/** Launcher-wide appearance state plus the catalogs Settings renders. */
+export interface AppearanceState {
+  theme: string;
+  accent: AccentSelection;
+  palette: AccentPalette;
+  themes: ThemeOption[];
+  accents: AccentOption[];
+}
+
+export async function getAppearance(): Promise<AppearanceState> {
+  try {
+    return await invoke<AppearanceState>("get_appearance");
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The launcher appearance could not be loaded.",
+    );
+  }
+}
+
+export async function setAppearance(
+  theme: string,
+  accent: AccentSelection,
+): Promise<AppearanceState> {
+  try {
+    return await invoke<AppearanceState>("set_appearance", {
+      request: { theme, accent },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The launcher appearance could not be saved.",
+    );
+  }
+}
+
 export type AcquisitionOrigin = "downloaded" | "cacheHit";
 
 export interface AcquireArtifactRequest {

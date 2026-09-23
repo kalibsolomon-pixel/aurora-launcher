@@ -1,3 +1,4 @@
+pub mod appearance;
 mod application;
 pub mod aurora;
 pub mod auth;
@@ -25,6 +26,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             application::get_application_status,
             application::get_launcher_state,
+            application::get_appearance,
+            application::set_appearance,
             application::acquire_artifact,
             application::plan_minecraft_install,
             application::plan_fabric_install,
