@@ -167,6 +167,7 @@ impl Client {
                     summary: hit.description,
                     author: hit.author,
                     downloads: hit.downloads,
+                    icon_url: hit.icon_url.as_deref().and_then(safe_icon_url),
                     project_type: kind,
                 })
                 .collect(),
@@ -298,6 +299,38 @@ impl Client {
             plans: graph.plans,
         })
     }
+
+    /// Select the same release-preferred compatible version shown by Details.
+    /// Search hits are display data and never authorize a file or version.
+    pub async fn resolve_latest(
+        &self,
+        context: &Context,
+        kind: ContentType,
+        project_id: &str,
+        installed: &ContentState,
+    ) -> Result<Resolved, Error> {
+        let details = self.details(context, kind, project_id).await?;
+        let version_id = details
+            .default_version_id
+            .ok_or(Error::NoCompatibleVersion)?;
+        self.resolve(context, kind, project_id, &version_id, installed)
+            .await
+    }
+}
+
+fn safe_icon_url(raw: &str) -> Option<String> {
+    let url = Url::parse(raw).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("cdn.modrinth.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !url.path().starts_with("/data/")
+    {
+        return None;
+    }
+    Some(url.into())
 }
 
 const CLIENT_ENVIRONMENTS: &[&str] = &[
@@ -587,6 +620,7 @@ pub struct ProjectSummary {
     pub summary: String,
     pub author: String,
     pub downloads: u64,
+    pub icon_url: Option<String>,
     pub project_type: ContentType,
 }
 
@@ -652,6 +686,8 @@ struct SearchHitDto {
     description: String,
     author: String,
     downloads: u64,
+    #[serde(default)]
+    icon_url: Option<String>,
     versions: Vec<String>,
     environment: Vec<String>,
 }
@@ -882,6 +918,111 @@ mod tests {
                 .flatten()
                 .any(|value| value == "project_type:shader")
         );
+    }
+
+    #[tokio::test]
+    async fn empty_browse_query_keeps_safe_icons_and_drops_untrusted_ones() {
+        let server = TestServer::spawn(Arc::new(|request: &TestRequest| {
+            let url = Url::parse(&format!("http://localhost{}", request.path)).unwrap();
+            assert_eq!(
+                url.query_pairs().find(|(key, _)| key == "query").unwrap().1,
+                ""
+            );
+            assert_eq!(
+                url.query_pairs()
+                    .find(|(key, _)| key == "offset")
+                    .unwrap()
+                    .1,
+                "0"
+            );
+            TestResponse::ok(&serde_json::to_vec(&json!({
+                "offset": 0, "total_hits": 3,
+                "hits": [
+                    {"project_id":"AAAABBBB","project_type":"mod","title":"Icon","description":"a","author":"a","downloads":1,"versions":["1.21.11"],"environment":["client_and_server"],"icon_url":"https://cdn.modrinth.com/data/AAAABBBB/icon.png"},
+                    {"project_id":"BBBBCCCC","project_type":"mod","title":"None","description":"b","author":"b","downloads":1,"versions":["1.21.11"],"environment":["client_and_server"],"icon_url":null},
+                    {"project_id":"CCCCDDDD","project_type":"mod","title":"Bad","description":"c","author":"c","downloads":1,"versions":["1.21.11"],"environment":["client_and_server"],"icon_url":"https://evil.example/data/icon.png"}
+                ]
+            })).unwrap())
+        }));
+        let client = Client::for_testing(&format!("{}/v2/", server.base_url()));
+        let page = client
+            .search(&context(), ContentType::Mod, "", 0)
+            .await
+            .unwrap();
+        assert_eq!(page.hits.len(), 3);
+        assert_eq!(
+            page.hits[0].icon_url.as_deref(),
+            Some("https://cdn.modrinth.com/data/AAAABBBB/icon.png")
+        );
+        assert!(page.hits[1].icon_url.is_none());
+        assert!(page.hits[2].icon_url.is_none());
+        assert!(safe_icon_url("javascript:alert(1)").is_none());
+        assert!(safe_icon_url("https://cdn.modrinth.com.evil.example/data/a.png").is_none());
+    }
+
+    #[tokio::test]
+    async fn quick_resolution_uses_latest_compatible_for_each_content_type() {
+        for (kind, project_type, loader, extension) in [
+            (ContentType::Mod, "mod", "fabric", "jar"),
+            (
+                ContentType::ResourcePack,
+                "resourcepack",
+                "minecraft",
+                "zip",
+            ),
+            (ContentType::ShaderPack, "shader", "iris", "zip"),
+        ] {
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/v2/project/AAAABBBB".into(),
+                project("AAAABBBB", project_type),
+            );
+            let mut wrong = version("11112222", "AAAABBBB", json!([]));
+            wrong["date_published"] = json!("2026-09-01T00:00:00Z");
+            wrong["game_versions"] = json!(["1.20.1"]);
+            let mut good = version("22223333", "AAAABBBB", json!([]));
+            good["loaders"] = json!([loader]);
+            good["files"][0]["filename"] = json!(format!("content.{extension}"));
+            routes.insert(
+                "/v2/project/AAAABBBB/version".into(),
+                json!([wrong, good.clone()]),
+            );
+            routes.insert("/v2/version/22223333".into(), good);
+            let server = server(routes);
+            let client = Client::for_testing(&format!("{}/v2/", server.base_url()));
+            let resolved = client
+                .resolve_latest(&context(), kind, "AAAABBBB", &ContentState::empty())
+                .await
+                .unwrap();
+            assert_eq!(resolved.preview.version_id, "22223333");
+            assert_eq!(resolved.plans.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_resolution_no_match_never_reaches_artifact_planning() {
+        for (kind, project_type) in [
+            (ContentType::Mod, "mod"),
+            (ContentType::ResourcePack, "resourcepack"),
+            (ContentType::ShaderPack, "shader"),
+        ] {
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/v2/project/AAAABBBB".into(),
+                project("AAAABBBB", project_type),
+            );
+            let mut wrong = version("11112222", "AAAABBBB", json!([]));
+            wrong["game_versions"] = json!(["1.20.1"]);
+            routes.insert("/v2/project/AAAABBBB/version".into(), json!([wrong]));
+            let server = server(routes);
+            let client = Client::for_testing(&format!("{}/v2/", server.base_url()));
+            assert!(matches!(
+                client
+                    .resolve_latest(&context(), kind, "AAAABBBB", &ContentState::empty())
+                    .await,
+                Err(Error::NoCompatibleVersion)
+            ));
+        }
     }
 
     #[tokio::test]

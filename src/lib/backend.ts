@@ -813,6 +813,7 @@ export interface ModrinthProjectSummary {
   summary: string;
   author: string;
   downloads: number;
+  iconUrl: string | null;
   projectType: ContentType;
 }
 
@@ -875,6 +876,10 @@ export function previewModrinthInstall(instanceId: string, contentType: ContentT
 
 export function installModrinth(instanceId: string, contentType: ContentType, projectId: string, versionId: string, previewFingerprint: string): Promise<ProviderRecord[]> {
   return contentInvoke("install_modrinth", { instanceId, contentType, projectId, versionId, previewFingerprint });
+}
+
+export function quickInstallModrinth(instanceId: string, contentType: ContentType, projectId: string): Promise<ProviderRecord[]> {
+  return contentInvoke("quick_install_modrinth", { instanceId, contentType, projectId });
 }
 
 async function contentInvoke<T>(command: string, request: Record<string, unknown>): Promise<T> {

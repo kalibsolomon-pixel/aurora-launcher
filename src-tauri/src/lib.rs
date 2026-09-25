@@ -62,6 +62,7 @@ pub fn run() {
             application::get_modrinth_project,
             application::preview_modrinth_install,
             application::install_modrinth,
+            application::quick_install_modrinth,
             application::validate_instance,
             application::get_instance_runtime_status,
             application::ensure_instance_runtime,

@@ -62,7 +62,7 @@
     <button type="button" class="btn btn-quiet" aria-pressed={view === "browse"} onclick={() => view = "browse"}>Browse</button>
   </div>
   {#if view === "browse"}
-    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} {kind} onInstalled={async () => { await launcher.runLoadContent(instance.id, kind); view = "installed"; }} />
+    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} {kind} installedProjectIds={entries.filter((entry) => entry.provenance?.provider === "modrinth").map((entry) => entry.provenance!.projectId)} onInstalled={async (targetId, targetKind) => { if (targetKind !== "mod") await launcher.runLoadContent(targetId, targetKind); }} />
   {:else}
   <div class="packs-heading">
     <div>

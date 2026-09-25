@@ -2184,6 +2184,14 @@ pub struct ModrinthInstallRequest {
     preview_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthQuickInstallRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModrinthPreviewResponse {
@@ -2396,10 +2404,18 @@ pub async fn install_modrinth(
             "The dependency preview changed. Review it again before installing.",
         ));
     }
+    install_resolved_provider_plans(&managed, &instance, resolved).await
+}
+
+async fn install_resolved_provider_plans(
+    managed: &ManagedPaths,
+    instance: &crate::instances::InstanceId,
+    resolved: crate::modrinth::Resolved,
+) -> Result<Vec<crate::instance_content::ProviderRecord>, CommandError> {
     if resolved.plans.is_empty() {
         return Ok(Vec::new());
     }
-    crate::instance_content::install_provider_plans(&managed, &instance, resolved.plans)
+    crate::instance_content::install_provider_plans(managed, instance, resolved.plans)
         .await
         .map_err(|error| {
             let code = match error {
@@ -2409,6 +2425,60 @@ pub async fn install_modrinth(
             };
             CommandError::new(code, error.to_string())
         })
+}
+
+/// One-click UX over the same resolution, fingerprint, and transaction path as
+/// the reviewed install. No search-result metadata becomes install authority.
+#[tauri::command]
+pub async fn quick_install_modrinth(
+    app: AppHandle,
+    request: ModrinthQuickInstallRequest,
+) -> Result<Vec<crate::instance_content::ProviderRecord>, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (instance, context) = provider_context(&managed, &request.instance_id)?;
+    let state = provider_state(&managed, &instance)?;
+    if state.entries.iter().any(|record| {
+        record.provider == "modrinth"
+            && record.content_type == request.content_type
+            && record.project_id == request.project_id
+    }) {
+        return Ok(Vec::new());
+    }
+    let client = crate::modrinth::Client::official();
+    let first = client
+        .resolve_latest(&context, request.content_type, &request.project_id, &state)
+        .await
+        .map_err(provider_error)?;
+    let fingerprint = provider_fingerprint(&instance, &first);
+    let version_id = first.preview.version_id;
+    let (current_instance, current_context) = provider_context(&managed, &request.instance_id)?;
+    if current_instance != instance
+        || current_context.minecraft_version != context.minecraft_version
+        || current_context.loader != context.loader
+    {
+        return Err(CommandError::new(
+            "provider_install_failed",
+            "Instance compatibility changed. Try again.",
+        ));
+    }
+    let current_state = provider_state(&managed, &instance)?;
+    let revalidated = client
+        .resolve(
+            &current_context,
+            request.content_type,
+            &request.project_id,
+            &version_id,
+            &current_state,
+        )
+        .await
+        .map_err(provider_error)?;
+    if provider_fingerprint(&instance, &revalidated) != fingerprint {
+        return Err(CommandError::new(
+            "provider_install_failed",
+            "The installation plan changed. Try again.",
+        ));
+    }
+    install_resolved_provider_plans(&managed, &instance, revalidated).await
 }
 
 /// One Minecraft version offered for instance configuration, from the
