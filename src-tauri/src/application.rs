@@ -3236,9 +3236,9 @@ mod tests {
     fn ready_status_preserves_structured_platform_metadata() {
         let root = std::env::temp_dir().join("com.aurora.launcher");
 
-        let status = ApplicationStatus::ready("0.1.0", "windows", "x86_64", root.clone());
+        let status = ApplicationStatus::ready("1.0.0", "windows", "x86_64", root.clone());
 
-        assert_eq!(status.launcher_version, "0.1.0");
+        assert_eq!(status.launcher_version, "1.0.0");
         assert_eq!(status.platform.os, "windows");
         assert_eq!(status.platform.architecture, "x86_64");
         assert_eq!(status.managed_data_root, root.to_string_lossy());

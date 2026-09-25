@@ -47,9 +47,14 @@ jobs:
         env:
           SOURCE_REF: ${{ inputs.source_ref }}
           VERSION: ${{ inputs.version }}
+          INSTALLER_FORMAT: ${{ inputs.installer_format }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = 'refs/heads/main'
+          if [[ "$VERSION" == '1.0.0' && "$INSTALLER_FORMAT" != 'nsis' ]]; then
+            echo 'Aurora Launcher 1.0.0 publishes NSIS only' >&2
+            exit 1
+          fi
           [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
           git cat-file -e "$SOURCE_REF^{commit}"
           git fetch --no-tags origin main

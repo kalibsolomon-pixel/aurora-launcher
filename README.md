@@ -78,7 +78,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for implemented boundaries and future direction. Contributions are licensed under the [MIT License](LICENSE).
 
-Launcher versioning, Windows installer differences, manual release checks, and the future launcher-update policy are documented in [RELEASING.md](RELEASING.md). The inherited `0.1.0` remains a development version until a first public launcher version is deliberately chosen.
+Launcher versioning, Windows installer differences, manual release checks, and the future launcher-update policy are documented in [RELEASING.md](RELEASING.md). Aurora Launcher 1.0.0 is the selected first public version; its selected Windows distribution format is NSIS x64.
 
 ## Disclaimer
 
