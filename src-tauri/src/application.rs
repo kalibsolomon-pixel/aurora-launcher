@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::aurora::AuroraInstallError;
@@ -1715,10 +1715,12 @@ pub struct OpenInstanceFolderRequest {
 /// Resolves the managed root folder of one registered instance for opening
 /// in the operating system's file browser.
 ///
-/// Pure registry/path logic with no side effects: the identifier must be a
-/// valid [`crate::instances::InstanceId`] that exists in the registry, and
-/// the folder is derived through [`ManagedPaths`] — a validated identifier
-/// inside the managed instances directory, never a frontend-supplied path.
+/// Registry/path logic for one existing managed instance: the identifier must
+/// be a valid [`crate::instances::InstanceId`] that exists in the registry,
+/// and the folder is derived through [`ManagedPaths`] — never supplied by the
+/// frontend. Canonical-path checks reject a junction or symbolic link that
+/// would redirect either the instances directory or the instance root outside
+/// Aurora's managed filesystem boundary (or to another instance).
 fn resolve_instance_folder(
     managed: &ManagedPaths,
     registry: &InstanceRegistry,
@@ -1733,15 +1735,63 @@ fn resolve_instance_folder(
     }
 
     let folder = managed.instance_paths(&instance).root().to_path_buf();
-    // Containment holds by construction; the check documents and defends it
-    // without trusting the construction site.
-    if !folder.starts_with(managed.instances_dir()) {
+    if !folder.is_dir() {
         return Err(CommandError::new(
-            "instance_id_invalid",
-            "the derived instance folder escaped the managed instances directory",
+            "instance_folder_missing",
+            format!(
+                "the managed folder for this instance does not exist yet: {}",
+                folder.display()
+            ),
         ));
     }
+
+    let canonical_root = std::fs::canonicalize(managed.data_root()).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("the managed data boundary could not be resolved: {error}"),
+        )
+    })?;
+    let canonical_instances = std::fs::canonicalize(managed.instances_dir()).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("the managed instances boundary could not be resolved: {error}"),
+        )
+    })?;
+    let canonical_folder = std::fs::canonicalize(&folder).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("the managed instance folder could not be resolved: {error}"),
+        )
+    })?;
+
+    validate_canonical_instance_folder(
+        &canonical_root,
+        &canonical_instances,
+        &canonical_folder,
+        &instance,
+    )?;
+
+    // Keep the derived platform path for the opener. On Windows,
+    // `canonicalize` may add a verbatim `\\?\` prefix that shell APIs do not
+    // consistently accept; the canonical path above is validation evidence,
+    // not the UI-facing value.
     Ok(folder)
+}
+
+fn validate_canonical_instance_folder(
+    managed_root: &Path,
+    instances_root: &Path,
+    instance_folder: &Path,
+    instance: &crate::instances::InstanceId,
+) -> Result<(), CommandError> {
+    let expected = instances_root.join(instance.as_str());
+    if !instances_root.starts_with(managed_root) || instance_folder != expected {
+        return Err(CommandError::new(
+            "instance_folder_open_failure",
+            "the resolved instance folder is outside Aurora's managed filesystem boundary",
+        ));
+    }
+    Ok(())
 }
 
 /// Opens one instance's managed root folder in the operating system's file
@@ -1761,15 +1811,6 @@ pub fn open_instance_folder(
     let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
 
     let folder = resolve_instance_folder(&managed, &registry, &request.instance_id)?;
-    if !folder.is_dir() {
-        return Err(CommandError::new(
-            "instance_folder_missing",
-            format!(
-                "the managed folder for this instance does not exist yet: {}",
-                folder.display()
-            ),
-        ));
-    }
 
     tauri_plugin_opener::open_path(&folder, None::<&str>).map_err(|error| {
         CommandError::new(
@@ -2733,7 +2774,8 @@ mod tests {
 
     #[test]
     fn instance_folder_resolution_follows_the_registry_and_managed_paths() {
-        let root = std::env::temp_dir().join("AuroraLauncherFolderResolutionTest");
+        let root =
+            std::env::temp_dir().join(format!("aurora-folder-resolution-{}", uuid::Uuid::new_v4()));
         let managed = ManagedPaths::from_app_local_data_dir(root.clone()).unwrap();
 
         let mut registry = InstanceRegistry::empty();
@@ -2754,9 +2796,14 @@ mod tests {
             .unwrap(),
         );
 
+        let expected = root.join("instances").join("aurora-folder-test");
+        std::fs::create_dir_all(&expected).unwrap();
+
         let folder = resolve_instance_folder(&managed, &registry, " aurora-folder-test ").unwrap();
-        assert_eq!(folder, root.join("instances").join("aurora-folder-test"));
-        assert!(folder.starts_with(managed.instances_dir()));
+        assert_eq!(folder, expected);
+        assert!(folder.starts_with(managed.data_root()));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2772,6 +2819,40 @@ mod tests {
 
         let invalid = resolve_instance_folder(&managed, &registry, "../escape").unwrap_err();
         assert_eq!(invalid.code, "instance_id_invalid");
+    }
+
+    #[test]
+    fn instance_folder_resolution_rejects_canonical_boundary_escapes() {
+        let managed_root = Path::new("C:/managed/aurora");
+        let instances_root = managed_root.join("instances");
+        let instance = crate::instances::InstanceId::new("aurora-folder-test").unwrap();
+
+        validate_canonical_instance_folder(
+            managed_root,
+            &instances_root,
+            &instances_root.join(instance.as_str()),
+            &instance,
+        )
+        .unwrap();
+
+        let redirected_instances = Path::new("C:/elsewhere/instances");
+        let escaped_parent = validate_canonical_instance_folder(
+            managed_root,
+            redirected_instances,
+            &redirected_instances.join(instance.as_str()),
+            &instance,
+        )
+        .unwrap_err();
+        assert_eq!(escaped_parent.code, "instance_folder_open_failure");
+
+        let redirected_instance = validate_canonical_instance_folder(
+            managed_root,
+            &instances_root,
+            &instances_root.join("another-instance"),
+            &instance,
+        )
+        .unwrap_err();
+        assert_eq!(redirected_instance.code, "instance_folder_open_failure");
     }
 
     #[test]

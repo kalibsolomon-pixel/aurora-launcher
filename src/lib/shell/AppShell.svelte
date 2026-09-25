@@ -72,7 +72,6 @@
             <button
               type="button"
               class="nav-item sidebar-all-instances"
-              aria-current={!inWorkspace && currentPage === "instances" ? "page" : undefined}
               onclick={() => navigation.goTo("instances")}
             >
               All instances
