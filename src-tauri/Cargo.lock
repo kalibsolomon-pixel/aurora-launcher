@@ -212,6 +212,7 @@ name = "aurora-launcher"
 version = "1.0.0"
 dependencies = [
  "base64ct",
+ "futures-util",
  "getrandom 0.3.4",
  "png 0.17.16",
  "reqwest",

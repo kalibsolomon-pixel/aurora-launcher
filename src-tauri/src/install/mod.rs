@@ -50,13 +50,16 @@ pub mod assets;
 pub mod natives;
 pub mod state;
 
+use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::cache::{
-    AcquisitionError, ArtifactCache, ObservedArtifact, VerifiedArtifact, VerifiedSha1Artifact,
+    AcquisitionError, ArtifactCache, ArtifactOrigin, ObservedArtifact, VerifiedArtifact,
+    VerifiedSha1Artifact,
 };
 use crate::downloads::{
     ArtifactSource, DownloadOptions, InvalidArtifactSource, ObservedArtifactSource,
@@ -88,12 +91,15 @@ const REPLACED_GAME_DIR_NAME: &str = "replaced-game";
 /// The maximum asset-index document size the installer will parse (real
 /// indexes are well under one megabyte).
 const MAX_ASSET_INDEX_BYTES: usize = 8 * 1024 * 1024;
+const SMALL_ARTIFACT_CONCURRENCY: usize = 16;
+const STAGED_VALIDATION_CONCURRENCY: usize = 8;
 
 /// Everything the installer needs beyond the plan itself.
 #[derive(Debug, Clone)]
 pub struct InstallContext {
     download_options: DownloadOptions,
     asset_endpoints: AssetObjectEndpoints,
+    small_artifact_concurrency: usize,
 }
 
 impl InstallContext {
@@ -103,6 +109,7 @@ impl InstallContext {
         Self {
             download_options: DownloadOptions::default(),
             asset_endpoints: AssetObjectEndpoints::official(),
+            small_artifact_concurrency: SMALL_ARTIFACT_CONCURRENCY,
         }
     }
 
@@ -115,6 +122,7 @@ impl InstallContext {
         Self {
             download_options,
             asset_endpoints,
+            small_artifact_concurrency: SMALL_ARTIFACT_CONCURRENCY,
         }
     }
 
@@ -124,6 +132,13 @@ impl InstallContext {
 
     pub fn asset_endpoints(&self) -> &AssetObjectEndpoints {
         &self.asset_endpoints
+    }
+
+    #[cfg(test)]
+    fn with_concurrency_for_testing(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0);
+        self.small_artifact_concurrency = concurrency;
+        self
     }
 }
 
@@ -203,6 +218,7 @@ struct PlannedFile {
     trust: ArtifactTrust,
     size_bytes: u64,
     role: InstalledFileRole,
+    origin: ArtifactOrigin,
 }
 
 /// Executes one complete installation of `plan` into `instance`.
@@ -220,6 +236,7 @@ pub async fn install_game(
     progress: &mut (dyn FnMut(InstallProgress) + Send),
     faults: InstallFaults,
 ) -> Result<InstalledGame, InstallError> {
+    let started = Instant::now();
     let lock = instance_installation_lock(instance);
     let _guard = lock
         .try_lock()
@@ -266,6 +283,7 @@ pub async fn install_game(
             reason: error.reason,
         }
     })?;
+    let index_finished = Instant::now();
 
     let total_items = acquisition_total(plan, &UnknownObjects::Known(objects.len()));
     let mut completed = 1u32;
@@ -279,6 +297,7 @@ pub async fn install_game(
         Some(format!("{} client", minecraft.minecraft_version())),
     );
     let client = acquire_mojang(&cache, minecraft.client(), context).await?;
+    let client_finished = Instant::now();
     completed += 1;
     files.push(PlannedFile {
         source: client.path.clone(),
@@ -286,6 +305,7 @@ pub async fn install_game(
         trust: client.trust(),
         size_bytes: client.bytes,
         role: InstalledFileRole::Client,
+        origin: client.origin,
     });
 
     // Logging configuration, when the version requires one.
@@ -308,8 +328,10 @@ pub async fn install_game(
             trust: artifact.trust(),
             size_bytes: artifact.bytes,
             role: InstalledFileRole::LoggingConfig,
+            origin: artifact.origin,
         });
     }
+    let logging_finished = Instant::now();
 
     // The verified index itself is an installed file.
     files.push(PlannedFile {
@@ -321,54 +343,76 @@ pub async fn install_game(
         trust: index_artifact.trust(),
         size_bytes: index_artifact.bytes,
         role: InstalledFileRole::AssetIndex,
+        origin: index_artifact.origin,
     });
 
-    // Composed libraries, Mojang then Fabric, in classpath order.
-    for library in plan.libraries() {
-        report(
-            InstallPhase::Acquiring,
-            completed,
-            total_items,
-            Some(library.coordinate_string()),
-        );
-        let (source, trust, size, role) = acquire_library(&cache, library, context).await?;
-        completed += 1;
-        files.push(PlannedFile {
-            source,
-            relative: format!("libraries/{}", library.repository_path()),
-            trust,
-            size_bytes: size,
-            role,
-        });
+    // Preserve classpath order even when independent acquisitions complete
+    // out of order. A failed batch is fully settled before returning, so no
+    // download task is abandoned with an open untrusted staging file.
+    for batch in plan.libraries().chunks(context.small_artifact_concurrency) {
+        let acquired = join_all(
+            batch
+                .iter()
+                .map(|library| async { acquire_library(&cache, library, context).await }),
+        )
+        .await;
+        for (library, result) in batch.iter().zip(acquired) {
+            let (source, trust, size, role, origin) = result?;
+            completed += 1;
+            files.push(PlannedFile {
+                source,
+                relative: format!("libraries/{}", library.repository_path()),
+                trust,
+                size_bytes: size,
+                role,
+                origin,
+            });
+            report(
+                InstallPhase::Acquiring,
+                completed,
+                total_items,
+                Some(library.coordinate_string()),
+            );
+        }
     }
+    let libraries_finished = Instant::now();
 
     // Asset objects, deduplicated by hash.
-    for object in &objects {
-        let hex = object.sha1().as_hex();
-        report(
-            InstallPhase::Acquiring,
-            completed,
-            total_items,
-            Some(format!("asset {hex}")),
-        );
-        let source = Sha1ArtifactSource::https_or_loopback(
-            context.asset_endpoints().object_url(object.sha1()).as_str(),
-            &hex,
-            Some(object.size_bytes()),
-        )
-        .map_err(|error| InstallError::InvalidSource(error.to_string()))?;
-        let artifact = cache
-            .acquire_sha1(&source, context.download_options())
-            .await?;
-        completed += 1;
-        files.push(PlannedFile {
-            source: artifact.path.clone(),
-            relative: object.game_relative_path(),
-            trust: artifact.trust(),
-            size_bytes: artifact.bytes,
-            role: InstalledFileRole::AssetObject,
-        });
+    for batch in objects.chunks(context.small_artifact_concurrency) {
+        let acquired = join_all(batch.iter().map(|object| async {
+            let hex = object.sha1().as_hex();
+            let source = Sha1ArtifactSource::https_or_loopback(
+                context.asset_endpoints().object_url(object.sha1()).as_str(),
+                &hex,
+                Some(object.size_bytes()),
+            )
+            .map_err(|error| InstallError::InvalidSource(error.to_string()))?;
+            cache
+                .acquire_sha1(&source, context.download_options())
+                .await
+                .map_err(InstallError::Acquisition)
+        }))
+        .await;
+        for (object, result) in batch.iter().zip(acquired) {
+            let artifact = result?;
+            completed += 1;
+            files.push(PlannedFile {
+                source: artifact.path.clone(),
+                relative: object.game_relative_path(),
+                trust: artifact.trust(),
+                size_bytes: artifact.bytes,
+                role: InstalledFileRole::AssetObject,
+                origin: artifact.origin,
+            });
+            report(
+                InstallPhase::Acquiring,
+                completed,
+                total_items,
+                Some(format!("asset {}", object.sha1().as_hex())),
+            );
+        }
     }
+    let assets_finished = Instant::now();
 
     // ---- Materialization: verified cache objects are copied into staging.
     let total_files = files.len() as u32;
@@ -389,6 +433,7 @@ pub async fn install_game(
             });
         }
     }
+    let materialization_finished = Instant::now();
 
     // ---- Native extraction from the verified native archives.
     let natives_relative = format!("natives/{}", minecraft.minecraft_version());
@@ -430,10 +475,12 @@ pub async fn install_game(
             reason: "the plan selected no native libraries for this platform".to_owned(),
         });
     }
+    let natives_finished = Instant::now();
 
     // ---- Staged validation: every file re-verified before completion.
     report(InstallPhase::Validating, 0, total_files, None);
-    let installed_files = validate_staged_files(&staging_game, &files, &natives_relative)?;
+    let installed_files = validate_staged_files(&staging_game, &files, &natives_relative).await?;
+    let staged_validation_finished = Instant::now();
 
     // ---- Completion record, written last inside staging.
     let installation_id = format!(
@@ -461,6 +508,7 @@ pub async fn install_game(
         context: "writing the installed-state manifest".to_owned(),
         source: error,
     })?;
+    let state_finished = Instant::now();
 
     if faults.fail_before_commit {
         return Err(InstallError::Commit {
@@ -478,6 +526,50 @@ pub async fn install_game(
         &staging_game,
         replacing,
     )?;
+
+    if std::env::var_os("AURORA_INSTALL_DIAGNOSTICS").is_some() {
+        let hits = files
+            .iter()
+            .filter(|file| file.origin == ArtifactOrigin::CacheHit)
+            .count();
+        let downloaded_bytes: u64 = files
+            .iter()
+            .filter(|file| file.origin == ArtifactOrigin::Downloaded)
+            .map(|file| file.size_bytes)
+            .sum();
+        eprintln!(
+            "[aurora-install] total_ms={} asset_index_ms={} client_ms={} logging_ms={} libraries_ms={} asset_objects_ms={} materialization_ms={} natives_ms={} staged_validation_ms={} installed_state_ms={} commit_ms={} files={} assets={} cache_hits={} downloads={} downloaded_bytes={} limit={}",
+            started.elapsed().as_millis(),
+            index_finished.duration_since(started).as_millis(),
+            client_finished.duration_since(index_finished).as_millis(),
+            logging_finished.duration_since(client_finished).as_millis(),
+            libraries_finished
+                .duration_since(logging_finished)
+                .as_millis(),
+            assets_finished
+                .duration_since(libraries_finished)
+                .as_millis(),
+            materialization_finished
+                .duration_since(assets_finished)
+                .as_millis(),
+            natives_finished
+                .duration_since(materialization_finished)
+                .as_millis(),
+            staged_validation_finished
+                .duration_since(natives_finished)
+                .as_millis(),
+            state_finished
+                .duration_since(staged_validation_finished)
+                .as_millis(),
+            Instant::now().duration_since(state_finished).as_millis(),
+            files.len(),
+            objects.len(),
+            hits,
+            files.len() - hits,
+            downloaded_bytes,
+            context.small_artifact_concurrency,
+        );
+    }
 
     let total_bytes = files.iter().map(|file| file.size_bytes).sum();
     Ok(InstalledGame {
@@ -791,7 +883,16 @@ async fn acquire_library(
     cache: &ArtifactCache,
     library: &GameLibrary,
     context: &InstallContext,
-) -> Result<(PathBuf, ArtifactTrust, u64, InstalledFileRole), InstallError> {
+) -> Result<
+    (
+        PathBuf,
+        ArtifactTrust,
+        u64,
+        InstalledFileRole,
+        ArtifactOrigin,
+    ),
+    InstallError,
+> {
     match library {
         GameLibrary::Minecraft(entry) => {
             let artifact = acquire_mojang(cache, entry.artifact(), context).await?;
@@ -805,6 +906,7 @@ async fn acquire_library(
                 artifact.trust(),
                 artifact.bytes,
                 role,
+                artifact.origin,
             ))
         }
         GameLibrary::Fabric(entry) => {
@@ -824,6 +926,7 @@ async fn acquire_library(
                     verified.trust(),
                     verified.bytes,
                     InstalledFileRole::Library,
+                    verified.origin,
                 ))
             } else {
                 let source = ObservedArtifactSource::https_or_loopback(artifact.url().as_str())
@@ -836,6 +939,7 @@ async fn acquire_library(
                     observed.trust(),
                     observed.bytes,
                     InstalledFileRole::Library,
+                    observed.origin,
                 ))
             }
         }
@@ -899,24 +1003,37 @@ fn materialize_file(staging_game: &Path, file: &PlannedFile) -> Result<(), Insta
 /// Re-verifies every staged file against its recorded trust, producing the
 /// manifest entries. This is the pass that proves a successful API call
 /// really produced valid installed bytes.
-fn validate_staged_files(
+async fn validate_staged_files(
     staging_game: &Path,
     files: &[PlannedFile],
     natives_relative: &str,
 ) -> Result<Vec<InstalledFile>, InstallError> {
     let mut installed = Vec::with_capacity(files.len());
-    for file in files {
-        let record = InstalledFile::new(
-            file.role,
-            file.relative.clone(),
-            file.trust.clone(),
-            file.size_bytes,
-        );
-        verify_managed_file(staging_game, &record).map_err(|reason| InstallError::Validation {
-            path: file.relative.clone(),
-            reason,
-        })?;
-        installed.push(record);
+    let root = Arc::new(staging_game.to_path_buf());
+    for batch in files.chunks(STAGED_VALIDATION_CONCURRENCY) {
+        let tasks = batch.iter().map(|file| {
+            let root = Arc::clone(&root);
+            let record = InstalledFile::new(
+                file.role,
+                file.relative.clone(),
+                file.trust.clone(),
+                file.size_bytes,
+            );
+            tokio::task::spawn_blocking(move || {
+                verify_managed_file(&root, &record).map_err(|reason| InstallError::Validation {
+                    path: record.path().to_owned(),
+                    reason,
+                })?;
+                Ok::<_, InstallError>(record)
+            })
+        });
+        for result in join_all(tasks).await {
+            let record = result.map_err(|error| InstallError::Validation {
+                path: "staged files".to_owned(),
+                reason: format!("a staged verification worker failed: {error}"),
+            })??;
+            installed.push(record);
+        }
     }
 
     let natives_root = staging_game.join(natives_relative);
@@ -1074,6 +1191,7 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::io::Write as _;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     /// Everything the synthetic installation serves, from one loopback
@@ -1350,6 +1468,7 @@ mod tests {
             asset_endpoints: AssetObjectEndpoints::loopback_for_testing(&format!(
                 "{server_base}/assets/"
             )),
+            small_artifact_concurrency: SMALL_ARTIFACT_CONCURRENCY,
         }
     }
 
@@ -1874,24 +1993,30 @@ mod tests {
             &fixture.bodies["/fabric-maven/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar"],
         );
 
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let first = {
             let managed = env.managed.clone();
             let instance = env.instance.clone();
             let context = test_context(slow_server.base_url());
             let plan = slow_plan.clone();
+            let mut started_tx = Some(started_tx);
             tokio::spawn(async move {
                 install_game(
                     &managed,
                     &instance,
                     &plan,
                     &context,
-                    &mut |_| {},
+                    &mut |_| {
+                        if let Some(sender) = started_tx.take() {
+                            let _ = sender.send(());
+                        }
+                    },
                     InstallFaults::default(),
                 )
                 .await
             })
         };
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        started_rx.await.expect("the first installation must start");
 
         let second = install(&env, &fixture, &plan, InstallFaults::default()).await;
 
@@ -1937,6 +2062,236 @@ mod tests {
         assert!(text.contains("\"expectedDigestVerified\""));
         assert!(text.contains("\"algorithm\": \"sha1\""));
         assert!(text.contains("\"algorithm\": \"sha256\""));
+    }
+
+    fn parallel_test_world(
+        broken: Option<String>,
+    ) -> (TestServer, GameInstallPlan, Arc<AtomicUsize>) {
+        let (fixture, _) = synthetic_game();
+        let bodies = Arc::new(fixture.bodies.clone());
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server = TestServer::spawn(Arc::new({
+            let bodies = Arc::clone(&bodies);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |request| {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(35));
+                let response = if broken.as_deref() == Some(request.path.as_str()) {
+                    TestResponse::status(503)
+                } else {
+                    bodies
+                        .get(&request.path)
+                        .map(|body| TestResponse::ok(body))
+                        .unwrap_or_else(|| TestResponse::status(404))
+                };
+                active.fetch_sub(1, Ordering::SeqCst);
+                response
+            }
+        }));
+        let base = server.base_url();
+        let plan = synthetic_plan(
+            base,
+            &fixture.bodies["/mojang/client.jar"],
+            &fixture.bodies["/mojang/logging/client-1.21.2.xml"],
+            &fixture.bodies["/mojang/libraries/com/mojang/brigadier/1.0.18/brigadier-1.0.18.jar"],
+            &fixture.bodies["/mojang/libraries/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-natives-windows.jar"],
+            &fixture.bodies["/mojang/asset-index/32.json"],
+            &fixture.bodies["/fabric-maven/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar"],
+        );
+        (server, plan, maximum)
+    }
+
+    #[tokio::test]
+    async fn independent_acquisitions_are_concurrent_and_bounded() {
+        let (server, plan, maximum) = parallel_test_world(None);
+        let root =
+            std::env::temp_dir().join(format!("aurora-parallel-test-{}", uuid::Uuid::new_v4()));
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let instance = InstanceId::new("parallel-bound").unwrap();
+        let context = test_context(server.base_url()).with_concurrency_for_testing(2);
+        install_game(
+            &managed,
+            &instance,
+            &plan,
+            &context,
+            &mut |_| {},
+            InstallFaults::default(),
+        )
+        .await
+        .unwrap();
+        let observed = maximum.load(Ordering::SeqCst);
+        assert!(
+            observed > 1,
+            "independent requests must overlap: {observed}"
+        );
+        assert!(observed <= 2, "the configured bound must hold: {observed}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_failed_concurrent_acquisition_never_commits_installed_state() {
+        let (fixture, _) = synthetic_game();
+        let broken_asset = fixture
+            .bodies
+            .keys()
+            .find(|path| path.starts_with("/assets/"))
+            .unwrap()
+            .clone();
+        let (server, plan, maximum) = parallel_test_world(Some(broken_asset));
+        let root =
+            std::env::temp_dir().join(format!("aurora-parallel-failure-{}", uuid::Uuid::new_v4()));
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let instance = InstanceId::new("parallel-failure").unwrap();
+        let context = test_context(server.base_url()).with_concurrency_for_testing(2);
+        let error = install_game(
+            &managed,
+            &instance,
+            &plan,
+            &context,
+            &mut |_| {},
+            InstallFaults::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, InstallError::Acquisition(_)), "{error}");
+        assert!(maximum.load(Ordering::SeqCst) <= 2);
+        assert!(!managed.instance_paths(&instance).game().exists());
+        assert!(
+            std::fs::read_dir(ArtifactCache::new(managed.clone()).staging_dir())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Opt-in wall-clock diagnostic through the real game executor. The
+    /// loopback host supplies many small independent assets with fixed
+    /// latency; no public service or user launcher data is involved.
+    #[tokio::test]
+    #[ignore = "controlled installation performance diagnostic"]
+    async fn benchmark_controlled_game_installation() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let (fixture, _) = synthetic_game();
+        let mut bodies = fixture.bodies.clone();
+        let mut objects = serde_json::Map::new();
+        for number in 0..192u32 {
+            let body = format!("benchmark asset {number:04} fixed payload").into_bytes();
+            let hash = sha1_hex(&body);
+            bodies.insert(format!("/assets/{}/{hash}", &hash[..2]), body.clone());
+            objects.insert(
+                format!("minecraft/sounds/benchmark/{number:04}.ogg"),
+                serde_json::json!({"hash": hash, "size": body.len()}),
+            );
+        }
+        let index = serde_json::json!({"objects": objects})
+            .to_string()
+            .into_bytes();
+        bodies.insert("/mojang/asset-index/32.json".to_owned(), index.clone());
+        let served = Arc::new(bodies);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicU64::new(0));
+        let server = TestServer::spawn(Arc::new({
+            let served = Arc::clone(&served);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let bytes = Arc::clone(&bytes);
+            move |request| {
+                let in_flight = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(in_flight, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(18));
+                let response = served
+                    .get(&request.path)
+                    .map(|body| {
+                        bytes.fetch_add(body.len() as u64, Ordering::SeqCst);
+                        TestResponse::ok(body)
+                    })
+                    .unwrap_or_else(|| TestResponse::status(404));
+                active.fetch_sub(1, Ordering::SeqCst);
+                response
+            }
+        }));
+        let base = server.base_url();
+        let plan = synthetic_plan(
+            base,
+            &served["/mojang/client.jar"],
+            &served["/mojang/logging/client-1.21.2.xml"],
+            &served["/mojang/libraries/com/mojang/brigadier/1.0.18/brigadier-1.0.18.jar"],
+            &served["/mojang/libraries/org/lwjgl/lwjgl/3.4.1/lwjgl-3.4.1-natives-windows.jar"],
+            &index,
+            &served["/fabric-maven/org/ow2/asm/asm/9.10.1/asm-9.10.1.jar"],
+        );
+        let root = std::env::temp_dir().join(format!("aurora-perf-bench-{}", uuid::Uuid::new_v4()));
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let concurrency = std::env::var("AURORA_BENCH_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=32).contains(value))
+            .unwrap_or(SMALL_ARTIFACT_CONCURRENCY);
+        let context = test_context(base).with_concurrency_for_testing(concurrency);
+        for (scenario, id) in [
+            ("cold", "benchmark-first"),
+            ("warm-reinstall", "benchmark-first"),
+            ("second-instance", "benchmark-second"),
+        ] {
+            let instance = InstanceId::new(id).unwrap();
+            let before_requests = server.request_count();
+            let before_bytes = bytes.load(Ordering::SeqCst);
+            maximum.store(0, Ordering::SeqCst);
+            let start = Instant::now();
+            let mut phases = Vec::new();
+            let mut previous = "start";
+            install_game(
+                &managed,
+                &instance,
+                &plan,
+                &context,
+                &mut |progress| {
+                    let next = if progress.phase == InstallPhase::Acquiring {
+                        match progress.current_item.as_deref() {
+                            Some("asset index") => "asset-index",
+                            Some(item) if item.contains(" client") => "client",
+                            Some(item) if item.starts_with("logging configuration") => "logging",
+                            Some(item) if item.starts_with("asset ") => "assets",
+                            _ => "libraries",
+                        }
+                    } else {
+                        progress.phase.as_str()
+                    };
+                    if next != previous {
+                        phases.push((next, start.elapsed().as_millis()));
+                        previous = next;
+                    }
+                },
+                InstallFaults::default(),
+            )
+            .await
+            .unwrap();
+            let total_ms = start.elapsed().as_millis();
+            let validation_start = Instant::now();
+            let validation = validate_installed_game(&managed, &instance).unwrap();
+            assert!(matches!(
+                validation,
+                ValidationOutcome::Installed(InstalledGameValidation {
+                    status: ValidationStatus::Valid,
+                    ..
+                })
+            ));
+            println!(
+                "BENCH limit={concurrency} {scenario} total_ms={total_ms} validation_ms={} requests={} downloaded_bytes={} max_concurrency={} phases={phases:?}",
+                validation_start.elapsed().as_millis(),
+                server.request_count() - before_requests,
+                bytes.load(Ordering::SeqCst) - before_bytes,
+                maximum.load(Ordering::SeqCst),
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Controlled live installation against the real official Mojang and

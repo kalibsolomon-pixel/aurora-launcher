@@ -560,6 +560,7 @@ async fn install_instance_components(
     progress: &mut (dyn FnMut(InstanceProgress) + Send),
     faults: InstanceFaults,
 ) -> Result<(), InstanceError> {
+    let started = std::time::Instant::now();
     let release = endpoints
         .release_manifest()
         .resolve_exact(
@@ -570,9 +571,11 @@ async fn install_instance_components(
             channel: record.release().channel(),
             aurora_version: record.release().aurora_version().to_owned(),
         })?;
+    let release_finished = std::time::Instant::now();
 
     progress(report(InstancePhase::ResolvingGame, None));
     let plan = resolve_record_game_plan(endpoints, record, release).await?;
+    let metadata_finished = std::time::Instant::now();
 
     progress(report(InstancePhase::InstallingGame, None));
     execute_game_install(
@@ -584,6 +587,7 @@ async fn install_instance_components(
         crate::install::InstallFaults::default(),
     )
     .await?;
+    let game_finished = std::time::Instant::now();
 
     if faults.fail_before_aurora_install {
         return Err(InstanceError::Aurora(AuroraInstallError::Materialization {
@@ -600,6 +604,7 @@ async fn install_instance_components(
         endpoints.install.download_options(),
     )
     .await?;
+    let aurora_finished = std::time::Instant::now();
 
     progress(report(InstancePhase::Validating, None));
     let registry = InstanceRegistry::load(registry_path)?;
@@ -618,6 +623,7 @@ async fn install_instance_components(
                 .collect(),
         });
     }
+    let validation_finished = std::time::Instant::now();
 
     if faults.fail_before_ready {
         return Err(InstanceError::Registry(InstanceRegistryError::Write(
@@ -633,6 +639,25 @@ async fn install_instance_components(
             stored.set_state(InstanceState::Ready);
         }
         registry.save(registry_path)?;
+    }
+
+    if std::env::var_os("AURORA_INSTALL_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "[aurora-instance] total_ms={} release_resolution_ms={} metadata_and_planning_ms={} game_ms={} aurora_and_fabric_api_ms={} final_validation_ms={} ready_commit_ms={}",
+            started.elapsed().as_millis(),
+            release_finished.duration_since(started).as_millis(),
+            metadata_finished
+                .duration_since(release_finished)
+                .as_millis(),
+            game_finished.duration_since(metadata_finished).as_millis(),
+            aurora_finished.duration_since(game_finished).as_millis(),
+            validation_finished
+                .duration_since(aurora_finished)
+                .as_millis(),
+            std::time::Instant::now()
+                .duration_since(validation_finished)
+                .as_millis(),
+        );
     }
 
     Ok(())
@@ -2676,5 +2701,239 @@ mod tests {
         assert!(!managed.runtimes_dir().exists());
         assert!(events > 0);
         let _ = server;
+    }
+
+    /// Opt-in production-source diagnostic in a uniquely created temp root.
+    /// The root is retained for manual readiness and launch inspection.
+    #[tokio::test]
+    #[ignore = "downloads the real production Aurora 2.1.2 instance"]
+    async fn benchmark_live_production_instances() {
+        use std::time::Instant;
+
+        let root =
+            std::env::temp_dir().join(format!("aurora-production-bench-{}", uuid::Uuid::new_v4()));
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let endpoints = InstanceEndpoints::creation().unwrap();
+        let registry_path = managed.instance_registry_file();
+        let config_path = managed.config_file();
+        println!("PRODUCTION BENCH ROOT {}", root.display());
+
+        let started = Instant::now();
+        let mut phases = Vec::new();
+        let mut last = String::new();
+        let mut progress = |event: InstanceProgress| {
+            let phase = match &event.game {
+                Some(game) if game.phase == crate::install::InstallPhase::Acquiring => {
+                    let category = match game.current_item.as_deref() {
+                        Some("asset index") => "asset-index",
+                        Some(item) if item.contains(" client") => "client",
+                        Some(item) if item.starts_with("logging configuration") => "logging",
+                        Some(item) if item.starts_with("asset ") => "assets",
+                        _ => "libraries",
+                    };
+                    format!("game/{category}")
+                }
+                Some(game) => format!("game/{}", game.phase.as_str()),
+                None => event.phase.as_str().to_owned(),
+            };
+            if phase != last {
+                phases.push((phase.clone(), started.elapsed().as_millis()));
+                last = phase;
+            }
+        };
+        let first = create_instance(
+            &managed,
+            &registry_path,
+            &config_path,
+            &endpoints,
+            CreateInstanceRequest::new(
+                "Production benchmark one",
+                InstanceConfiguration::for_minecraft_version("1.21.11"),
+            ),
+            &mut progress,
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PRODUCTION BENCH cold total_ms={} instance={} phases={phases:?}",
+            started.elapsed().as_millis(),
+            first.id()
+        );
+
+        let started = Instant::now();
+        install_instance_configuration(
+            &managed,
+            &registry_path,
+            &config_path,
+            &endpoints,
+            first.id(),
+            &mut |_| {},
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PRODUCTION BENCH warm-reinstall total_ms={}",
+            started.elapsed().as_millis()
+        );
+
+        let started = Instant::now();
+        let second = create_instance(
+            &managed,
+            &registry_path,
+            &config_path,
+            &endpoints,
+            CreateInstanceRequest::new(
+                "Production benchmark two",
+                InstanceConfiguration::for_minecraft_version("1.21.11"),
+            ),
+            &mut |_| {},
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PRODUCTION BENCH second-instance total_ms={} instance={}",
+            started.elapsed().as_millis(),
+            second.id()
+        );
+
+        for record in [first, second] {
+            let validation = validate_instance(
+                &managed,
+                &InstanceRegistry::load(&registry_path).unwrap(),
+                record.id(),
+            )
+            .unwrap();
+            assert_eq!(
+                validation.status,
+                InstanceStatus::Ready,
+                "{:?}",
+                validation.problems
+            );
+        }
+    }
+
+    /// Repeat the warm transaction on an already-created benchmark root.
+    /// The root must be a direct child of the OS temp directory with the
+    /// benchmark prefix, so this cannot mutate normal launcher data.
+    #[tokio::test]
+    #[ignore = "reinstalls an existing controlled production benchmark instance"]
+    async fn benchmark_existing_production_warm_install() {
+        use std::time::Instant;
+
+        let requested = std::env::var_os("AURORA_BENCH_ROOT").expect("set AURORA_BENCH_ROOT");
+        let root = std::path::PathBuf::from(requested).canonicalize().unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("aurora-production-bench-")
+        );
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let registry_path = managed.instance_registry_file();
+        let registry = InstanceRegistry::load(&registry_path).unwrap();
+        let first = registry.instances().first().unwrap();
+        assert_eq!(first.release().aurora_version(), "2.1.2");
+        let id = first.id().clone();
+        let endpoints = InstanceEndpoints::operational().unwrap();
+        let started = Instant::now();
+        let mut phases = Vec::new();
+        let mut last = String::new();
+        install_instance_configuration(
+            &managed,
+            &registry_path,
+            &managed.config_file(),
+            &endpoints,
+            &id,
+            &mut |event| {
+                let phase = match &event.game {
+                    Some(game) if game.phase == crate::install::InstallPhase::Acquiring => {
+                        match game.current_item.as_deref() {
+                            Some("asset index") => "asset-index".to_owned(),
+                            Some(item) if item.contains(" client") => "client".to_owned(),
+                            Some(item) if item.starts_with("logging configuration") => {
+                                "logging".to_owned()
+                            }
+                            Some(item) if item.starts_with("asset ") => "assets".to_owned(),
+                            _ => "libraries".to_owned(),
+                        }
+                    }
+                    Some(game) => game.phase.as_str().to_owned(),
+                    None => event.phase.as_str().to_owned(),
+                };
+                if phase != last {
+                    phases.push((phase.clone(), started.elapsed().as_millis()));
+                    last = phase;
+                }
+            },
+            InstanceFaults::default(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PRODUCTION BENCH existing-warm total_ms={} phases={phases:?}",
+            started.elapsed().as_millis()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "provisions the real managed Java runtime in a controlled benchmark root"]
+    async fn benchmark_live_production_managed_java() {
+        use std::time::Instant;
+
+        let requested = std::env::var_os("AURORA_BENCH_ROOT").expect("set AURORA_BENCH_ROOT");
+        let root = std::path::PathBuf::from(requested).canonicalize().unwrap();
+        let temp = std::env::temp_dir().canonicalize().unwrap();
+        assert_eq!(root.parent(), Some(temp.as_path()));
+        assert!(
+            root.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("aurora-production-bench-")
+        );
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        let registry_path = managed.instance_registry_file();
+        let registry = InstanceRegistry::load(&registry_path).unwrap();
+        let id = registry.instances().first().unwrap().id();
+        let endpoints = InstanceEndpoints::operational().unwrap();
+        let runtime_endpoints = RuntimeMetadataEndpoints::official();
+        let resolve_started = Instant::now();
+        let (_, plan) = resolve_instance_launch_plans(
+            &managed,
+            &registry_path,
+            &endpoints,
+            &runtime_endpoints,
+            id,
+        )
+        .await
+        .unwrap();
+        println!(
+            "PRODUCTION JAVA resolve_ms={} component={} major={} files={}",
+            resolve_started.elapsed().as_millis(),
+            plan.component(),
+            plan.required_major_version(),
+            plan.entries().len()
+        );
+        for scenario in ["cold", "warm"] {
+            let started = Instant::now();
+            let result = crate::runtime::install::ensure_runtime(
+                &managed,
+                &plan,
+                endpoints.install.download_options(),
+                true,
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+            println!(
+                "PRODUCTION JAVA {scenario} total_ms={} reused={}",
+                started.elapsed().as_millis(),
+                result.reused()
+            );
+        }
     }
 }

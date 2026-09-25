@@ -191,7 +191,7 @@ pub(crate) fn is_loopback_host(url: &Url) -> bool {
 
 /// Tunable transport limits. Tests use shorter timeouts; production uses the
 /// documented defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DownloadOptions {
     pub connect_timeout: Duration,
     pub idle_read_timeout: Duration,
@@ -607,15 +607,35 @@ fn validate_transport_url(
 /// Shared by the artifact transport and the Minecraft metadata fetch so every
 /// outbound request obeys one policy; it confers no trust by itself.
 pub(crate) fn build_client(options: &DownloadOptions) -> reqwest::Client {
-    ensure_rustls_crypto_provider();
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
 
-    reqwest::Client::builder()
+    // A reqwest client owns dispatch tasks in the Tokio runtime where it was
+    // created. Tests create many short-lived runtimes, so a client from one
+    // runtime must never be handed to another after its dispatcher exits.
+    static CLIENTS: OnceLock<
+        Mutex<HashMap<(tokio::runtime::Id, DownloadOptions), reqwest::Client>>,
+    > = OnceLock::new();
+    let runtime = tokio::runtime::Handle::current().id();
+    let key = (runtime, options.clone());
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = clients
+        .lock()
+        .expect("HTTP client pool lock is not poisoned");
+    if let Some(client) = clients.get(&key) {
+        return client.clone();
+    }
+
+    ensure_rustls_crypto_provider();
+    let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(options.connect_timeout)
         .read_timeout(options.idle_read_timeout)
         .redirect(redirect_policy(options.max_redirects))
         .build()
-        .expect("download client configuration is valid")
+        .expect("download client configuration is valid");
+    clients.insert(key, client.clone());
+    client
 }
 
 /// Installs the rustls crypto provider reqwest requires.
@@ -903,6 +923,40 @@ mod tests {
             idle_read_timeout: Duration::from_millis(500),
             max_redirects: 3,
         }
+    }
+
+    #[test]
+    fn shared_clients_do_not_cross_tokio_runtime_lifetimes() {
+        let server = serve(|_| TestResponse::ok(b"runtime-scoped pooled client"));
+        let bytes = b"runtime-scoped pooled client";
+        let source = source_for(
+            &server,
+            "/artifact",
+            &digest_of(bytes),
+            Some(bytes.len() as u64),
+        );
+        let root =
+            std::env::temp_dir().join(format!("aurora-http-runtime-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for number in 0..2 {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let result = download(
+                    &source,
+                    &root.join(format!("{number}.part")),
+                    &short_options(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(result.bytes, bytes.len() as u64);
+            });
+            drop(runtime);
+        }
+        assert_eq!(server.request_count(), 2);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]

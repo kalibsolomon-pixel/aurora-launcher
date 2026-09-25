@@ -25,6 +25,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
     "system-proxy",
 ] }
+futures-util = "0.3"
 # reqwest's default rustls provider (aws-lc-rs) needs CMake/NASM on some hosts;
 # the ring provider builds with a plain C compiler, so the launcher supplies it.
 rustls = { version = "0.23", default-features = false, features = [
@@ -41,7 +42,7 @@ sha2 = "0.10"
 # Phase 7's `process` + `time` bound structured managed-Java diagnostics;
 # Phase 8's `macros` provides the `select!` used to race the OAuth callback
 # receiver against login cancellation and timeout.
-tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
 url = "2"
 # Instance identifier generation (Phase 6): opaque, collision-resistant UUIDv4
 # in the canonical simple (hyphen-less) lowercase-hex form. Focused and

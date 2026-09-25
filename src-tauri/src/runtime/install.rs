@@ -1,11 +1,13 @@
 //! Transactional installation and read-only validation of shared runtimes.
 
+use futures_util::future::join_all;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::cache::{AcquisitionError, ArtifactCache};
 use crate::downloads::{DownloadOptions, Sha1ArtifactSource};
@@ -20,6 +22,7 @@ use crate::runtime::state::{
 const STAGING_PREFIX: &str = ".installing-";
 const STAGED_RUNTIME_DIR: &str = "runtime";
 const REPLACED_RUNTIME_DIR: &str = "replaced-runtime";
+const RUNTIME_DOWNLOAD_CONCURRENCY: usize = 16;
 pub const DEFAULT_JAVA_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +154,7 @@ async fn ensure_runtime_with_faults(
     progress: &mut (dyn FnMut(InstallRuntimeProgress) + Send),
     faults: RuntimeInstallFaults,
 ) -> Result<InstalledRuntime, RuntimeInstallError> {
+    let started = Instant::now();
     let lock = runtime_installation_lock(&plan.identity());
     let _guard = lock
         .try_lock()
@@ -167,6 +171,14 @@ async fn ensure_runtime_with_faults(
     )
     .await?;
     if initial.status == RuntimeValidationStatus::Ready {
+        if std::env::var_os("AURORA_INSTALL_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "[aurora-runtime] reused=true total_ms={} validated_files={} verified_bytes={}",
+                started.elapsed().as_millis(),
+                initial.checked_files,
+                initial.verified_bytes
+            );
+        }
         let state = load_runtime_state(&root)?.expect("ready validation loaded state");
         return Ok(installed_result(plan, managed, state, true));
     }
@@ -183,25 +195,49 @@ async fn ensure_runtime_with_faults(
     let total = files.len() as u32;
     let cache = ArtifactCache::new(managed.clone());
     let mut acquired = HashMap::new();
-    for (index, (relative, artifact)) in files.iter().enumerate() {
-        progress(report(
-            RuntimeInstallPhase::Acquiring,
-            index as u32,
-            total,
-            Some(relative.clone()),
-        ));
-        let source = Sha1ArtifactSource::https_or_loopback(
-            artifact.url(),
-            &artifact.sha1().as_hex(),
-            Some(artifact.size_bytes()),
-        )
-        .map_err(|error| {
-            RuntimeInstallError::Plan(format!("runtime artifact '{relative}' is invalid: {error}"))
-        })?;
-        let verified = cache.acquire_sha1(&source, options).await?;
-        acquired.insert(relative.clone(), verified.path);
+    let mut downloads = 0usize;
+    let mut downloaded_bytes = 0u64;
+    for batch in files.chunks(RUNTIME_DOWNLOAD_CONCURRENCY) {
+        let cache = &cache;
+        let results = join_all(batch.iter().map(|(relative, artifact)| async move {
+            let source = Sha1ArtifactSource::https_or_loopback(
+                artifact.url(),
+                &artifact.sha1().as_hex(),
+                Some(artifact.size_bytes()),
+            )
+            .map_err(|error| {
+                RuntimeInstallError::Plan(format!(
+                    "runtime artifact '{relative}' is invalid: {error}"
+                ))
+            })?;
+            let verified = cache.acquire_sha1(&source, options).await?;
+            Ok::<_, RuntimeInstallError>((
+                relative.clone(),
+                verified.path,
+                verified.origin,
+                verified.bytes,
+            ))
+        }))
+        .await;
+        // Settle each bounded batch before returning an error, so no
+        // in-flight transfer is dropped with an open staging file.
+        for result in results {
+            let (relative, path, origin, bytes) = result?;
+            if origin == crate::cache::ArtifactOrigin::Downloaded {
+                downloads += 1;
+                downloaded_bytes += bytes;
+            }
+            acquired.insert(relative.clone(), path);
+            progress(report(
+                RuntimeInstallPhase::Acquiring,
+                acquired.len() as u32,
+                total,
+                Some(relative),
+            ));
+        }
     }
     progress(report(RuntimeInstallPhase::Acquiring, total, total, None));
+    let acquisition_finished = Instant::now();
 
     let component_root = managed.runtimes_dir().join(plan.component());
     let staging = component_root.join(format!("{STAGING_PREFIX}{}", plan.identity()));
@@ -268,6 +304,7 @@ async fn ensure_runtime_with_faults(
             }
         }
     }
+    let materialization_finished = Instant::now();
 
     let state = RuntimeInstalledState::from_plan(plan, now_unix_seconds());
     progress(report(RuntimeInstallPhase::Validating, 0, total, None));
@@ -277,6 +314,7 @@ async fn ensure_runtime_with_faults(
             staged_validation.problems.join("; "),
         ));
     }
+    let staged_validation_finished = Instant::now();
     // Completion marker written last. It is still invisible at the final path.
     std::fs::write(staged_root.join(RUNTIME_STATE_FILE_NAME), state.to_json())
         .map_err(|error| RuntimeInstallError::State(RuntimeStateError::Write(error)))?;
@@ -289,6 +327,7 @@ async fn ensure_runtime_with_faults(
 
     progress(report(RuntimeInstallPhase::Committing, total, total, None));
     promote_staged_runtime(managed, plan, &root, &staging, &staged_root, replacing)?;
+    let commit_finished = Instant::now();
 
     if execute_diagnostic {
         progress(report(
@@ -309,6 +348,31 @@ async fn ensure_runtime_with_faults(
         return Err(RuntimeInstallError::Validation(
             final_validation.problems.join("; "),
         ));
+    }
+    if std::env::var_os("AURORA_INSTALL_DIAGNOSTICS").is_some() {
+        eprintln!(
+            "[aurora-runtime] reused=false total_ms={} acquisition_ms={} materialization_ms={} staged_validation_ms={} commit_ms={} final_validation_ms={} files={} cache_hits={} downloads={} downloaded_bytes={} limit={}",
+            started.elapsed().as_millis(),
+            acquisition_finished.duration_since(started).as_millis(),
+            materialization_finished
+                .duration_since(acquisition_finished)
+                .as_millis(),
+            staged_validation_finished
+                .duration_since(materialization_finished)
+                .as_millis(),
+            commit_finished
+                .duration_since(staged_validation_finished)
+                .as_millis(),
+            started
+                .elapsed()
+                .saturating_sub(commit_finished.duration_since(started))
+                .as_millis(),
+            total,
+            total as usize - downloads,
+            downloads,
+            downloaded_bytes,
+            RUNTIME_DOWNLOAD_CONCURRENCY,
+        );
     }
     Ok(installed_result(plan, managed, state, false))
 }
@@ -820,6 +884,106 @@ mod tests {
     use crate::test_support::{TestResponse, TestServer};
     use std::collections::BTreeMap;
     use std::sync::Arc;
+
+    #[tokio::test]
+    #[ignore = "controlled managed Java performance diagnostic"]
+    async fn benchmark_controlled_runtime_installation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+
+        let mut bodies = BTreeMap::new();
+        bodies.insert("/bin-java.exe".to_owned(), b"java-runtime".to_vec());
+        bodies.insert("/bin-javaw.exe".to_owned(), b"javaw-runtime".to_vec());
+        for number in 0..128u32 {
+            bodies.insert(
+                format!("/file-{number:04}"),
+                format!("runtime file {number:04}").into_bytes(),
+            );
+        }
+        let bodies = Arc::new(bodies);
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let server = TestServer::spawn(Arc::new({
+            let bodies = Arc::clone(&bodies);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |request| {
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(count, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(18));
+                let response = bodies
+                    .get(&request.path)
+                    .map(|body| TestResponse::ok(body))
+                    .unwrap_or_else(|| TestResponse::status(404));
+                active.fetch_sub(1, Ordering::SeqCst);
+                response
+            }
+        }));
+        let mut files = BTreeMap::new();
+        files.insert("bin".to_owned(), RuntimeFileKind::Directory);
+        for (path, url_path, executable) in [
+            ("bin/java.exe".to_owned(), "/bin-java.exe".to_owned(), true),
+            (
+                "bin/javaw.exe".to_owned(),
+                "/bin-javaw.exe".to_owned(),
+                true,
+            ),
+        ]
+        .into_iter()
+        .chain((0..128u32).map(|number| {
+            (
+                format!("lib/file-{number:04}"),
+                format!("/file-{number:04}"),
+                false,
+            )
+        })) {
+            let body = &bodies[&url_path];
+            files.insert(
+                path,
+                RuntimeFileKind::File {
+                    executable,
+                    downloads: RuntimeDownloads {
+                        raw: RuntimeDownload {
+                            sha1: Sha1Digest::compute(body).as_hex(),
+                            size: body.len() as u64,
+                            url: format!("{}{}", server.base_url(), url_path),
+                        },
+                        lzma: None,
+                    },
+                },
+            );
+        }
+        let plan = JavaRuntimePlan::from_metadata(
+            "java-runtime-epsilon",
+            25,
+            RuntimePlatform::new(RuntimeOperatingSystem::Windows, RuntimeArchitecture::X86_64),
+            RuntimeSelection {
+                version_name: "25.0.1".to_owned(),
+                released: "2025-10-12".to_owned(),
+                manifest_sha1: Sha1Digest::compute(server.base_url().as_bytes()),
+            },
+            RuntimeFileDocument { files },
+        )
+        .unwrap();
+        let root =
+            std::env::temp_dir().join(format!("aurora-runtime-bench-{}", uuid::Uuid::new_v4()));
+        let managed = ManagedPaths::from_app_local_data_dir(root.join("managed")).unwrap();
+        for scenario in ["cold", "warm"] {
+            maximum.store(0, Ordering::SeqCst);
+            let before = server.request_count();
+            let start = Instant::now();
+            ensure_runtime(&managed, &plan, &options(), false, &mut |_| {})
+                .await
+                .unwrap();
+            println!(
+                "RUNTIME BENCH {scenario} total_ms={} requests={} max_concurrency={}",
+                start.elapsed().as_millis(),
+                server.request_count() - before,
+                maximum.load(Ordering::SeqCst)
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn test_plan(base: &str, java: &[u8], javaw: &[u8]) -> JavaRuntimePlan {
         let mut files = BTreeMap::new();
