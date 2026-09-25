@@ -484,6 +484,7 @@ impl From<AcquisitionError> for CommandError {
                 DownloadError::SizeMismatch { .. } => "artifact_size_mismatch",
                 DownloadError::Sha256Mismatch { .. } => "artifact_hash_mismatch",
                 DownloadError::Sha1Mismatch { .. } => "artifact_hash_mismatch",
+                DownloadError::Sha512Mismatch { .. } => "artifact_hash_mismatch",
                 DownloadError::ObservedDigestDrift { .. } => "fabric_artifact_unverified",
                 DownloadError::StagingIo(_) => "cache_io_failure",
             },
@@ -2147,6 +2148,269 @@ pub fn open_instance_content_folder(
     })
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthSearchRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    query: String,
+    offset: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthProjectRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthPreviewRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+    version_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthInstallRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+    version_id: String,
+    preview_fingerprint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModrinthPreviewResponse {
+    preview: crate::modrinth::InstallPreview,
+    preview_fingerprint: String,
+}
+
+fn provider_context(
+    managed: &ManagedPaths,
+    id: &str,
+) -> Result<(crate::instances::InstanceId, crate::modrinth::Context), CommandError> {
+    let instance = registered_instance(managed, id)?;
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+    let record = registry.find(&instance).ok_or_else(|| {
+        CommandError::new(
+            "instance_not_found",
+            "Instance was removed during the request.",
+        )
+    })?;
+    if record.state() != crate::instances::InstanceState::Ready {
+        return Err(CommandError::new(
+            "instance_not_ready",
+            "Install the instance before browsing provider content.",
+        ));
+    }
+    Ok((
+        instance,
+        crate::modrinth::Context {
+            minecraft_version: record.release().minecraft_version().to_owned(),
+            loader: "fabric".into(),
+        },
+    ))
+}
+
+fn provider_state(
+    managed: &ManagedPaths,
+    instance: &crate::instances::InstanceId,
+) -> Result<crate::instance_content::ContentState, CommandError> {
+    use crate::integrity::{ArtifactDigest, verify_file};
+    let state = crate::instance_content::ContentState::load(managed, instance)?;
+    for record in &state.entries {
+        let directory =
+            crate::instance_content::validate_directory(managed, instance, record.content_type)?;
+        let path = directory.join(&record.file_name);
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+            CommandError::new(
+                "provider_content_collision",
+                "An installed provider file is missing or changed.",
+            )
+        })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(CommandError::new(
+                "provider_content_collision",
+                "An installed provider file is not a regular file.",
+            ));
+        }
+        #[cfg(windows)]
+        if {
+            use std::os::windows::fs::MetadataExt as _;
+            metadata.file_attributes() & 0x400 != 0
+        } {
+            return Err(CommandError::new(
+                "provider_content_collision",
+                "An installed provider file is a reparse point.",
+            ));
+        }
+        let digest = ArtifactDigest::parse(&record.sha256).map_err(|_| {
+            CommandError::new(
+                "content_state_malformed",
+                "Provider content state has an invalid digest.",
+            )
+        })?;
+        if verify_file(&path, &digest, None).is_err() {
+            return Err(CommandError::new(
+                "provider_content_collision",
+                "An installed provider file is missing or changed. Inspect local content before installing.",
+            ));
+        }
+    }
+    Ok(state)
+}
+
+fn provider_fingerprint(
+    instance: &crate::instances::InstanceId,
+    resolved: &crate::modrinth::Resolved,
+) -> String {
+    use sha2::Digest as _;
+    let plans: Vec<_> = resolved
+        .plans
+        .iter()
+        .map(|plan| {
+            let source = match &plan.source {
+                crate::instance_content::ProviderArtifactSource::Sha256(source) => {
+                    serde_json::json!({
+                        "algorithm": "sha256",
+                        "digest": source.sha256().as_hex(),
+                        "url": source.url().as_str(),
+                        "size": source.size_bytes(),
+                    })
+                }
+                crate::instance_content::ProviderArtifactSource::Sha512(source) => {
+                    serde_json::json!({
+                        "algorithm": "sha512",
+                        "digest": source.sha512().as_hex(),
+                        "url": source.url().as_str(),
+                        "size": source.size_bytes(),
+                    })
+                }
+            };
+            serde_json::json!({
+                "contentType": plan.content_type,
+                "provider": plan.provider,
+                "projectId": plan.project_id,
+                "versionId": plan.version_id,
+                "fileId": plan.file_id,
+                "fileName": plan.file_name,
+                "displayVersion": plan.display_version,
+                "compatibility": plan.compatibility,
+                "dependencies": plan.dependencies,
+                "source": source,
+            })
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&(instance.to_string(), &resolved.preview, plans))
+        .expect("provider preview and plans serialize");
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn provider_error(error: crate::modrinth::Error) -> CommandError {
+    CommandError::new(error.code(), error.to_string())
+}
+
+#[tauri::command]
+pub async fn search_modrinth(
+    app: AppHandle,
+    request: ModrinthSearchRequest,
+) -> Result<crate::modrinth::SearchPage, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (_, context) = provider_context(&managed, &request.instance_id)?;
+    crate::modrinth::Client::official()
+        .search(
+            &context,
+            request.content_type,
+            &request.query,
+            request.offset,
+        )
+        .await
+        .map_err(provider_error)
+}
+
+#[tauri::command]
+pub async fn get_modrinth_project(
+    app: AppHandle,
+    request: ModrinthProjectRequest,
+) -> Result<crate::modrinth::ProjectDetails, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (_, context) = provider_context(&managed, &request.instance_id)?;
+    crate::modrinth::Client::official()
+        .details(&context, request.content_type, &request.project_id)
+        .await
+        .map_err(provider_error)
+}
+
+#[tauri::command]
+pub async fn preview_modrinth_install(
+    app: AppHandle,
+    request: ModrinthPreviewRequest,
+) -> Result<ModrinthPreviewResponse, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (instance, context) = provider_context(&managed, &request.instance_id)?;
+    let state = provider_state(&managed, &instance)?;
+    let resolved = crate::modrinth::Client::official()
+        .resolve(
+            &context,
+            request.content_type,
+            &request.project_id,
+            &request.version_id,
+            &state,
+        )
+        .await
+        .map_err(provider_error)?;
+    let preview_fingerprint = provider_fingerprint(&instance, &resolved);
+    Ok(ModrinthPreviewResponse {
+        preview: resolved.preview,
+        preview_fingerprint,
+    })
+}
+
+#[tauri::command]
+pub async fn install_modrinth(
+    app: AppHandle,
+    request: ModrinthInstallRequest,
+) -> Result<Vec<crate::instance_content::ProviderRecord>, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (instance, context) = provider_context(&managed, &request.instance_id)?;
+    let state = provider_state(&managed, &instance)?;
+    let resolved = crate::modrinth::Client::official()
+        .resolve(
+            &context,
+            request.content_type,
+            &request.project_id,
+            &request.version_id,
+            &state,
+        )
+        .await
+        .map_err(provider_error)?;
+    if provider_fingerprint(&instance, &resolved) != request.preview_fingerprint {
+        return Err(CommandError::new(
+            "provider_install_failed",
+            "The dependency preview changed. Review it again before installing.",
+        ));
+    }
+    if resolved.plans.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::instance_content::install_provider_plans(&managed, &instance, resolved.plans)
+        .await
+        .map_err(|error| {
+            let code = match error {
+                crate::instance_content::ContentError::Collision => "provider_content_collision",
+                crate::instance_content::ContentError::HashMismatch => "provider_integrity_failure",
+                _ => "provider_install_failed",
+            };
+            CommandError::new(code, error.to_string())
+        })
+}
+
 /// One Minecraft version offered for instance configuration, from the
 /// official Mojang manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3098,6 +3362,69 @@ pub async fn play_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_preview_fingerprint_changes_with_integrity_and_dependency_metadata() {
+        use crate::instance_content::{
+            ContentCompatibility, ContentType, DependencyKind, ProviderArtifactSource,
+            ProviderDependency, ProviderInstallPlan,
+        };
+
+        let instance = crate::instances::InstanceId::new("fingerprint-test").unwrap();
+        let source = |digest: char| {
+            ProviderArtifactSource::Sha512(
+                crate::downloads::Sha512ArtifactSource::https(
+                    "https://cdn.modrinth.com/data/example.jar",
+                    &digest.to_string().repeat(128),
+                    Some(5),
+                )
+                .unwrap(),
+            )
+        };
+        let mut resolved = crate::modrinth::Resolved {
+            preview: crate::modrinth::InstallPreview {
+                project_id: "AAAABBBB".into(),
+                version_id: "11112222".into(),
+                content_type: ContentType::Mod,
+                items: vec![crate::modrinth::PreviewItem {
+                    project_id: "AAAABBBB".into(),
+                    title: "Example".into(),
+                    version_id: "11112222".into(),
+                    version_number: "1.0".into(),
+                    file_name: "example.jar".into(),
+                    already_installed: false,
+                }],
+                warnings: Vec::new(),
+            },
+            plans: vec![ProviderInstallPlan {
+                content_type: ContentType::Mod,
+                provider: "modrinth".into(),
+                project_id: "AAAABBBB".into(),
+                version_id: "11112222".into(),
+                file_id: "a".repeat(128),
+                file_name: "example.jar".into(),
+                display_version: Some("1.0".into()),
+                compatibility: ContentCompatibility {
+                    minecraft_versions: vec!["1.21.11".into()],
+                    loader: Some("fabric".into()),
+                    environment: Some("client_and_server".into()),
+                },
+                dependencies: Vec::new(),
+                source: source('a'),
+            }],
+        };
+        let first = provider_fingerprint(&instance, &resolved);
+        resolved.plans[0].source = source('b');
+        assert_ne!(provider_fingerprint(&instance, &resolved), first);
+        resolved.plans[0].source = source('a');
+        resolved.plans[0].dependencies.push(ProviderDependency {
+            kind: DependencyKind::Required,
+            provider: "modrinth".into(),
+            project_id: "CCCCDDDD".into(),
+            version_id: None,
+        });
+        assert_ne!(provider_fingerprint(&instance, &resolved), first);
+    }
 
     #[test]
     fn instance_folder_resolution_follows_the_registry_and_managed_paths() {

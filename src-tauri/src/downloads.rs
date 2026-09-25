@@ -24,9 +24,10 @@ use std::time::Duration;
 use url::Url;
 
 use crate::integrity::{
-    ArtifactDigest, InvalidDigest, InvalidSha1Digest, Sha1Digest, StreamingSha1Verifier,
-    StreamingVerifier, VerificationFailure,
+    ArtifactDigest, InvalidDigest, InvalidSha1Digest, Sha1Digest, Sha512Digest,
+    StreamingSha1Verifier, StreamingVerifier, VerificationFailure,
 };
+use sha2::{Digest as _, Sha256, Sha512};
 
 /// Default bound on redirect hops the transport is willing to follow.
 pub const MAX_REDIRECTS: usize = 8;
@@ -132,6 +133,7 @@ pub enum InvalidArtifactSource {
     InsecureUrl(String),
     EmbeddedCredentials,
     InvalidDigest(InvalidDigest),
+    InvalidSha512(InvalidDigest),
     InvalidSha1(InvalidSha1Digest),
     InvalidSize,
 }
@@ -151,6 +153,10 @@ impl fmt::Display for InvalidArtifactSource {
             Self::InvalidDigest(error) => {
                 write!(formatter, "the artifact digest is invalid: {error}")
             }
+            Self::InvalidSha512(_) => write!(
+                formatter,
+                "the expected SHA-512 digest must be exactly 128 hexadecimal characters"
+            ),
             Self::InvalidSha1(error) => write!(
                 formatter,
                 "the official expected SHA-1 digest is invalid: {error}"
@@ -167,6 +173,7 @@ impl std::error::Error for InvalidArtifactSource {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidDigest(error) => Some(error),
+            Self::InvalidSha512(error) => Some(error),
             Self::InvalidSha1(error) => Some(error),
             _ => None,
         }
@@ -214,6 +221,107 @@ impl Default for DownloadOptions {
 pub struct DownloadedFile {
     pub bytes: u64,
     pub sha256: ArtifactDigest,
+}
+
+/// A provider artifact with a published SHA-512 and optional exact size.
+/// Its locally computed SHA-256 is an address, not the remote expectation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sha512ArtifactSource {
+    url: Url,
+    sha512: Sha512Digest,
+    size_bytes: Option<u64>,
+}
+
+impl Sha512ArtifactSource {
+    pub fn https(
+        url: &str,
+        sha512: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha512, size_bytes, HostPolicy::HttpsOnly)
+    }
+
+    pub fn loopback_http_for_testing(
+        url: &str,
+        sha512: &str,
+        size_bytes: Option<u64>,
+    ) -> Result<Self, InvalidArtifactSource> {
+        Self::build(url, sha512, size_bytes, HostPolicy::LoopbackHttpAllowed)
+    }
+
+    fn build(
+        url: &str,
+        sha512: &str,
+        size_bytes: Option<u64>,
+        policy: HostPolicy,
+    ) -> Result<Self, InvalidArtifactSource> {
+        if size_bytes == Some(0) {
+            return Err(InvalidArtifactSource::InvalidSize);
+        }
+        Ok(Self {
+            url: validate_transport_url(url, policy)?,
+            sha512: Sha512Digest::parse(sha512).map_err(InvalidArtifactSource::InvalidSha512)?,
+            size_bytes,
+        })
+    }
+
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+    pub fn sha512(&self) -> &Sha512Digest {
+        &self.sha512
+    }
+    pub fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
+    }
+}
+
+pub async fn download_sha512(
+    source: &Sha512ArtifactSource,
+    destination: &Path,
+    options: &DownloadOptions,
+) -> Result<DownloadedFile, DownloadError> {
+    let response = send_request(source.url(), options).await?;
+    check_declared_length(&response, source.size_bytes())?;
+    let mut sha512 = Sha512::new();
+    let mut sha256 = Sha256::new();
+    let mut bytes = 0u64;
+    stream_body(response, destination, |chunk| {
+        bytes += chunk.len() as u64;
+        if let Some(expected) = source.size_bytes() {
+            if bytes > expected {
+                return Err(VerificationFailure::SizeMismatch {
+                    expected,
+                    actual: bytes,
+                });
+            }
+        }
+        sha512.update(chunk);
+        sha256.update(chunk);
+        Ok(())
+    })
+    .await?;
+    if let Some(expected) = source.size_bytes() {
+        if bytes != expected {
+            let _ = tokio::fs::remove_file(destination).await;
+            return Err(DownloadError::SizeMismatch {
+                expected,
+                actual: bytes,
+            });
+        }
+    }
+    let actual: [u8; 64] = sha512.finalize().into();
+    if &actual != source.sha512().as_bytes() {
+        let _ = tokio::fs::remove_file(destination).await;
+        return Err(DownloadError::Sha512Mismatch {
+            expected: source.sha512().as_hex(),
+            actual: actual.iter().map(|byte| format!("{byte:02x}")).collect(),
+        });
+    }
+    Ok(DownloadedFile {
+        bytes,
+        sha256: ArtifactDigest::from_sha256(sha256.finalize().into()),
+    })
 }
 
 /// Streams the artifact described by `source` into `destination`, verifying
@@ -756,13 +864,28 @@ pub enum DownloadError {
     /// A redirect could not be followed within the transport policy.
     Redirect(RedirectRefusal),
     /// The server answered with a non-success status.
-    HttpStatus { status: u16 },
+    HttpStatus {
+        status: u16,
+    },
     /// The received (or declared) byte count differs from the expected size.
-    SizeMismatch { expected: u64, actual: u64 },
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
     /// The received bytes do not hash to the expected digest.
-    Sha256Mismatch { expected: String, actual: String },
+    Sha256Mismatch {
+        expected: String,
+        actual: String,
+    },
     /// The received bytes do not hash to the official expected SHA-1.
-    Sha1Mismatch { expected: String, actual: String },
+    Sha1Mismatch {
+        expected: String,
+        actual: String,
+    },
+    Sha512Mismatch {
+        expected: String,
+        actual: String,
+    },
     /// A digest-less artifact's content no longer matches the locally
     /// recorded observation from a prior acquisition of the same URL.
     ObservedDigestDrift {
@@ -801,6 +924,9 @@ impl DownloadError {
             }
             VerificationFailure::Sha1Mismatch { expected, actual } => {
                 Self::Sha1Mismatch { expected, actual }
+            }
+            VerificationFailure::Sha512Mismatch { expected, actual } => {
+                Self::Sha512Mismatch { expected, actual }
             }
         }
     }
@@ -852,6 +978,10 @@ impl fmt::Display for DownloadError {
                 formatter,
                 "the downloaded artifact does not match its official expected SHA-1 digest: expected {expected} but computed {actual}"
             ),
+            Self::Sha512Mismatch { expected, actual } => write!(
+                formatter,
+                "the downloaded artifact does not match its expected SHA-512 digest: expected {expected} but computed {actual}"
+            ),
             Self::ObservedDigestDrift {
                 url,
                 recorded,
@@ -882,7 +1012,7 @@ impl std::error::Error for DownloadError {
 mod tests {
     use super::*;
     use crate::test_support::{TestRequest, TestResponse, TestServer};
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
     use std::sync::Arc;
     use std::thread;
 

@@ -467,7 +467,7 @@ fn unavailable_entry(file_name: String, reason: String) -> ModEntry {
     }
 }
 
-fn inspect_fabric_metadata(
+pub(crate) fn inspect_fabric_metadata(
     path: &Path,
     jar_size: u64,
 ) -> (Option<FabricModMetadata>, Vec<ModWarning>) {

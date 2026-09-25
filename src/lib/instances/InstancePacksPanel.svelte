@@ -3,6 +3,7 @@
   import type { ContentEntry, InstanceSummary } from "$lib/backend";
   import { launcher } from "$lib/launcher/store.svelte";
   import { formatModSize } from "./mods";
+  import ModrinthBrowse from "./ModrinthBrowse.svelte";
 
   let { instance, kind }: { instance: InstanceSummary; kind: "resourcePack" | "shaderPack" } = $props();
   let query = $state("");
@@ -10,6 +11,7 @@
   let removal = $state<ContentEntry | null>(null);
   let confirmButton: HTMLButtonElement | null = $state(null);
   let loadedKey = $state("");
+  let view = $state<"installed" | "browse">("installed");
   const key = $derived(`${instance.id}:${kind}`);
   const title = $derived(kind === "resourcePack" ? "Resource Packs" : "Shaders");
   const directoryName = $derived(kind === "resourcePack" ? "resourcepacks" : "shaderpacks");
@@ -55,6 +57,13 @@
 </script>
 
 <section class="packs-panel" aria-label={title}>
+  <div class="content-view-tabs" role="group" aria-label={`${title} view`}>
+    <button type="button" class="btn btn-quiet" aria-pressed={view === "installed"} onclick={() => view = "installed"}>Installed</button>
+    <button type="button" class="btn btn-quiet" aria-pressed={view === "browse"} onclick={() => view = "browse"}>Browse</button>
+  </div>
+  {#if view === "browse"}
+    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} {kind} onInstalled={async () => { await launcher.runLoadContent(instance.id, kind); view = "installed"; }} />
+  {:else}
   <div class="packs-heading">
     <div>
       <h3 class="group-title">{title}</h3>
@@ -121,9 +130,12 @@
   {:else if launcher.contentBusy === key}
     <div class="group-row group-row-loading"><span class="spinner" aria-hidden="true"></span> Inspecting local {title.toLowerCase()}…</div>
   {/if}
+  {/if}
 </section>
 
 <style>
+  .content-view-tabs { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); }
+  .content-view-tabs [aria-pressed="true"] { color: var(--color-text); background: var(--color-surface-raised); }
   .packs-panel { min-width: 0; }
   .packs-heading, .packs-heading-actions, .packs-toolbar, .pack-main, .pack-actions, .pack-confirm { display: flex; align-items: center; gap: var(--space-3); }
   .packs-heading { justify-content: space-between; margin-bottom: var(--space-4); }

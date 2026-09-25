@@ -801,6 +801,82 @@ export interface InstanceContentContext {
   environment: "client";
 }
 
+export interface ModrinthSearchPage {
+  offset: number;
+  totalHits: number;
+  hits: ModrinthProjectSummary[];
+}
+
+export interface ModrinthProjectSummary {
+  projectId: string;
+  title: string;
+  summary: string;
+  author: string;
+  downloads: number;
+  projectType: ContentType;
+}
+
+export interface ModrinthVersionChoice {
+  id: string;
+  name: string;
+  versionNumber: string;
+  versionType: string;
+  datePublished: string;
+  environment: string;
+  loaders: string[];
+}
+
+export interface ModrinthProjectDetails {
+  projectId: string;
+  title: string;
+  summary: string;
+  license: string;
+  gameVersions: string[];
+  loaders: string[];
+  environments: string[];
+  versions: ModrinthVersionChoice[];
+  defaultVersionId: string | null;
+  projectType: ContentType;
+}
+
+export interface ModrinthPreviewItem {
+  projectId: string;
+  title: string;
+  versionId: string;
+  versionNumber: string;
+  fileName: string;
+  alreadyInstalled: boolean;
+}
+
+export interface ModrinthInstallPreview {
+  projectId: string;
+  versionId: string;
+  contentType: ContentType;
+  items: ModrinthPreviewItem[];
+  warnings: string[];
+}
+
+export interface ModrinthPreviewResponse {
+  preview: ModrinthInstallPreview;
+  previewFingerprint: string;
+}
+
+export function searchModrinth(instanceId: string, contentType: ContentType, query: string, offset: number): Promise<ModrinthSearchPage> {
+  return contentInvoke("search_modrinth", { instanceId, contentType, query, offset });
+}
+
+export function getModrinthProject(instanceId: string, contentType: ContentType, projectId: string): Promise<ModrinthProjectDetails> {
+  return contentInvoke("get_modrinth_project", { instanceId, contentType, projectId });
+}
+
+export function previewModrinthInstall(instanceId: string, contentType: ContentType, projectId: string, versionId: string): Promise<ModrinthPreviewResponse> {
+  return contentInvoke("preview_modrinth_install", { instanceId, contentType, projectId, versionId });
+}
+
+export function installModrinth(instanceId: string, contentType: ContentType, projectId: string, versionId: string, previewFingerprint: string): Promise<ProviderRecord[]> {
+  return contentInvoke("install_modrinth", { instanceId, contentType, projectId, versionId, previewFingerprint });
+}
+
 async function contentInvoke<T>(command: string, request: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(command, { request });

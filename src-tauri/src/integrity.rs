@@ -15,13 +15,91 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha1::{Digest as _, Sha1};
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 
 /// The SHA-256 digest is represented as exactly 64 hexadecimal characters.
 pub const SHA256_HEX_LENGTH: usize = 64;
 
 /// The SHA-1 digest is represented as exactly 40 hexadecimal characters.
 pub const SHA1_HEX_LENGTH: usize = 40;
+pub const SHA512_HEX_LENGTH: usize = 128;
+
+/// A canonical expected SHA-512 supplied by a content provider.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Sha512Digest([u8; 64]);
+
+impl Sha512Digest {
+    pub fn parse(hex: &str) -> Result<Self, InvalidDigest> {
+        if hex.len() != SHA512_HEX_LENGTH {
+            return Err(InvalidDigest::InvalidLength(hex.len()));
+        }
+        let mut raw = [0; 64];
+        for (index, pair) in hex.as_bytes().chunks_exact(2).enumerate() {
+            let high = hex_value(pair[0]).map_err(InvalidDigest::InvalidCharacter)?;
+            let low = hex_value(pair[1]).map_err(InvalidDigest::InvalidCharacter)?;
+            raw[index] = (high << 4) | low;
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_hex(&self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 64] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Sha512Digest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Sha512Digest({})", self.as_hex())
+    }
+}
+
+/// Recheck a cache object against both the provider expectation and its
+/// locally computed SHA-256 address before it can be reused.
+pub fn verify_file_sha512(
+    path: &Path,
+    expected: &Sha512Digest,
+    expected_size: Option<u64>,
+) -> Result<(u64, ArtifactDigest), VerifyFileError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(VerifyFileError::Io)?;
+    let mut sha512 = Sha512::new();
+    let mut sha256 = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; STREAM_CHUNK_BYTES];
+    loop {
+        let count = file.read(&mut buffer).map_err(VerifyFileError::Io)?;
+        if count == 0 {
+            break;
+        }
+        bytes += count as u64;
+        sha512.update(&buffer[..count]);
+        sha256.update(&buffer[..count]);
+    }
+    if let Some(size) = expected_size {
+        if size != bytes {
+            return Err(VerifyFileError::Mismatch(
+                VerificationFailure::SizeMismatch {
+                    expected: size,
+                    actual: bytes,
+                },
+            ));
+        }
+    }
+    let actual: [u8; 64] = sha512.finalize().into();
+    if &actual != expected.as_bytes() {
+        return Err(VerifyFileError::Mismatch(
+            VerificationFailure::Sha512Mismatch {
+                expected: expected.as_hex(),
+                actual: actual.iter().map(|byte| format!("{byte:02x}")).collect(),
+            },
+        ));
+    }
+    Ok((bytes, ArtifactDigest::from_sha256(sha256.finalize().into())))
+}
 
 /// Read/write chunk size used when streaming files for hashing.
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -324,6 +402,7 @@ pub enum VerificationFailure {
     SizeMismatch { expected: u64, actual: u64 },
     Sha256Mismatch { expected: String, actual: String },
     Sha1Mismatch { expected: String, actual: String },
+    Sha512Mismatch { expected: String, actual: String },
 }
 
 impl fmt::Display for VerificationFailure {
@@ -340,6 +419,10 @@ impl fmt::Display for VerificationFailure {
             Self::Sha1Mismatch { expected, actual } => write!(
                 formatter,
                 "artifact SHA-1 digest does not match the official expected digest: expected {expected} but computed {actual}"
+            ),
+            Self::Sha512Mismatch { expected, actual } => write!(
+                formatter,
+                "artifact SHA-512 digest does not match the expected digest: expected {expected} but computed {actual}"
             ),
         }
     }

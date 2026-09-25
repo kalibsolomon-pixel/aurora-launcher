@@ -14,6 +14,7 @@ pub mod instances;
 pub mod integrity;
 pub mod launch;
 pub mod minecraft;
+pub mod modrinth;
 pub mod paths;
 pub mod runtime;
 pub mod shortcuts;
@@ -57,6 +58,10 @@ pub fn run() {
             application::get_instance_content,
             application::remove_instance_content,
             application::open_instance_content_folder,
+            application::search_modrinth,
+            application::get_modrinth_project,
+            application::preview_modrinth_install,
+            application::install_modrinth,
             application::validate_instance,
             application::get_instance_runtime_status,
             application::ensure_instance_runtime,

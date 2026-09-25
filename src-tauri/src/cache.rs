@@ -43,10 +43,11 @@
 
 use crate::downloads::{
     self, ArtifactSource, DownloadError, DownloadOptions, ObservedArtifactSource,
-    Sha1ArtifactSource,
+    Sha1ArtifactSource, Sha512ArtifactSource,
 };
 use crate::integrity::{
     ArtifactDigest, ArtifactTrust, Sha1Digest, VerifyFileError, verify_file, verify_file_sha1,
+    verify_file_sha512,
 };
 use crate::paths::ManagedPaths;
 use serde::{Deserialize, Serialize};
@@ -332,6 +333,66 @@ impl ArtifactCache {
         source: &ArtifactSource,
     ) -> Result<VerifiedArtifact, AcquisitionError> {
         self.acquire_with(source, &DownloadOptions::default()).await
+    }
+
+    /// Verify a published SHA-512, then address the verified bytes by their
+    /// locally computed SHA-256. The small map is only a lookup hint: every
+    /// reused object is checked against both digests and the expected size.
+    pub async fn acquire_sha512(
+        &self,
+        source: &Sha512ArtifactSource,
+    ) -> Result<VerifiedArtifact, AcquisitionError> {
+        let map_dir = self
+            .managed
+            .cache_dir()
+            .join(ARTIFACTS_DIR)
+            .join("sha512-map");
+        let map_path = map_dir.join(source.sha512().as_hex());
+        if let Ok(text) = std::fs::read_to_string(&map_path) {
+            if let Ok(sha256) = ArtifactDigest::parse(text.trim()) {
+                let path = self.verified_path(&sha256);
+                if let Ok((bytes, computed)) =
+                    verify_file_sha512(&path, source.sha512(), source.size_bytes())
+                {
+                    if computed == sha256 {
+                        return Ok(VerifiedArtifact {
+                            path,
+                            sha256,
+                            bytes,
+                            origin: ArtifactOrigin::CacheHit,
+                        });
+                    }
+                }
+            }
+        }
+        let staging = self.prepare_staging(&self.store_dir())?;
+        let downloaded = downloads::download_sha512(source, &staging, &DownloadOptions::default())
+            .await
+            .map_err(AcquisitionError::Download)?;
+        let path = self.verified_path(&downloaded.sha256);
+        let expected = Expected::Sha256 {
+            digest: &downloaded.sha256,
+            size_bytes: source.size_bytes(),
+        };
+        self.promote(&staging, &path, expected).await?;
+        std::fs::create_dir_all(&map_dir).map_err(AcquisitionError::StoreIo)?;
+        let temporary = map_dir.join(format!(
+            "{}.{}.tmp",
+            source.sha512().as_hex(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&temporary, downloaded.sha256.as_hex())
+            .map_err(AcquisitionError::StoreIo)?;
+        if let Err(error) = std::fs::rename(&temporary, &map_path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(AcquisitionError::StoreIo(error));
+        }
+        Ok(VerifiedArtifact {
+            path,
+            sha256: downloaded.sha256,
+            bytes: downloaded.bytes,
+            origin: ArtifactOrigin::Downloaded,
+        })
     }
 
     /// [`ArtifactCache::acquire`] with explicit transport limits (used by

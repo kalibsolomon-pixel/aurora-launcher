@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
+use futures_util::{StreamExt as _, stream};
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::cache::ArtifactCache;
-use crate::downloads::ArtifactSource;
+use crate::downloads::{ArtifactSource, Sha512ArtifactSource};
 use crate::instances::InstanceId;
 use crate::integrity::{ArtifactDigest, verify_file};
 use crate::paths::ManagedPaths;
@@ -774,11 +775,41 @@ pub fn remove(
     })
 }
 
-/// Backend-only normalized plan. A future provider adapter resolves its own
-/// metadata into this type; no frontend command accepts a source URL or path.
+/// Backend-only normalized plan. Source URL authority belongs to its adapter.
+/// The installed SHA-256 is filled only after expected-digest acquisition.
 pub struct ProviderInstallPlan {
-    pub record: ProviderRecord,
-    pub source: ArtifactSource,
+    pub content_type: ContentType,
+    pub provider: String,
+    pub project_id: String,
+    pub version_id: String,
+    pub file_id: String,
+    pub file_name: String,
+    pub display_version: Option<String>,
+    pub compatibility: ContentCompatibility,
+    pub dependencies: Vec<ProviderDependency>,
+    pub source: ProviderArtifactSource,
+}
+
+pub enum ProviderArtifactSource {
+    Sha256(ArtifactSource),
+    Sha512(Sha512ArtifactSource),
+}
+
+impl ProviderInstallPlan {
+    fn record(&self, sha256: String) -> ProviderRecord {
+        ProviderRecord {
+            content_type: self.content_type,
+            provider: self.provider.clone(),
+            project_id: self.project_id.clone(),
+            version_id: self.version_id.clone(),
+            file_id: self.file_id.clone(),
+            file_name: self.file_name.clone(),
+            sha256,
+            display_version: self.display_version.clone(),
+            compatibility: self.compatibility.clone(),
+            dependencies: self.dependencies.clone(),
+        }
+    }
 }
 
 pub async fn install_provider_artifact(
@@ -786,23 +817,151 @@ pub async fn install_provider_artifact(
     instance: &InstanceId,
     plan: ProviderInstallPlan,
 ) -> Result<ContentInventory, ContentError> {
-    plan.record.validate()?;
-    if plan.record.sha256 != plan.source.sha256().as_hex() {
-        return Err(ContentError::HashMismatch);
+    let cache = ArtifactCache::new(managed.clone());
+    let artifact = match &plan.source {
+        ProviderArtifactSource::Sha256(source) => cache.acquire(source).await,
+        ProviderArtifactSource::Sha512(source) => cache.acquire_sha512(source).await,
     }
-    // Cache acquisition revalidates hits and verifies fresh downloads before
-    // anything may be materialized inside the instance.
-    let artifact = ArtifactCache::new(managed.clone())
-        .acquire(&plan.source)
-        .await
-        .map_err(|error| ContentError::Acquisition(error.to_string()))?;
+    .map_err(|error| ContentError::Acquisition(error.to_string()))?;
+    let record = plan.record(artifact.sha256.as_hex());
+    record.validate()?;
     activate_verified(
         managed,
         instance,
-        plan.record,
+        record,
         &artifact.path,
-        plan.source.size_bytes(),
+        Some(artifact.bytes),
     )
+}
+
+/// Acquire a dependency graph with bounded concurrency, then activate every
+/// file under one instance lock. State is written only after all names exist;
+/// any failure before that removes only names created by this transaction.
+pub async fn install_provider_plans(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    plans: Vec<ProviderInstallPlan>,
+) -> Result<Vec<ProviderRecord>, ContentError> {
+    if plans.is_empty() || plans.len() > 64 {
+        return Err(ContentError::StateMalformed(
+            "provider plan size is invalid".into(),
+        ));
+    }
+    for plan in &plans {
+        validate_file_name(&plan.file_name)?;
+        let provisional = plan.record("0".repeat(64));
+        provisional.validate()?;
+    }
+    let cache = Arc::new(ArtifactCache::new(managed.clone()));
+    let acquired = stream::iter(plans.into_iter().map(|plan| {
+        let cache = cache.clone();
+        async move {
+            let artifact = match &plan.source {
+                ProviderArtifactSource::Sha256(source) => cache.acquire(source).await,
+                ProviderArtifactSource::Sha512(source) => cache.acquire_sha512(source).await,
+            }
+            .map_err(|error| ContentError::Acquisition(error.to_string()))?;
+            let record = plan.record(artifact.sha256.as_hex());
+            record.validate()?;
+            Ok::<_, ContentError>((record, artifact.path, artifact.bytes))
+        }
+    }))
+    .buffered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let acquired = acquired.into_iter().collect::<Result<Vec<_>, _>>()?;
+    activate_provider_transaction(managed, instance, acquired, |state| {
+        state.save(managed, instance)
+    })
+}
+
+fn activate_provider_transaction(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    acquired: Vec<(ProviderRecord, PathBuf, u64)>,
+    commit: impl FnOnce(&ContentState) -> Result<(), ContentError>,
+) -> Result<Vec<ProviderRecord>, ContentError> {
+    with_instance_lock(instance, || {
+        let mut state = ContentState::load(managed, instance)?;
+        let mut keys = HashSet::new();
+        let mut targets = Vec::new();
+        let required = crate::instance_mods::managed_artifact_file_name(managed, instance)
+            .map_err(|error| ContentError::StateMalformed(error.to_string()))?
+            .unwrap_or_default();
+        for (record, _, _) in &acquired {
+            let key = (record.content_type, record.file_name.to_lowercase());
+            if !keys.insert(key.clone())
+                || state.entries.iter().any(|entry| {
+                    entry.content_type == record.content_type
+                        && entry.file_name.eq_ignore_ascii_case(&record.file_name)
+                })
+                || (record.content_type == ContentType::Mod
+                    && required
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&record.file_name)))
+            {
+                return Err(ContentError::Collision);
+            }
+            let directory = ensure_directory(managed, instance, record.content_type)?;
+            let target = directory.join(&record.file_name);
+            if std::fs::symlink_metadata(&target).is_ok()
+                || std::fs::read_dir(&directory)
+                    .map_err(ContentError::Io)?
+                    .any(|item| {
+                        item.is_ok_and(|item| {
+                            item.file_name()
+                                .to_string_lossy()
+                                .eq_ignore_ascii_case(&record.file_name)
+                        })
+                    })
+            {
+                return Err(ContentError::Collision);
+            }
+            targets.push(target);
+        }
+        let mut created = Vec::new();
+        let result = (|| {
+            for ((record, source, bytes), target) in acquired.iter().zip(targets.iter()) {
+                let digest = ArtifactDigest::parse(&record.sha256)
+                    .map_err(|_| ContentError::HashMismatch)?;
+                verify_file(source, &digest, Some(*bytes))
+                    .map_err(|_| ContentError::HashMismatch)?;
+                validate_provider_mod_artifact(record, source, *bytes)?;
+                let temporary =
+                    target.with_file_name(format!(".content-installing-{}", uuid::Uuid::new_v4()));
+                if let Err(error) = std::fs::copy(source, &temporary) {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(ContentError::Io(error));
+                }
+                if verify_file(&temporary, &digest, Some(*bytes)).is_err() {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(ContentError::HashMismatch);
+                }
+                let linked = std::fs::hard_link(&temporary, target);
+                let _ = std::fs::remove_file(&temporary);
+                if let Err(error) = linked {
+                    return if target.exists() {
+                        Err(ContentError::Collision)
+                    } else {
+                        Err(ContentError::Io(error))
+                    };
+                }
+                created.push(target.clone());
+            }
+            state
+                .entries
+                .extend(acquired.iter().map(|(record, _, _)| record.clone()));
+            commit(&state)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for path in created.into_iter().rev() {
+                std::fs::remove_file(path).map_err(ContentError::Io)?;
+            }
+            return Err(error);
+        }
+        Ok(acquired.into_iter().map(|(record, _, _)| record).collect())
+    })
 }
 
 fn activate_verified(
@@ -822,6 +981,25 @@ fn activate_verified(
     )
 }
 
+fn validate_provider_mod_artifact(
+    record: &ProviderRecord,
+    path: &Path,
+    bytes: u64,
+) -> Result<(), ContentError> {
+    if record.content_type != ContentType::Mod {
+        return Ok(());
+    }
+    let (metadata, _) = crate::instance_mods::inspect_fabric_metadata(path, bytes);
+    let Some(metadata) = metadata else {
+        return Err(ContentError::InvalidProviderArtifact);
+    };
+    if metadata.id.eq_ignore_ascii_case("aurora") || metadata.id.eq_ignore_ascii_case("fabric-api")
+    {
+        return Err(ContentError::Collision);
+    }
+    Ok(())
+}
+
 fn activate_verified_with_commit(
     managed: &ManagedPaths,
     instance: &InstanceId,
@@ -836,6 +1014,10 @@ fn activate_verified_with_commit(
             ArtifactDigest::parse(&record.sha256).map_err(|_| ContentError::HashMismatch)?;
         verify_file(verified_path, &digest, expected_size)
             .map_err(|_| ContentError::HashMismatch)?;
+        let bytes = std::fs::metadata(verified_path)
+            .map_err(ContentError::Io)?
+            .len();
+        validate_provider_mod_artifact(&record, verified_path, bytes)?;
         let kind = record.content_type;
         if kind == ContentType::Mod {
             let required = crate::instance_mods::managed_artifact_file_name(managed, instance)
@@ -911,6 +1093,7 @@ pub enum ContentError {
     HashMismatch,
     OperationInProgress,
     Acquisition(String),
+    InvalidProviderArtifact,
 }
 impl ContentError {
     pub fn code(&self) -> &'static str {
@@ -924,6 +1107,7 @@ impl ContentError {
             Self::HashMismatch => "content_hash_mismatch",
             Self::OperationInProgress => "content_operation_in_progress",
             Self::Acquisition(_) => "content_acquisition_failed",
+            Self::InvalidProviderArtifact => "content_invalid_artifact",
         }
     }
 }
@@ -946,6 +1130,10 @@ impl fmt::Display for ContentError {
                 formatter.write_str("another content operation is in progress")
             }
             Self::Acquisition(reason) => write!(formatter, "content acquisition failed: {reason}"),
+            Self::InvalidProviderArtifact => write!(
+                formatter,
+                "the provider artifact is not a valid Fabric mod JAR"
+            ),
         }
     }
 }
@@ -954,7 +1142,10 @@ impl std::error::Error for ContentError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestRequest, TestResponse, TestServer};
+    use sha2::Sha512;
     use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Fixture {
         root: PathBuf,
@@ -1026,6 +1217,292 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn transaction_record(kind: ContentType, name: &str, bytes: &[u8]) -> ProviderRecord {
+        ProviderRecord {
+            content_type: kind,
+            provider: "modrinth".into(),
+            project_id: "AAAABBBB".into(),
+            version_id: "11112222".into(),
+            file_id: format!("{:x}", Sha512::digest(bytes)),
+            file_name: name.into(),
+            sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+            display_version: Some("1.0.0".into()),
+            compatibility: ContentCompatibility {
+                minecraft_versions: vec!["1.21.11".into()],
+                loader: (kind == ContentType::Mod).then(|| "fabric".into()),
+                environment: Some("client_and_server".into()),
+            },
+            dependencies: vec![],
+        }
+    }
+
+    fn fixture_fabric_jar() -> Vec<u8> {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = zip::ZipWriter::new(cursor);
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"schemaVersion":1,"id":"fixture","version":"1.0.0"}"#)
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn transaction_rolls_back_after_second_file_and_state_failure() {
+        let fixture = Fixture::new();
+        let bytes = b"verified content";
+        let source = fixture.root.join("verified-source");
+        std::fs::write(&source, bytes).unwrap();
+        let existing = fixture.dir(ContentType::ResourcePack).join("manual.zip");
+        std::fs::write(&existing, b"user content").unwrap();
+        let first = transaction_record(ContentType::ResourcePack, "first.zip", bytes);
+        let second = transaction_record(ContentType::ShaderPack, "second.zip", bytes);
+        let result = activate_provider_transaction(
+            &fixture.managed,
+            &fixture.instance,
+            vec![
+                (first.clone(), source.clone(), bytes.len() as u64),
+                (
+                    second.clone(),
+                    fixture.root.join("missing"),
+                    bytes.len() as u64,
+                ),
+            ],
+            |state| state.save(&fixture.managed, &fixture.instance),
+        );
+        assert!(result.is_err());
+        assert!(
+            !fixture
+                .dir(ContentType::ResourcePack)
+                .join("first.zip")
+                .exists()
+        );
+        assert!(
+            !fixture
+                .dir(ContentType::ShaderPack)
+                .join("second.zip")
+                .exists()
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"user content");
+        assert!(
+            ContentState::load(&fixture.managed, &fixture.instance)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+
+        let result = activate_provider_transaction(
+            &fixture.managed,
+            &fixture.instance,
+            vec![(first, source, bytes.len() as u64)],
+            |_| {
+                Err(ContentError::StateMalformed(
+                    "injected state failure".into(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !fixture
+                .dir(ContentType::ResourcePack)
+                .join("first.zip")
+                .exists()
+        );
+        assert_eq!(std::fs::read(existing).unwrap(), b"user content");
+    }
+
+    #[test]
+    fn transaction_rejects_collision_before_activating_any_file() {
+        let fixture = Fixture::new();
+        let bytes = b"verified content";
+        let source = fixture.root.join("verified-source");
+        std::fs::write(&source, bytes).unwrap();
+        let existing = fixture.dir(ContentType::ShaderPack).join("taken.zip");
+        std::fs::write(&existing, b"user content").unwrap();
+        let result = activate_provider_transaction(
+            &fixture.managed,
+            &fixture.instance,
+            vec![
+                (
+                    transaction_record(ContentType::ResourcePack, "first.zip", bytes),
+                    source.clone(),
+                    bytes.len() as u64,
+                ),
+                (
+                    transaction_record(ContentType::ShaderPack, "taken.zip", bytes),
+                    source,
+                    bytes.len() as u64,
+                ),
+            ],
+            |state| state.save(&fixture.managed, &fixture.instance),
+        );
+        assert!(matches!(result, Err(ContentError::Collision)));
+        assert!(
+            !fixture
+                .dir(ContentType::ResourcePack)
+                .join("first.zip")
+                .exists()
+        );
+        assert_eq!(std::fs::read(existing).unwrap(), b"user content");
+    }
+
+    #[tokio::test]
+    async fn sha512_plans_acquire_concurrently_and_persist_provider_ownership() {
+        let fixture = Fixture::new();
+        let bytes = fixture_fabric_jar();
+        let served_bytes = bytes.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handler_active = active.clone();
+        let handler_peak = peak.clone();
+        let handler_requests = requests.clone();
+        let server = TestServer::spawn(Arc::new(move |_request: &TestRequest| {
+            handler_requests.fetch_add(1, Ordering::SeqCst);
+            let now = handler_active.fetch_add(1, Ordering::SeqCst) + 1;
+            handler_peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(35));
+            handler_active.fetch_sub(1, Ordering::SeqCst);
+            TestResponse::ok(&served_bytes)
+        }));
+        let sha512 = format!("{:x}", Sha512::digest(&bytes));
+        let cases = [
+            (ContentType::Mod, "fixture.jar"),
+            (ContentType::ResourcePack, "fixture.zip"),
+            (ContentType::ShaderPack, "shader.zip"),
+        ];
+        let plans: Vec<_> = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (kind, name))| {
+                let mut record = transaction_record(*kind, name, &bytes);
+                record.project_id = format!("project-{index}");
+                ProviderInstallPlan {
+                    content_type: *kind,
+                    provider: record.provider,
+                    project_id: record.project_id,
+                    version_id: record.version_id,
+                    file_id: record.file_id,
+                    file_name: record.file_name,
+                    display_version: record.display_version,
+                    compatibility: record.compatibility,
+                    dependencies: vec![],
+                    source: ProviderArtifactSource::Sha512(
+                        Sha512ArtifactSource::loopback_http_for_testing(
+                            &format!("{}/file/{index}", server.base_url()),
+                            &sha512,
+                            Some(bytes.len() as u64),
+                        )
+                        .unwrap(),
+                    ),
+                }
+            })
+            .collect();
+        let records = install_provider_plans(&fixture.managed, &fixture.instance, plans)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            ContentState::load(&fixture.managed, &fixture.instance)
+                .unwrap()
+                .entries
+                .len(),
+            3
+        );
+        for (kind, name) in cases {
+            if kind == ContentType::Mod {
+                let inventory =
+                    crate::instance_mods::scan(&fixture.managed, &fixture.instance).unwrap();
+                assert_eq!(inventory.entries[0].file_name, name);
+                assert_eq!(
+                    inventory.entries[0].ownership,
+                    crate::instance_mods::ModOwnership::ProviderManaged
+                );
+            } else {
+                let inventory = scan(&fixture.managed, &fixture.instance, kind).unwrap();
+                assert_eq!(inventory.entries[0].file_name, name);
+                assert_eq!(
+                    inventory.entries[0].ownership,
+                    ContentOwnership::ProviderManaged
+                );
+            }
+        }
+        let count = requests.load(Ordering::SeqCst);
+        let source = Sha512ArtifactSource::loopback_http_for_testing(
+            &format!("{}/file/0", server.base_url()),
+            &sha512,
+            Some(bytes.len() as u64),
+        )
+        .unwrap();
+        let cached = ArtifactCache::new(fixture.managed.clone())
+            .acquire_sha512(&source)
+            .await
+            .unwrap();
+        assert_eq!(cached.origin, crate::cache::ArtifactOrigin::CacheHit);
+        assert_eq!(requests.load(Ordering::SeqCst), count);
+        std::fs::write(
+            fixture.dir(ContentType::ResourcePack).join("fixture.zip"),
+            b"tampered",
+        )
+        .unwrap();
+        assert_eq!(
+            scan(
+                &fixture.managed,
+                &fixture.instance,
+                ContentType::ResourcePack
+            )
+            .unwrap()
+            .entries[0]
+                .ownership,
+            ContentOwnership::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_published_sha512_never_activates_content() {
+        let fixture = Fixture::new();
+        let server = TestServer::spawn(Arc::new(|_| TestResponse::ok(b"actual bytes")));
+        let record = transaction_record(ContentType::ResourcePack, "bad.zip", b"expected bytes");
+        let plan = ProviderInstallPlan {
+            content_type: record.content_type,
+            provider: record.provider,
+            project_id: record.project_id,
+            version_id: record.version_id,
+            file_id: record.file_id.clone(),
+            file_name: record.file_name,
+            display_version: record.display_version,
+            compatibility: record.compatibility,
+            dependencies: vec![],
+            source: ProviderArtifactSource::Sha512(
+                Sha512ArtifactSource::loopback_http_for_testing(
+                    &format!("{}/bad", server.base_url()),
+                    &record.file_id,
+                    Some(12),
+                )
+                .unwrap(),
+            ),
+        };
+        assert!(
+            install_provider_plans(&fixture.managed, &fixture.instance, vec![plan])
+                .await
+                .is_err()
+        );
+        assert!(
+            !fixture
+                .dir(ContentType::ResourcePack)
+                .join("bad.zip")
+                .exists()
+        );
+        assert!(
+            ContentState::load(&fixture.managed, &fixture.instance)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

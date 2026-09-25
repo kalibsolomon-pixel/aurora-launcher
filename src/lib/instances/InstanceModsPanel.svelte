@@ -11,6 +11,7 @@
     type RemovalCandidate,
   } from "$lib/instances/mods";
   import type { InstanceSummary, ModEntry } from "$lib/backend";
+  import ModrinthBrowse from "./ModrinthBrowse.svelte";
 
   let { instance }: { instance: InstanceSummary } = $props();
   let query = $state("");
@@ -19,6 +20,7 @@
   let loadedInstance = $state("");
   let removal = $state<RemovalCandidate | null>(null);
   let confirmButton: HTMLButtonElement | null = $state(null);
+  let view = $state<"installed" | "browse">("installed");
 
   const inventory = $derived(launcher.modInventories[instance.id] ?? null);
   const entries = $derived(inventory?.entries ?? []);
@@ -78,6 +80,13 @@
 </script>
 
 <section class="mods-panel" aria-labelledby="mods-title">
+  <div class="content-view-tabs" role="group" aria-label="Mods view">
+    <button type="button" class="btn btn-quiet" aria-pressed={view === "installed"} onclick={() => view = "installed"}>Installed</button>
+    <button type="button" class="btn btn-quiet" aria-pressed={view === "browse"} onclick={() => view = "browse"}>Browse</button>
+  </div>
+  {#if view === "browse"}
+    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} kind="mod" onInstalled={async () => { await launcher.runLoadMods(instance.id); view = "installed"; }} />
+  {:else}
   {#if inventory?.missingManaged.length}
     <p class="mods-notice" role="status">{inventory.missingManaged.length} managed mod file{inventory.missingManaged.length === 1 ? " is" : "s are"} missing. Refresh or inspect the instance folder; Aurora will not recreate files automatically.</p>
     <details class="missing-details"><summary>Missing managed files</summary><ul>{#each inventory.missingManaged as record}<li>{record.fileName} · {record.provider}</li>{/each}</ul></details>
@@ -85,7 +94,7 @@
   <div class="mods-heading">
     <div>
       <h3 id="mods-title" class="group-title">Mods</h3>
-      <p class="group-subtitle">Local files in this instance. Online discovery is not available yet.</p>
+      <p class="group-subtitle">Local files in this instance. Use Browse to find compatible Modrinth mods.</p>
     </div>
     <div class="mods-heading-actions">
       <button
@@ -212,7 +221,7 @@
                 </button>
               {:else}
                 <span class="protected-marker" title={entry.actionBlockedReason ?? undefined}>
-                  {entry.ownership === "launcherManagedRequired" ? "Protected" : "Unavailable"}
+                  {entry.ownership === "launcherManagedRequired" ? "Protected" : entry.ownership === "providerManaged" ? "No toggle" : "Unavailable"}
                 </span>
               {/if}
               <details class="mod-actions-menu">
@@ -288,9 +297,12 @@
       <span>Inspecting local mod files…</span>
     </div>
   {/if}
+  {/if}
 </section>
 
 <style>
+  .content-view-tabs { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); }
+  .content-view-tabs [aria-pressed="true"] { color: var(--color-text); background: var(--color-surface-raised); }
   .mods-panel { min-width: 0; }
   .mods-heading, .mods-heading-actions, .mods-toolbar, .mod-title-line, .mod-row-actions, .remove-actions {
     display: flex;
