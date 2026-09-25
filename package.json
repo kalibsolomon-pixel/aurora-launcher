@@ -4,6 +4,9 @@
   "description": "Launcher for the Aurora client mod for Minecraft: Java Edition",
   "type": "module",
   "scripts": {
+    "verify:version": "node tools/release/verify-version.mjs",
+    "prebuild": "npm run verify:version",
+    "precheck": "npm run verify:version",
     "dev": "vite dev",
     "build": "vite build",
     "preview": "vite preview",

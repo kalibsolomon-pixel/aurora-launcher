@@ -74,9 +74,9 @@
       <div class="group-row-main">
         <span class="group-row-title">Development status</span>
         <span class="group-row-detail">
-          The launcher foundation is complete through installation, managed Java, authentication,
-          and supervised launching. Aurora releases currently come from a checked-in development
-          fixture — no production distribution exists yet.
+          The launcher supports installation, managed Java, authentication, and supervised launching.
+          Reviewed Aurora Client releases are bundled with each launcher build; this build includes
+          Aurora Client 2.1.2 for new production instances.
         </span>
       </div>
     </div>

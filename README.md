@@ -78,6 +78,8 @@ cargo test --manifest-path src-tauri/Cargo.toml
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for implemented boundaries and future direction. Contributions are licensed under the [MIT License](LICENSE).
 
+Launcher versioning, Windows installer differences, manual release checks, and the future launcher-update policy are documented in [RELEASING.md](RELEASING.md). The inherited `0.1.0` remains a development version until a first public launcher version is deliberately chosen.
+
 ## Disclaimer
 
 Aurora Launcher and Aurora are independent projects and are not affiliated with, endorsed by, or sponsored by Microsoft, Mojang Studios, or Fabric.

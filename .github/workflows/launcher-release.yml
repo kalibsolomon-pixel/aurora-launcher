@@ -1,0 +1,177 @@
+name: Aurora Launcher release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Launcher major.minor.patch version (Aurora Client is versioned separately)
+        required: true
+        type: string
+      source_ref:
+        description: Exact 40-character commit SHA currently at origin/main
+        required: true
+        type: string
+      installer_format:
+        description: Windows installer format to publish
+        required: true
+        type: choice
+        options:
+          - nsis
+          - msi
+          - both
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aurora-launcher-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - id: source
+        name: Resolve exact reviewed source
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = 'refs/heads/main'
+          [[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]
+          git cat-file -e "$SOURCE_REF^{commit}"
+          git fetch --no-tags origin main
+          test "$SOURCE_REF" = "$(git rev-parse refs/remotes/origin/main)"
+          git checkout --detach "$SOURCE_REF"
+          node tools/release/verify-version.mjs --release "$VERSION"
+          echo "sha=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+      - name: Reject an existing tag or release
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          matches="$(git ls-remote --tags origin "refs/tags/v$VERSION")"
+          test -z "$matches"
+          node tools/release/check-collision.mjs "$VERSION"
+
+  build:
+    needs: resolve
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Verify source and install dependencies
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          node tools/release/verify-version.mjs --release $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Launcher version contract failed' }
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'npm ci failed' }
+      - name: Test, check, and build
+        shell: pwsh
+        run: |
+          npm test
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend tests failed' }
+          npm run check
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend check failed' }
+          cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'Rust formatting failed' }
+          cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+          if ($LASTEXITCODE -ne 0) { throw 'Rust check failed' }
+          cargo test --manifest-path src-tauri/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Rust tests failed' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Frontend build failed' }
+          npm run tauri build
+          if ($LASTEXITCODE -ne 0) { throw 'Tauri installer build failed' }
+      - name: Inspect and hash installer bytes
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          FORMAT: ${{ inputs.installer_format }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          & ./tools/release/windows-artifacts.ps1 -Version $env:VERSION -Format $env:FORMAT -Mode Pack -SourceSha $env:SOURCE_SHA -OutputDirectory (Join-Path $env:RUNNER_TEMP 'aurora-release-assets')
+          if (-not $?) { throw 'Installer inspection failed' }
+          $manifest = Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'aurora-release-assets/release-assets.json') -Raw | ConvertFrom-Json
+          @("## Validated Aurora Launcher $($manifest.version)", '', "Source commit: ``$($manifest.sourceSha)``", '', '| File | Format | Architecture | Bytes | SHA-256 |', '| --- | --- | --- | ---: | --- |') | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          foreach ($asset in $manifest.artifacts) {
+            "| $($asset.name) | $($asset.format) | $($asset.architecture) | $($asset.sizeBytes) | ``$($asset.sha256)`` |" | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aurora-launcher-${{ inputs.version }}-${{ inputs.installer_format }}
+          path: ${{ runner.temp }}/aurora-release-assets/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [resolve, build]
+    runs-on: windows-latest
+    environment: launcher-production
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: aurora-launcher-${{ inputs.version }}-${{ inputs.installer_format }}
+          path: ${{ runner.temp }}/aurora-release-assets
+      - name: Recheck collision and transferred bytes
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          FORMAT: ${{ inputs.installer_format }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $matches = git ls-remote --tags origin "refs/tags/v$env:VERSION"
+          if ($LASTEXITCODE -ne 0 -or $matches) { throw 'Release tag already exists or could not be checked' }
+          node tools/release/check-collision.mjs $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'Release collision check failed' }
+          & ./tools/release/windows-artifacts.ps1 -Version $env:VERSION -Format $env:FORMAT -Mode Verify -SourceSha $env:SOURCE_SHA -OutputDirectory (Join-Path $env:RUNNER_TEMP 'aurora-release-assets')
+          if (-not $?) { throw 'Transferred installer verification failed' }
+      - name: Create verified draft, publish, and redownload public bytes
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          FORMAT: ${{ inputs.installer_format }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          & ./tools/release/publish.ps1 -Version $env:VERSION -Format $env:FORMAT -SourceSha $env:SOURCE_SHA -AssetsDirectory (Join-Path $env:RUNNER_TEMP 'aurora-release-assets')
+          if (-not $?) { throw 'Release publication or public-byte verification failed' }
