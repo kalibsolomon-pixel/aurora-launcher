@@ -2,13 +2,10 @@
 //!
 //! The model parses and validates release metadata locally; resolution
 //! selects exact releases from a manifest. Aurora release *distribution*
-//! does not exist yet: there is no production manifest endpoint and no
-//! artifact repository, so the only operational source today is the
-//! checked-in development fixture (see `src-tauri/development/`), embedded
-//! via [`development_manifest`]. The resolver consumes any parsed, validated
-//! manifest, so wiring a real HTTPS release source later is an additive
-//! change rather than a redesign; the launcher will not pretend production
-//! release discovery exists until it does.
+//! is deliberately gated by the checked-in production manifest, embedded in
+//! the application. Development builds also offer the separate loopback
+//! fixture for new instances; existing fixture-pinned instances retain a
+//! compatibility path in release builds.
 //!
 //! Manifest authenticity, honestly stated: a manifest fetched over HTTPS
 //! would be HTTPS-authenticated release metadata, not independently
@@ -28,11 +25,10 @@ use crate::downloads::is_loopback_host;
 /// The only release-manifest schema version this launcher understands.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
-/// The checked-in development release fixture (see `src-tauri/development/`).
-///
-/// Development artifact URLs are pinned to a loopback server the developer
-/// runs; production release infrastructure does not exist yet.
+/// The checked-in debug-only development release fixture.
+/// Development artifact URLs are pinned to a developer-run loopback server.
 const DEVELOPMENT_MANIFEST_JSON: &str = include_str!("../development/aurora-releases.json");
+const PRODUCTION_MANIFEST_JSON: &str = include_str!("../production/aurora-releases.json");
 
 /// A versioned collection of Aurora releases.
 ///
@@ -112,14 +108,40 @@ impl ReleaseManifest {
     }
 }
 
-/// The operational development release source: the checked-in fixture
-/// manifest, parsed and validated like any other manifest.
-///
-/// This exists because no production Aurora release endpoint exists. It is
-/// development-only by construction (its artifact URLs are loopback), and
-/// the UI labels it as a development source.
+/// The development fixture, parsed and validated like any other manifest.
+/// Its artifact URLs are loopback-only; release builds do not offer it for
+/// new instance creation.
 pub fn development_manifest() -> Result<ReleaseManifest, ManifestError> {
     ReleaseManifest::from_json(DEVELOPMENT_MANIFEST_JSON)
+}
+
+/// The manually curated production manifest shipped in this launcher build.
+pub fn production_manifest() -> Result<ReleaseManifest, ManifestError> {
+    ReleaseManifest::from_json(PRODUCTION_MANIFEST_JSON)
+}
+
+/// Releases resolvable for existing instances, including the historical
+/// development fixture so a new build does not strand older pinned content.
+pub fn operational_manifest() -> Result<ReleaseManifest, ManifestError> {
+    let mut manifest = production_manifest()?;
+    manifest.releases.extend(development_manifest()?.releases);
+    ReleaseManifest::from_json(
+        &serde_json::to_string(&manifest)
+            .map_err(|error| ManifestError::Json(error.to_string()))?,
+    )
+}
+
+/// Releases offered for new instance creation. Production builds show only
+/// reviewed entries; debug builds also offer explicit development fixtures.
+pub fn creation_manifest() -> Result<ReleaseManifest, ManifestError> {
+    #[cfg(debug_assertions)]
+    {
+        operational_manifest()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        production_manifest()
+    }
 }
 
 /// A single released Aurora build and its compatibility mapping.
@@ -132,6 +154,25 @@ pub struct AuroraRelease {
     fabric_loader_version: String,
     java: JavaRequirement,
     artifact: ReleaseArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fabric_api: Option<RequiredFabricApi>,
+}
+
+/// A release-pinned Fabric API runtime dependency, when Aurora requires it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequiredFabricApi {
+    version: String,
+    artifact: ReleaseArtifact,
+}
+
+impl RequiredFabricApi {
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+    pub fn artifact(&self) -> &ReleaseArtifact {
+        &self.artifact
+    }
 }
 
 impl AuroraRelease {
@@ -159,12 +200,28 @@ impl AuroraRelease {
         &self.artifact
     }
 
+    pub fn fabric_api(&self) -> Option<&RequiredFabricApi> {
+        self.fabric_api.as_ref()
+    }
+
     fn validate(&self) -> Result<(), String> {
         validate_version_field("Aurora version", &self.aurora_version)?;
         validate_version_field("Minecraft version", &self.minecraft_version)?;
         validate_version_field("Fabric Loader version", &self.fabric_loader_version)?;
         self.java.validate()?;
-        self.artifact.validate()
+        self.artifact.validate()?;
+        if let Some(fabric_api) = &self.fabric_api {
+            validate_version_field("Fabric API version", &fabric_api.version)?;
+            if !fabric_api
+                .version
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+            {
+                return Err("Fabric API version must be safe for a managed file name".to_owned());
+            }
+            fabric_api.artifact.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -217,8 +274,8 @@ impl JavaRequirement {
 
 /// The downloadable Aurora artifact for a release.
 ///
-/// Only the representation is implemented: the URL is validated for shape and
-/// the hash for encoding, but nothing is downloaded or verified yet.
+/// The URL and expected digest/size are validated here. The acquisition
+/// boundary verifies downloaded bytes before cache or instance activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseArtifact {
@@ -605,6 +662,63 @@ mod tests {
                 "the development fixture must carry a {channel:?} release"
             );
         }
+    }
+
+    #[test]
+    fn production_release_is_exact_and_separate_from_the_development_fixture() {
+        let production = production_manifest().unwrap();
+        assert_eq!(production.schema_version(), 1);
+        assert_eq!(production.releases().len(), 1);
+        let release = production
+            .resolve_exact("2.1.2", Some(ReleaseChannel::Stable))
+            .unwrap();
+        assert_eq!(release.minecraft_version(), "1.21.11");
+        assert_eq!(release.fabric_loader_version(), "0.19.5");
+        assert_eq!(release.java().major_version(), 21);
+        assert_eq!(
+            release.artifact().url(),
+            "https://github.com/kalibsolomon-pixel/Aurora-Client/releases/download/v2.1.2/aurora-2.1.2.jar"
+        );
+        assert_eq!(
+            release.artifact().sha256(),
+            "55ac97f7494daa3866bb3b4aa8d23e49b240fe5ced00fbf1742f7214fc77c52a"
+        );
+        assert_eq!(release.artifact().size_bytes(), Some(2450086));
+        let fabric_api = release
+            .fabric_api()
+            .expect("production Aurora requires Fabric API");
+        assert_eq!(fabric_api.version(), "0.141.6+1.21.11");
+        assert_eq!(
+            fabric_api.artifact().sha256(),
+            "bdff7fd7e220085cfad2ff9b1f40dde6534ae0b96cf378f97a374bc54cb9ed0f"
+        );
+        assert_eq!(fabric_api.artifact().size_bytes(), Some(2426039));
+        assert!(
+            production
+                .resolve_exact("2.1.2", Some(ReleaseChannel::Beta))
+                .is_none()
+        );
+        assert!(production.resolve_exact("2.1.1", None).is_none());
+        assert!(
+            development_manifest()
+                .unwrap()
+                .resolve_exact("2.1.2", None)
+                .is_none()
+        );
+        let operational = operational_manifest().unwrap();
+        assert!(
+            operational
+                .resolve_exact("2.1.2", Some(ReleaseChannel::Stable))
+                .is_some()
+        );
+        assert!(operational.resolve_exact("0.3.0", None).is_some());
+        assert_eq!(
+            creation_manifest()
+                .unwrap()
+                .resolve_exact("0.3.0", None)
+                .is_some(),
+            cfg!(debug_assertions)
+        );
     }
 
     fn replace_release_field(

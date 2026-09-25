@@ -144,7 +144,7 @@
               }
             }}
           >
-            <option value="">Fabric — latest compatible</option>
+            <option value="">Fabric — release version</option>
             <option value="pinned">Fabric — choose version</option>
           </select>
           {#if launcher.createLoaderPolicy.type === "pinned"}
@@ -211,12 +211,16 @@
       </p>
     {/if}
 
-    {#if launcher.releases.length > 0 && launcher.releases[0].source === "development-fixture"}
+    {#if launcher.releases.some((release) => release.source === "production-bundled")}
       <p class="group-footer">
-        Development release source: Aurora releases currently come from the launcher's checked-in
-        development fixture — no production release infrastructure exists yet. Serve
-        <code>src-tauri/development</code> on 127.0.0.1:8765 for artifact downloads. Instances can
-        only be created for Minecraft versions this source supports.
+        Production releases are reviewed and bundled with this launcher build. Aurora 2.1.2 uses
+        Fabric Loader 0.19.5; instances keep their installed versions until you explicitly reinstall.
+      </p>
+    {/if}
+    {#if launcher.releases.some((release) => release.source === "development-fixture")}
+      <p class="group-footer">
+        Development releases are available in this debug build. Serve
+        <code>src-tauri/development</code> on 127.0.0.1:8765 to install those fixtures.
       </p>
     {/if}
   </section>

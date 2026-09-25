@@ -1,19 +1,19 @@
 //! Aurora client-artifact installation: acquisition, managed
 //! materialization, and the Aurora installed-state record.
 //!
-//! Aurora's client mod is a single versioned artifact with a pre-known
-//! expected SHA-256 published by its release metadata, so acquisition uses
-//! the Phase 2 SHA-256 verified store unchanged — an Aurora artifact is
-//! always `ExpectedDigestVerified(sha256)`, never the transport-observed
-//! path reserved for digest-less Fabric artifacts.
+//! Aurora's client mod and any release-pinned required Fabric API mod have
+//! pre-known SHA-256 digests in release metadata. Both use the Phase 2
+//! verified store, never the transport-observed path for digest-less Fabric
+//! loader artifacts.
 //!
 //! ## Managed ownership
 //!
-//! The materialized artifact lives at a deterministic launcher-managed path
+//! Materialized artifacts live at deterministic launcher-managed paths
 //! inside the instance's mods directory:
 //!
 //! ```text
 //! instances/<id>/mods/aurora-<validated aurora version>.jar
+//! instances/<id>/mods/fabric-api-<validated API version>.jar  # when required
 //! ```
 //!
 //! The filename derives from validated release metadata (never a remote
@@ -64,8 +64,27 @@ pub struct AuroraInstalledState {
     minecraft_version: String,
     fabric_loader_version: String,
     artifact: AuroraInstalledArtifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fabric_api: Option<InstalledFabricApi>,
     installation_id: String,
     installed_at_unix_seconds: u64,
+}
+
+/// A verified Fabric API mod installed because the Aurora release requires it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledFabricApi {
+    version: String,
+    artifact: AuroraInstalledArtifact,
+}
+
+impl InstalledFabricApi {
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+    pub fn artifact(&self) -> &AuroraInstalledArtifact {
+        &self.artifact
+    }
 }
 
 /// The materialized launcher-managed artifact.
@@ -98,6 +117,10 @@ impl AuroraInstalledState {
 
     pub fn artifact(&self) -> &AuroraInstalledArtifact {
         &self.artifact
+    }
+
+    pub fn fabric_api(&self) -> Option<&InstalledFabricApi> {
+        self.fabric_api.as_ref()
     }
 
     pub fn installation_id(&self) -> &str {
@@ -147,6 +170,26 @@ impl AuroraInstalledState {
             return Err(AuroraStateError::Malformed {
                 reason: "the artifact size must be greater than zero".to_owned(),
             });
+        }
+        if let Some(fabric_api) = &state.fabric_api {
+            let expected_path = format!("mods/fabric-api-{}.jar", fabric_api.version);
+            if fabric_api.version.is_empty() || fabric_api.artifact.relative_path != expected_path {
+                return Err(AuroraStateError::Malformed {
+                    reason: "the Fabric API managed path or version is invalid".to_owned(),
+                });
+            }
+            validate_fabric_api_relative_path(&fabric_api.artifact.relative_path)
+                .map_err(|reason| AuroraStateError::Malformed { reason })?;
+            ArtifactDigest::parse(&fabric_api.artifact.sha256).map_err(|error| {
+                AuroraStateError::Malformed {
+                    reason: format!("the Fabric API SHA-256 is invalid: {error}"),
+                }
+            })?;
+            if fabric_api.artifact.size_bytes == 0 {
+                return Err(AuroraStateError::Malformed {
+                    reason: "the Fabric API size must be greater than zero".to_owned(),
+                });
+            }
         }
 
         Ok(state)
@@ -213,12 +256,20 @@ pub fn managed_artifact_relative_path(
 /// the launcher-owned `aurora-` prefix — exactly the shape installation
 /// writes and the only shape validation accepts as launcher-owned.
 fn validate_managed_relative_path(path: &str) -> Result<(), String> {
+    validate_managed_mod_path(path, MANAGED_FILE_PREFIX)
+}
+
+fn validate_fabric_api_relative_path(path: &str) -> Result<(), String> {
+    validate_managed_mod_path(path, "fabric-api-")
+}
+
+fn validate_managed_mod_path(path: &str, prefix: &str) -> Result<(), String> {
     let rest = path
         .strip_prefix("mods/")
         .ok_or("the managed artifact path must live under mods/")?;
     let file = rest
-        .strip_prefix(MANAGED_FILE_PREFIX)
-        .ok_or("the managed artifact path must use the launcher-owned aurora- prefix")?;
+        .strip_prefix(prefix)
+        .ok_or("the managed artifact path must use its launcher-owned prefix")?;
     if !file.ends_with(".jar") || file.len() < 5 {
         return Err("the managed artifact path must be a .jar file".to_owned());
     }
@@ -273,6 +324,26 @@ pub async fn install_aurora(
         .await
         .map_err(AuroraInstallError::Acquisition)?;
 
+    // Acquire every required mod through the verified store before touching
+    // the instance. A failed dependency cannot leave a completed state.
+    let fabric_api = if let Some(dependency) = release.fabric_api() {
+        let digest = ArtifactDigest::parse(dependency.artifact().sha256())
+            .map_err(|error| AuroraInstallError::ReleaseInvalid(error.to_string()))?;
+        let source = ArtifactSource::https_or_loopback(
+            dependency.artifact().url(),
+            dependency.artifact().sha256(),
+            dependency.artifact().size_bytes(),
+        )
+        .map_err(|error| AuroraInstallError::ArtifactInvalid(error.to_string()))?;
+        let verified = cache
+            .acquire_with(&source, options)
+            .await
+            .map_err(AuroraInstallError::Acquisition)?;
+        Some((dependency, digest, verified))
+    } else {
+        None
+    };
+
     let relative = managed_artifact_relative_path(release)?;
     let instance_paths = managed.instance_paths(instance);
     let artifact_path = instance_paths
@@ -307,6 +378,43 @@ pub async fn install_aurora(
         }
     })?;
 
+    let installed_fabric_api = if let Some((dependency, digest, verified)) = fabric_api {
+        let relative_path = format!("mods/fabric-api-{}.jar", dependency.version());
+        validate_fabric_api_relative_path(&relative_path)
+            .map_err(AuroraInstallError::ReleaseInvalid)?;
+        let path = instance_paths
+            .root()
+            .join(relative_path.split('/').collect::<PathBuf>());
+        if !path.starts_with(instance_paths.mods()) {
+            return Err(AuroraInstallError::Materialization {
+                path: relative_path,
+                reason: "the derived path escaped the managed mods directory".to_owned(),
+            });
+        }
+        std::fs::copy(&verified.path, &path).map_err(|error| {
+            AuroraInstallError::Materialization {
+                path: relative_path.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let size_bytes = verify_file(&path, &digest, Some(verified.bytes)).map_err(|error| {
+            AuroraInstallError::Materialization {
+                path: relative_path.clone(),
+                reason: format!("the materialized Fabric API failed verification: {error}"),
+            }
+        })?;
+        Some(InstalledFabricApi {
+            version: dependency.version().to_owned(),
+            artifact: AuroraInstalledArtifact {
+                relative_path,
+                size_bytes,
+                sha256: digest.as_hex(),
+            },
+        })
+    } else {
+        None
+    };
+
     let state = AuroraInstalledState {
         schema_version: AURORA_INSTALLED_SCHEMA_VERSION,
         aurora_version: release.aurora_version().to_owned(),
@@ -318,6 +426,7 @@ pub async fn install_aurora(
             size_bytes: bytes,
             sha256: expected.as_hex(),
         },
+        fabric_api: installed_fabric_api,
         installation_id: format!(
             "aurora-install-{}-{}",
             std::time::SystemTime::now()
@@ -408,8 +517,21 @@ pub fn validate_artifact(
         &expected,
         Some(state.artifact().size_bytes()),
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if let Some(fabric_api) = state.fabric_api() {
+        let path = managed.instance_paths(instance).root().join(
+            fabric_api
+                .artifact()
+                .relative_path()
+                .split('/')
+                .collect::<PathBuf>(),
+        );
+        let digest = ArtifactDigest::parse(fabric_api.artifact().sha256())
+            .map_err(|error| error.to_string())?;
+        verify_file(&path, &digest, Some(fabric_api.artifact().size_bytes()))
+            .map_err(|error| format!("Fabric API verification failed: {error}"))?;
+    }
+    Ok(())
 }
 
 /// A failed Aurora installation.
@@ -579,6 +701,78 @@ mod tests {
         assert_eq!(state.artifact().sha256(), sha256_of(&body));
         assert_eq!(state.trust().kind_name(), "expectedDigestVerified");
         assert!(validate_artifact(&managed, &instance, &state).is_ok());
+        let _ = root;
+    }
+
+    #[tokio::test]
+    async fn required_fabric_api_is_verified_protected_by_state_and_detects_damage() {
+        let body = b"two verified managed mod artifacts".to_vec();
+        let served = body.clone();
+        let server = TestServer::spawn(Arc::new(move |_request| TestResponse::ok(&served)));
+        let (root, managed, instance) = test_managed("fabric-api");
+        let mut value = serde_json::to_value(release(
+            &format!("{}/aurora.jar", server.base_url()),
+            &sha256_of(&body),
+            Some(body.len() as u64),
+        ))
+        .unwrap();
+        value["fabricApi"] = serde_json::json!({
+            "version": "0.141.6+1.21.11",
+            "artifact": {
+                "url": format!("{}/fabric-api.jar", server.base_url()),
+                "sha256": sha256_of(&body),
+                "sizeBytes": body.len()
+            }
+        });
+        let release: AuroraRelease = serde_json::from_value(value).unwrap();
+        install_aurora(&managed, &instance, &release, &quick_options())
+            .await
+            .unwrap();
+        let state = load_installed_state(&managed, &instance).unwrap().unwrap();
+        let dependency = state.fabric_api().unwrap();
+        assert_eq!(dependency.version(), "0.141.6+1.21.11");
+        assert_eq!(
+            dependency.artifact().relative_path(),
+            "mods/fabric-api-0.141.6+1.21.11.jar"
+        );
+        assert!(validate_artifact(&managed, &instance, &state).is_ok());
+        let path = managed
+            .instance_paths(&instance)
+            .mods()
+            .join("fabric-api-0.141.6+1.21.11.jar");
+        std::fs::write(&path, b"damage").unwrap();
+        assert!(validate_artifact(&managed, &instance, &state).is_err());
+        let _ = root;
+    }
+
+    #[tokio::test]
+    async fn wrong_fabric_api_hash_never_activates_either_managed_mod() {
+        let body = b"untrusted dependency bytes".to_vec();
+        let served = body.clone();
+        let server = TestServer::spawn(Arc::new(move |_request| TestResponse::ok(&served)));
+        let (root, managed, instance) = test_managed("fabric-api-wrong-hash");
+        let mut value = serde_json::to_value(release(
+            &format!("{}/aurora.jar", server.base_url()),
+            &sha256_of(&body),
+            Some(body.len() as u64),
+        ))
+        .unwrap();
+        value["fabricApi"] = serde_json::json!({
+            "version": "0.141.6+1.21.11",
+            "artifact": {
+                "url": format!("{}/fabric-api.jar", server.base_url()),
+                "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "sizeBytes": body.len()
+            }
+        });
+        let release: AuroraRelease = serde_json::from_value(value).unwrap();
+        assert!(
+            install_aurora(&managed, &instance, &release, &quick_options())
+                .await
+                .is_err()
+        );
+        assert!(load_installed_state(&managed, &instance).unwrap().is_none());
+        assert!(!managed.instance_paths(&instance).mods().exists());
         let _ = root;
     }
 

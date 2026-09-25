@@ -77,7 +77,7 @@ class LauncherStore {
   launcherState = $state<LauncherState | null>(null);
   stateError = $state<LauncherBackendError | null>(null);
 
-  // Aurora releases (instance creation source; development fixture today).
+  // Aurora releases from this build's production manifest and debug-only fixture.
   releases = $state<AuroraReleaseSummary[]>([]);
   releasesError = $state<LauncherBackendError | null>(null);
 
@@ -265,9 +265,15 @@ class LauncherStore {
     });
     listen<LaunchProcess>("launch-state", (event) => {
       this.playProcess = event.payload;
-      if (event.payload.status === "exited" || event.payload.status === "failed") {
+      if (
+        event.payload.status === "running" ||
+        event.payload.status === "exited" ||
+        event.payload.status === "failed"
+      ) {
         this.playBusy = false;
         this.playProgress = null;
+      }
+      if (event.payload.status === "exited" || event.payload.status === "failed") {
         void this.refreshPlayReadiness();
       }
     }).then((stop) => {
@@ -313,6 +319,8 @@ class LauncherStore {
     this.playError = null;
     try {
       this.playProcess = await playInstance(instanceId, accountId);
+      this.playBusy = false;
+      this.playProgress = null;
     } catch (cause: unknown) {
       this.playError = backendError(cause, "Minecraft could not be started.");
       this.playBusy = false;

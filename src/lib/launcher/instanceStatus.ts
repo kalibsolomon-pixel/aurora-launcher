@@ -107,7 +107,7 @@ export function configurationLabel(instance: InstanceSummary): string {
   const loader =
     instance.configuration.loader.policy.type === "pinned"
       ? `Fabric ${instance.configuration.loader.policy.version}`
-      : "Fabric (latest compatible)";
+      : "Fabric (release version)";
   return `Minecraft ${instance.configuration.minecraftVersion} · ${loader}`;
 }
 

@@ -174,7 +174,7 @@
           <span class="field-label">Fabric Loader version</span>
           {#if draft.loader.policy.type === "automatic"}
             <select value="" onchange={setLoaderPolicy}>
-              <option value="">Latest compatible</option>
+              <option value="">Release version</option>
               {#each launcher.loaderVersions ?? [] as loader (loader.version)}
                 <option value={loader.version}>
                   {loader.version}{loader.stable ? "" : " (unstable)"}
@@ -182,11 +182,11 @@
               {/each}
             </select>
             <span class="field-hint">
-              Automatically uses the newest stable loader for this Minecraft version.
+              Automatically uses the exact loader version required by the Aurora release.
             </span>
           {:else}
             <select value={loaderVersionValue(draft)} onchange={onLoaderVersionChange}>
-              <option value="">Latest compatible</option>
+              <option value="">Release version</option>
               {#each launcher.loaderVersions ?? [] as loader (loader.version)}
                 <option value={loader.version}>
                   {loader.version}{loader.stable ? "" : " (unstable)"}

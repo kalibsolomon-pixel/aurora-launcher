@@ -15,7 +15,7 @@
   const loaderPolicy = $derived(
     instance.configuration.loader.policy.type === "pinned"
       ? `Fabric ${instance.configuration.loader.policy.version}`
-      : "Fabric (latest compatible)",
+      : "Fabric (release version)",
   );
 
   function windowLabel(): string {
@@ -169,8 +169,7 @@
 
   <p class="group-footer">
     Instances pin concrete releases and never move between channels on their own.
-    Aurora releases currently come from the launcher's checked-in development fixture —
-    no production release infrastructure exists yet.
+    Production releases are bundled with the launcher; debug builds also offer development fixtures.
   </p>
 </section>
 

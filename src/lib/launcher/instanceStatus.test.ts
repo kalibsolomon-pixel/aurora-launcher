@@ -111,7 +111,7 @@ describe("configuration-versus-pin comparison", () => {
   it("labels the desired configuration compactly", () => {
     assert.equal(
       configurationLabel(instance()),
-      "Minecraft 26.2 · Fabric (latest compatible)",
+      "Minecraft 26.2 · Fabric (release version)",
     );
     assert.equal(
       configurationLabel(

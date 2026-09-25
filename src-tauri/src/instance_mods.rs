@@ -215,20 +215,33 @@ pub fn validate_mods_directory(
 fn managed_artifact_file_name(
     managed: &ManagedPaths,
     instance: &InstanceId,
-) -> Result<Option<String>, ModError> {
+) -> Result<Option<Vec<String>>, ModError> {
     let state = aurora::load_installed_state(managed, instance)
         .map_err(|error| ModError::InstalledState(error.to_string()))?;
     Ok(state.map(|state| {
-        state
-            .artifact()
-            .relative_path()
-            .strip_prefix("mods/")
-            .expect("validated Aurora state always lives beneath mods")
-            .to_owned()
+        let mut files = vec![
+            state
+                .artifact()
+                .relative_path()
+                .strip_prefix("mods/")
+                .expect("validated Aurora state always lives beneath mods")
+                .to_owned(),
+        ];
+        if let Some(fabric_api) = state.fabric_api() {
+            files.push(
+                fabric_api
+                    .artifact()
+                    .relative_path()
+                    .strip_prefix("mods/")
+                    .expect("validated Fabric API state always lives beneath mods")
+                    .to_owned(),
+            );
+        }
+        files
     }))
 }
 
-fn inspect_entry(path: &Path, managed_file: Option<&str>) -> ModEntry {
+fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -252,9 +265,11 @@ fn inspect_entry(path: &Path, managed_file: Option<&str>) -> ModEntry {
         ModFileType::UnexpectedFile
     };
     let enabled = file_type == ModFileType::EnabledJar;
-    let is_managed = managed_file.is_some_and(|managed| {
-        file_name.eq_ignore_ascii_case(managed)
-            || file_name.eq_ignore_ascii_case(&format!("{managed}{DISABLED_SUFFIX}"))
+    let is_managed = managed_files.is_some_and(|files| {
+        files.iter().any(|managed| {
+            file_name.eq_ignore_ascii_case(managed)
+                || file_name.eq_ignore_ascii_case(&format!("{managed}{DISABLED_SUFFIX}"))
+        })
     });
     let ownership = if is_managed {
         ModOwnership::LauncherManagedRequired
@@ -306,12 +321,12 @@ fn inspect_entry(path: &Path, managed_file: Option<&str>) -> ModEntry {
     if is_managed && !enabled {
         warnings.push(ModWarning::new(
             "required_mod_disabled",
-            "The required Aurora Client artifact is disabled outside the launcher; instance readiness may be damaged.",
+            "A required managed mod is disabled outside the launcher; instance readiness may be damaged.",
         ));
     }
     let blocked_reason = match ownership {
         ModOwnership::LauncherManagedRequired => Some(
-            "Aurora Client is required and is maintained by the verified installation system."
+            "This mod is required and is maintained by the verified installation system."
                 .to_owned(),
         ),
         ModOwnership::Unknown => {
@@ -871,7 +886,7 @@ impl fmt::Display for ModError {
             ),
             Self::RequiredArtifact => write!(
                 formatter,
-                "the required Aurora Client artifact cannot be disabled or removed from Mods"
+                "a required launcher-managed mod cannot be disabled or removed from Mods"
             ),
             Self::UnsafeEntry => write!(
                 formatter,
@@ -1072,6 +1087,44 @@ mod tests {
             "mod_required_artifact"
         );
         assert!(fixture.mods().join("aurora-0.3.0.jar").is_file());
+    }
+
+    #[test]
+    fn installed_state_also_protects_required_fabric_api() {
+        let fixture = Fixture::new("fabric-api-managed");
+        let state_path = fixture
+            .managed
+            .instance_paths(&fixture.instance)
+            .root()
+            .join(aurora::AURORA_INSTALLED_FILE_NAME);
+        let mut state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        state["fabricApi"] = serde_json::json!({
+            "version": "0.141.6+1.21.11",
+            "artifact": {
+                "relativePath": "mods/fabric-api-0.141.6+1.21.11.jar",
+                "sizeBytes": 4,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+        });
+        std::fs::write(&state_path, serde_json::to_string(&state).unwrap()).unwrap();
+        let path = fixture.mods().join("fabric-api-0.141.6+1.21.11.jar");
+        std::fs::write(&path, b"tiny").unwrap();
+        let inventory = scan(&fixture.managed, &fixture.instance).unwrap();
+        let required = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.file_name == "fabric-api-0.141.6+1.21.11.jar")
+            .unwrap();
+        assert_eq!(required.ownership, ModOwnership::LauncherManagedRequired);
+        assert!(!required.can_toggle && !required.can_remove);
+        assert_eq!(
+            remove(&fixture.managed, &fixture.instance, &required.entry_id)
+                .unwrap_err()
+                .code(),
+            "mod_required_artifact"
+        );
+        assert!(path.is_file());
     }
 
     #[test]

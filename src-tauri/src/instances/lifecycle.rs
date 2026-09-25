@@ -61,7 +61,7 @@ use crate::runtime::metadata::{RuntimeMetadataEndpoints, RuntimeMetadataError};
 use crate::runtime::plan::{JavaRuntimePlan, RuntimePlatform};
 
 /// Everything instance orchestration resolves from: the Aurora release
-/// manifest (today the checked-in development fixture or a test manifest),
+/// manifest (the build's operational entries or a test manifest),
 /// the official Mojang/Fabric metadata endpoints, and the Phase 5
 /// installation context.
 #[derive(Debug, Clone)]
@@ -73,9 +73,29 @@ pub struct InstanceEndpoints {
 }
 
 impl InstanceEndpoints {
-    /// The operational development source: the checked-in release fixture
-    /// plus the official Mojang and Fabric metadata chains. No production
-    /// Aurora release endpoint exists yet.
+    /// Releases offered for new instance creation in this build.
+    pub fn creation() -> Result<Self, ManifestError> {
+        Ok(Self {
+            release_manifest: crate::distribution::creation_manifest()?,
+            minecraft: MetadataEndpoints::official(),
+            fabric: FabricMetaEndpoints::official(),
+            install: InstallContext::official(),
+        })
+    }
+
+    /// Releases needed for existing instances plus official game metadata.
+    /// Fixture-pinned instances remain resolvable in release builds.
+    pub fn operational() -> Result<Self, ManifestError> {
+        Ok(Self {
+            release_manifest: crate::distribution::operational_manifest()?,
+            minecraft: MetadataEndpoints::official(),
+            fabric: FabricMetaEndpoints::official(),
+            install: InstallContext::official(),
+        })
+    }
+
+    /// The checked-in development fixture plus official metadata chains,
+    /// retained for deterministic and explicit development flows.
     pub fn development() -> Result<Self, ManifestError> {
         Ok(Self {
             release_manifest: crate::distribution::development_manifest()?,
@@ -237,7 +257,8 @@ pub async fn create_instance(
     progress(report(InstancePhase::ResolvingRelease, None));
     let release =
         resolve_release_for_configuration(endpoints.release_manifest(), request.configuration())?;
-    let loader_version = resolve_loader_version(endpoints, request.configuration()).await?;
+    let loader_version =
+        resolve_loader_version(endpoints, request.configuration(), &release).await?;
 
     let pin = PinnedRelease::new(
         release.channel(),
@@ -377,6 +398,7 @@ fn resolve_release_for_configuration(
 async fn resolve_loader_version(
     endpoints: &InstanceEndpoints,
     configuration: &InstanceConfiguration,
+    release: &crate::distribution::AuroraRelease,
 ) -> Result<String, InstanceError> {
     let game =
         crate::minecraft::metadata::MinecraftVersionId::new(configuration.minecraft_version())
@@ -399,29 +421,30 @@ async fn resolve_loader_version(
             stable: entry.stable,
         })
         .collect();
-    configuration
-        .loader()
-        .policy()
-        .resolve(&candidates)
-        .map(str::to_owned)
-        .ok_or_else(|| InstanceError::LoaderResolution {
+    let required = release.fabric_loader_version();
+    let selected = match configuration.loader().policy() {
+        LoaderPolicy::Automatic => required,
+        LoaderPolicy::Pinned { version } => version,
+    };
+    if selected != required
+        || !candidates
+            .iter()
+            .any(|candidate| candidate.version == selected)
+    {
+        return Err(InstanceError::LoaderResolution {
             game: configuration.minecraft_version().to_owned(),
-            reason: match configuration.loader().policy() {
-                LoaderPolicy::Automatic => {
-                    "no stable Fabric Loader version is available for this Minecraft version"
-                        .to_owned()
-                }
-                LoaderPolicy::Pinned { version } => {
-                    format!("Fabric Loader {version} is not available for this Minecraft version")
-                }
-            },
-        })
+            reason: format!(
+                "Fabric Loader {selected} is unavailable or differs from the Aurora release's required exact version {required}"
+            ),
+        });
+    }
+    Ok(selected.to_owned())
 }
 
 /// Atomically persists a new desired configuration for one ready instance.
 ///
 /// The persisted change is metadata only: identifiers, filesystem paths, and
-/// installed content are untouched. The release fixture must support the
+/// installed content are untouched. The release manifest must support the
 /// configured Minecraft version (an offline, honest compatibility check);
 /// loader-version compatibility is verified when the configuration is
 /// installed. Readiness reflects the change immediately: deep validation
@@ -496,7 +519,7 @@ pub async fn install_instance_configuration(
 
     progress(report(InstancePhase::ResolvingRelease, None));
     let release = resolve_release_for_configuration(endpoints.release_manifest(), &configuration)?;
-    let loader_version = resolve_loader_version(endpoints, &configuration).await?;
+    let loader_version = resolve_loader_version(endpoints, &configuration, &release).await?;
     let pin = PinnedRelease::new(
         release.channel(),
         release.aurora_version(),
@@ -707,7 +730,7 @@ pub async fn resolve_instance_launch_plans(
 }
 
 /// Re-resolves the normalized game plan for an existing content-ready
-/// instance. The checked-in release fixture supplies the exact pin, while
+/// instance. The bundled release manifest supplies the exact pin, while
 /// Mojang and Fabric remain the metadata authorities. No installation state
 /// is changed by this operation.
 pub async fn resolve_instance_game_plan(
@@ -990,6 +1013,40 @@ pub fn validate_instance(
 
     // Cross-component consistency.
     if let Some(aurora) = &aurora_state {
+        let manifest = crate::distribution::production_manifest()
+            .map_err(|error| InstanceError::ReleaseInvalid(error.to_string()))?;
+        if let Some(release) = manifest.resolve_exact(pin.aurora_version(), Some(pin.channel())) {
+            if aurora.artifact().sha256() != release.artifact().sha256()
+                || Some(aurora.artifact().size_bytes()) != release.artifact().size_bytes()
+            {
+                problems.push(InstanceProblem {
+                    component: "aurora",
+                    reason:
+                        "the installed Aurora artifact does not match production release metadata"
+                            .to_owned(),
+                });
+            }
+            let expected_api = release.fabric_api();
+            let installed_api = aurora.fabric_api();
+            if expected_api.map(|api| {
+                (
+                    api.version(),
+                    api.artifact().sha256(),
+                    api.artifact().size_bytes(),
+                )
+            }) != installed_api.map(|api| {
+                (
+                    api.version(),
+                    api.artifact().sha256(),
+                    Some(api.artifact().size_bytes()),
+                )
+            }) {
+                problems.push(InstanceProblem {
+                        component: "aurora",
+                        reason: "the release-required Fabric API installation does not match production metadata".to_owned(),
+                    });
+            }
+        }
         if aurora.aurora_version() != pin.aurora_version()
             || aurora.channel() != pin.channel()
             || aurora.minecraft_version() != pin.minecraft_version()
@@ -2458,7 +2515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_loader_policy_resolves_the_newest_stable_loader() {
+    async fn automatic_loader_policy_uses_the_release_exact_loader() {
         let world = SyntheticWorld::new("automatic-loader");
         // The synthetic loader list serves 0.19.5 as the single stable entry.
         let record = world
@@ -2492,8 +2549,8 @@ mod tests {
 
     /// Controlled live instance creation against the real official Mojang
     /// and Fabric chains plus the launcher's actual checked-in development
-    /// release fixture: exactly what the production `create_instance`
-    /// command runs. The fixture's artifact URLs pin
+    /// release fixture: the same lifecycle path that production creation
+    /// uses, with injected development endpoints. The artifact URLs pin
     /// `http://127.0.0.1:8765/`, so this test serves the development
     /// directory there — a local development source, honestly not
     /// production release infrastructure.

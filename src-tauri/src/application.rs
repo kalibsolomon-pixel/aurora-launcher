@@ -1435,9 +1435,8 @@ impl From<AuroraInstallError> for CommandError {
 
 /// One Aurora release offered for instance creation.
 ///
-/// `source` is always explicit: today the only operational source is the
-/// checked-in development fixture, and the UI must not imply production
-/// release discovery exists.
+/// `source` distinguishes the reviewed bundled production entry from the
+/// checked-in development fixture; there is no automatic release discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuroraReleaseSummary {
@@ -1451,18 +1450,27 @@ pub struct AuroraReleaseSummary {
 
 /// Lists the Aurora releases available for instance creation.
 ///
-/// Resolves from the operational development release source (a checked-in
-/// fixture) â€” no production Aurora release endpoint exists yet.
+/// Resolves from the manifest offered for creation in this build. Production
+/// entries are bundled, with no remote release discovery endpoint.
 #[tauri::command]
 pub fn list_aurora_releases() -> Result<Vec<AuroraReleaseSummary>, CommandError> {
-    let manifest = crate::distribution::development_manifest()
+    let manifest = crate::distribution::creation_manifest()
+        .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
+    let production = crate::distribution::production_manifest()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
 
     Ok(manifest
         .releases()
         .iter()
         .map(|release| AuroraReleaseSummary {
-            source: "development-fixture",
+            source: if production
+                .resolve_exact(release.aurora_version(), None)
+                .is_some()
+            {
+                "production-bundled"
+            } else {
+                "development-fixture"
+            },
             aurora_version: release.aurora_version().to_owned(),
             channel: release.channel(),
             minecraft_version: release.minecraft_version().to_owned(),
@@ -1517,7 +1525,7 @@ pub async fn create_instance(
     request: CreateInstanceRequest,
 ) -> Result<InstanceSummary, CommandError> {
     let managed_paths = managed_paths(&app)?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::creation()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
 
     let configuration = crate::instances::settings::InstanceConfiguration::from_parts(
@@ -1591,7 +1599,7 @@ pub async fn retry_instance_install(
 ) -> Result<InstanceSummary, CommandError> {
     let managed_paths = managed_paths(&app)?;
     let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
 
     let record = crate::instances::lifecycle::retry_instance_install(
@@ -1669,7 +1677,7 @@ pub fn update_instance_configuration(
 ) -> Result<InstanceSummary, CommandError> {
     let managed_paths = managed_paths(&app)?;
     let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
     let configuration = request.configuration.into_configuration()?;
 
@@ -1703,7 +1711,7 @@ pub async fn install_instance_configuration(
 ) -> Result<InstanceSummary, CommandError> {
     let managed_paths = managed_paths(&app)?;
     let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
 
     let record = crate::instances::lifecycle::install_instance_configuration(
@@ -2207,7 +2215,7 @@ pub async fn get_instance_runtime_status(
 ) -> Result<RuntimeStatusDto, CommandError> {
     let managed = managed_paths(&app)?;
     let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
     let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
     let validation = crate::instances::lifecycle::validate_instance_runtime(
@@ -2231,7 +2239,7 @@ pub async fn ensure_instance_runtime(
 ) -> Result<RuntimeStatusDto, CommandError> {
     let managed = managed_paths(&app)?;
     let instance = crate::instances::InstanceId::new(request.instance_id.trim())?;
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
     let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
     let installed = crate::instances::lifecycle::ensure_instance_runtime(
@@ -2678,7 +2686,7 @@ async fn calculate_play_readiness(
             // This one lifecycle call performs deep content validation and,
             // only after it passes, one exact metadata resolution pass.
             // Readiness does not hash the instance twice.
-            let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+            let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
                 .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
             let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
             match crate::instances::lifecycle::resolve_instance_launch_plans(
@@ -2792,7 +2800,7 @@ pub async fn play_instance(
     }
 
     emit_launch_phase(&app, "resolvingLaunch");
-    let endpoints = crate::instances::lifecycle::InstanceEndpoints::development()
+    let endpoints = crate::instances::lifecycle::InstanceEndpoints::operational()
         .map_err(|error| CommandError::new("aurora_manifest_invalid", error.to_string()))?;
     let runtime_endpoints = crate::runtime::metadata::RuntimeMetadataEndpoints::official();
     let (game_plan, runtime_plan) = crate::instances::lifecycle::resolve_instance_launch_plans(
