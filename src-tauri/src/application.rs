@@ -2231,7 +2231,7 @@ fn provider_state(
     instance: &crate::instances::InstanceId,
 ) -> Result<crate::instance_content::ContentState, CommandError> {
     use crate::integrity::{ArtifactDigest, verify_file};
-    let state = crate::instance_content::ContentState::load(managed, instance)?;
+    let state = crate::instance_content::ContentState::load_and_migrate(managed, instance)?;
     for record in &state.entries {
         let directory =
             crate::instance_content::validate_directory(managed, instance, record.content_type)?;
@@ -2413,6 +2413,20 @@ async fn install_resolved_provider_plans(
     resolved: crate::modrinth::Resolved,
 ) -> Result<Vec<crate::instance_content::ProviderRecord>, CommandError> {
     if resolved.plans.is_empty() {
+        let identity = crate::instance_content::ProviderIdentity {
+            content_type: resolved.preview.content_type,
+            provider: "modrinth".into(),
+            project_id: resolved.preview.project_id,
+        };
+        let state = provider_state(managed, instance)?;
+        if state
+            .find(&identity)
+            .is_some_and(|record| !record.explicitly_retained)
+        {
+            return Ok(vec![crate::instance_content::retain_provider(
+                managed, instance, &identity,
+            )?]);
+        }
         return Ok(Vec::new());
     }
     crate::instance_content::install_provider_plans(managed, instance, resolved.plans)
@@ -2437,11 +2451,18 @@ pub async fn quick_install_modrinth(
     let managed = managed_paths(&app)?;
     let (instance, context) = provider_context(&managed, &request.instance_id)?;
     let state = provider_state(&managed, &instance)?;
-    if state.entries.iter().any(|record| {
+    if let Some(record) = state.entries.iter().find(|record| {
         record.provider == "modrinth"
             && record.content_type == request.content_type
             && record.project_id == request.project_id
     }) {
+        if !record.explicitly_retained {
+            return Ok(vec![crate::instance_content::retain_provider(
+                &managed,
+                &instance,
+                &record.identity(),
+            )?]);
+        }
         return Ok(Vec::new());
     }
     let client = crate::modrinth::Client::official();
@@ -2479,6 +2500,378 @@ pub async fn quick_install_modrinth(
         ));
     }
     install_resolved_provider_plans(&managed, &instance, revalidated).await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLifecycleRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLifecycleApproval {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    project_id: String,
+    preview_fingerprint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderLifecycleEntry {
+    record: crate::instance_content::ProviderRecord,
+    required_by: Vec<crate::instance_content::ProviderRecord>,
+    requires: Vec<crate::instance_content::ProviderRecord>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleItem {
+    content_type: crate::instance_content::ContentType,
+    provider: String,
+    project_id: String,
+    file_name: String,
+    display_version: Option<String>,
+}
+
+impl From<&crate::instance_content::ProviderRecord> for LifecycleItem {
+    fn from(record: &crate::instance_content::ProviderRecord) -> Self {
+        Self {
+            content_type: record.content_type,
+            provider: record.provider.clone(),
+            project_id: record.project_id.clone(),
+            file_name: record.file_name.clone(),
+            display_version: record.display_version.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleDelta {
+    will_install: Vec<LifecycleItem>,
+    will_remove: Vec<LifecycleItem>,
+    will_retain: Vec<LifecycleItem>,
+    new_requirements: Vec<LifecycleItem>,
+    removed_requirements: Vec<LifecycleItem>,
+}
+
+fn lifecycle_delta(
+    current: &crate::instance_content::ContentState,
+    next: &crate::instance_content::ContentState,
+    root: &crate::instance_content::ProviderIdentity,
+) -> LifecycleDelta {
+    let old_root = current.find(root);
+    let new_root = next.find(root);
+    let old_requires = old_root
+        .map(|record| record.requires.as_slice())
+        .unwrap_or(&[]);
+    let new_requires = new_root
+        .map(|record| record.requires.as_slice())
+        .unwrap_or(&[]);
+    let will_install = next
+        .entries
+        .iter()
+        .filter(|record| {
+            current
+                .find(&record.identity())
+                .is_none_or(|old| old.sha256 != record.sha256 || old.file_name != record.file_name)
+        })
+        .map(LifecycleItem::from)
+        .collect();
+    let will_remove = current
+        .entries
+        .iter()
+        .filter(|record| {
+            next.find(&record.identity())
+                .is_none_or(|new| new.sha256 != record.sha256 || new.file_name != record.file_name)
+        })
+        .map(LifecycleItem::from)
+        .collect();
+    let will_retain = old_requires
+        .iter()
+        .filter(|identity| !new_requires.contains(identity))
+        .filter_map(|identity| next.find(identity))
+        .map(LifecycleItem::from)
+        .collect();
+    let new_requirements = new_requires
+        .iter()
+        .filter(|identity| !old_requires.contains(identity))
+        .filter_map(|identity| next.find(identity))
+        .map(LifecycleItem::from)
+        .collect();
+    let removed_requirements = old_requires
+        .iter()
+        .filter(|identity| !new_requires.contains(identity))
+        .filter_map(|identity| current.find(identity))
+        .map(LifecycleItem::from)
+        .collect();
+    LifecycleDelta {
+        will_install,
+        will_remove,
+        will_retain,
+        new_requirements,
+        removed_requirements,
+    }
+}
+
+fn lifecycle_fingerprint(
+    instance: &crate::instances::InstanceId,
+    context: &crate::modrinth::Context,
+    current: &crate::instance_content::ContentState,
+    next: &crate::instance_content::ContentState,
+    provider_plan: Option<&str>,
+) -> String {
+    use sha2::Digest as _;
+    let bytes = serde_json::to_vec(&(
+        instance.to_string(),
+        &context.minecraft_version,
+        &context.loader,
+        current,
+        next,
+        provider_plan,
+    ))
+    .expect("lifecycle state serializes");
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn lifecycle_record<'a>(
+    state: &'a crate::instance_content::ContentState,
+    request: &ProviderLifecycleRequest,
+) -> Result<&'a crate::instance_content::ProviderRecord, CommandError> {
+    let identity = crate::instance_content::ProviderIdentity {
+        content_type: request.content_type,
+        provider: "modrinth".into(),
+        project_id: request.project_id.clone(),
+    };
+    state.find(&identity).ok_or_else(|| {
+        CommandError::new(
+            "content_changed_since_scan",
+            "This managed project is no longer installed. Refresh and try again.",
+        )
+    })
+}
+
+#[tauri::command]
+pub fn get_provider_lifecycle(
+    app: AppHandle,
+    request: InstanceModsRequest,
+) -> Result<Vec<ProviderLifecycleEntry>, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (instance, _) = provider_context(&managed, &request.instance_id)?;
+    let state = provider_state(&managed, &instance)?;
+    Ok(state
+        .entries
+        .iter()
+        .map(|record| ProviderLifecycleEntry {
+            record: record.clone(),
+            required_by: state
+                .required_by(&record.identity())
+                .iter()
+                .filter_map(|identity| state.find(identity).cloned())
+                .collect(),
+            requires: record
+                .requires
+                .iter()
+                .filter_map(|identity| state.find(identity).cloned())
+                .collect(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn check_modrinth_update(
+    app: AppHandle,
+    request: ProviderLifecycleRequest,
+) -> Result<Option<crate::modrinth::VersionChoice>, CommandError> {
+    let managed = managed_paths(&app)?;
+    let (instance, context) = provider_context(&managed, &request.instance_id)?;
+    let state = provider_state(&managed, &instance)?;
+    let record = lifecycle_record(&state, &request)?;
+    if !record.explicitly_retained {
+        return Err(CommandError::new(
+            "content_required_by_installed",
+            "This item is installed as a dependency. Check its parent for updates.",
+        ));
+    }
+    crate::modrinth::Client::official()
+        .update_candidate(&context, record)
+        .await
+        .map_err(provider_error)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUpdatePreview {
+    current: LifecycleItem,
+    candidate: crate::modrinth::VersionChoice,
+    delta: LifecycleDelta,
+    warnings: Vec<String>,
+    preview_fingerprint: String,
+}
+
+async fn resolve_update_preview(
+    managed: &ManagedPaths,
+    request: &ProviderLifecycleRequest,
+) -> Result<
+    (
+        crate::instances::InstanceId,
+        crate::instance_content::ContentState,
+        crate::modrinth::Resolved,
+        ProviderUpdatePreview,
+    ),
+    CommandError,
+> {
+    let (instance, context) = provider_context(managed, &request.instance_id)?;
+    let state = provider_state(managed, &instance)?;
+    let current = lifecycle_record(&state, request)?;
+    let candidate = crate::modrinth::Client::official()
+        .update_candidate(&context, current)
+        .await
+        .map_err(provider_error)?
+        .ok_or_else(|| CommandError::new("provider_no_update", "This project is up to date."))?;
+    let resolved = crate::modrinth::Client::official()
+        .resolve_update(
+            &context,
+            request.content_type,
+            &request.project_id,
+            &candidate.id,
+            &state,
+        )
+        .await
+        .map_err(provider_error)?;
+    let root = current.identity();
+    let next = crate::instance_content::update_preview_state(&state, &root, &resolved.plans)?;
+    let fingerprint = lifecycle_fingerprint(
+        &instance,
+        &context,
+        &state,
+        &next,
+        Some(&provider_fingerprint(&instance, &resolved)),
+    );
+    let preview = ProviderUpdatePreview {
+        current: LifecycleItem::from(current),
+        candidate,
+        delta: lifecycle_delta(&state, &next, &root),
+        warnings: resolved.preview.warnings.clone(),
+        preview_fingerprint: fingerprint,
+    };
+    Ok((instance, state, resolved, preview))
+}
+
+#[tauri::command]
+pub async fn preview_modrinth_update(
+    app: AppHandle,
+    request: ProviderLifecycleRequest,
+) -> Result<ProviderUpdatePreview, CommandError> {
+    let managed = managed_paths(&app)?;
+    Ok(resolve_update_preview(&managed, &request).await?.3)
+}
+
+#[tauri::command]
+pub async fn apply_modrinth_update(
+    app: AppHandle,
+    request: ProviderLifecycleApproval,
+) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let lookup = ProviderLifecycleRequest {
+        instance_id: request.instance_id.clone(),
+        content_type: request.content_type,
+        project_id: request.project_id.clone(),
+    };
+    let (instance, state, resolved, preview) = resolve_update_preview(&managed, &lookup).await?;
+    if preview.preview_fingerprint != request.preview_fingerprint {
+        return Err(CommandError::new(
+            "provider_preview_changed",
+            "The update preview changed. Review it again before updating.",
+        ));
+    }
+    let root = crate::instance_content::ProviderIdentity {
+        content_type: request.content_type,
+        provider: "modrinth".into(),
+        project_id: request.project_id,
+    };
+    crate::instance_content::update_provider_graph(
+        &managed,
+        &instance,
+        &state,
+        &root,
+        resolved.plans,
+    )
+    .await
+    .map_err(CommandError::from)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderRemovalPreview {
+    root: LifecycleItem,
+    delta: LifecycleDelta,
+    preview_fingerprint: String,
+}
+
+fn resolve_removal_preview(
+    managed: &ManagedPaths,
+    request: &ProviderLifecycleRequest,
+) -> Result<
+    (
+        crate::instances::InstanceId,
+        crate::instance_content::ContentState,
+        ProviderRemovalPreview,
+    ),
+    CommandError,
+> {
+    let (instance, context) = provider_context(managed, &request.instance_id)?;
+    let state = provider_state(managed, &instance)?;
+    let record = lifecycle_record(&state, request)?;
+    let root = record.identity();
+    let next = crate::instance_content::removal_state(&state, &root)?;
+    let preview = ProviderRemovalPreview {
+        root: LifecycleItem::from(record),
+        delta: lifecycle_delta(&state, &next, &root),
+        preview_fingerprint: lifecycle_fingerprint(&instance, &context, &state, &next, None),
+    };
+    Ok((instance, state, preview))
+}
+
+#[tauri::command]
+pub fn preview_provider_removal(
+    app: AppHandle,
+    request: ProviderLifecycleRequest,
+) -> Result<ProviderRemovalPreview, CommandError> {
+    let managed = managed_paths(&app)?;
+    Ok(resolve_removal_preview(&managed, &request)?.2)
+}
+
+#[tauri::command]
+pub fn apply_provider_removal(
+    app: AppHandle,
+    request: ProviderLifecycleApproval,
+) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let lookup = ProviderLifecycleRequest {
+        instance_id: request.instance_id.clone(),
+        content_type: request.content_type,
+        project_id: request.project_id.clone(),
+    };
+    let (instance, state, preview) = resolve_removal_preview(&managed, &lookup)?;
+    if preview.preview_fingerprint != request.preview_fingerprint {
+        return Err(CommandError::new(
+            "provider_preview_changed",
+            "The removal preview changed. Review it again.",
+        ));
+    }
+    let root = crate::instance_content::ProviderIdentity {
+        content_type: request.content_type,
+        provider: "modrinth".into(),
+        project_id: request.project_id,
+    };
+    crate::instance_content::remove_provider_graph(&managed, &instance, &state, &root)?;
+    Ok(())
 }
 
 /// One Minecraft version offered for instance configuration, from the

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import type { ContentEntry, InstanceSummary } from "$lib/backend";
+  import { getProviderLifecycle, type ContentEntry, type InstanceSummary, type ProviderLifecycleEntry } from "$lib/backend";
   import { launcher } from "$lib/launcher/store.svelte";
   import { formatModSize } from "./mods";
   import ModrinthBrowse from "./ModrinthBrowse.svelte";
+  import ProviderLifecycleActions from "./ProviderLifecycleActions.svelte";
 
   let { instance, kind }: { instance: InstanceSummary; kind: "resourcePack" | "shaderPack" } = $props();
   let query = $state("");
@@ -12,6 +13,22 @@
   let confirmButton: HTMLButtonElement | null = $state(null);
   let loadedKey = $state("");
   let view = $state<"installed" | "browse">("installed");
+  let lifecycleEntries = $state<ProviderLifecycleEntry[]>([]);
+  let lifecycleError = $state("");
+
+  async function refreshLifecycle(targetId: string): Promise<void> {
+    try {
+      const entries = await getProviderLifecycle(targetId);
+      if (instance.id === targetId) { lifecycleEntries = entries; lifecycleError = ""; }
+    } catch (reason) {
+      if (instance.id === targetId) lifecycleError = reason instanceof Error ? reason.message : "Provider lifecycle is unavailable.";
+    }
+  }
+
+  async function refreshInstalled(targetId: string, targetKind: "resourcePack" | "shaderPack"): Promise<void> {
+    await launcher.runLoadContent(targetId, targetKind);
+    await refreshLifecycle(targetId);
+  }
   const key = $derived(`${instance.id}:${kind}`);
   const title = $derived(kind === "resourcePack" ? "Resource Packs" : "Shaders");
   const directoryName = $derived(kind === "resourcePack" ? "resourcepacks" : "shaderpacks");
@@ -29,6 +46,7 @@
     if (loadedKey !== key) {
       loadedKey = key;
       if (!launcher.contentInventories[key]) void launcher.runLoadContent(instance.id, kind);
+      void refreshLifecycle(instance.id);
     }
   });
 
@@ -62,7 +80,7 @@
     <button type="button" class="btn btn-quiet" aria-pressed={view === "browse"} onclick={() => view = "browse"}>Browse</button>
   </div>
   {#if view === "browse"}
-    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} {kind} installedProjectIds={entries.filter((entry) => entry.provenance?.provider === "modrinth").map((entry) => entry.provenance!.projectId)} onInstalled={async (targetId, targetKind) => { if (targetKind !== "mod") await launcher.runLoadContent(targetId, targetKind); }} />
+    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} {kind} installedProjectIds={entries.filter((entry) => entry.provenance?.provider === "modrinth").map((entry) => entry.provenance!.projectId)} dependencyOnlyProjectIds={lifecycleEntries.filter((entry) => entry.record.contentType === kind && !entry.record.explicitlyRetained).map((entry) => entry.record.projectId)} onInstalled={async (targetId, targetKind) => { if (targetKind !== "mod") await refreshInstalled(targetId, targetKind); }} />
   {:else}
   <div class="packs-heading">
     <div>
@@ -77,6 +95,7 @@
 
   {#if running}<p class="packs-note">Changes made while Minecraft is running apply on the next launch.</p>{/if}
   {#if launcher.contentError}<p class="inline-message inline-message-error" role="alert">{launcher.contentError.message} <code>{launcher.contentError.code}</code></p>{/if}
+  {#if lifecycleError}<p class="inline-message inline-message-error" role="alert">{lifecycleError}</p>{/if}
   {#if inventory?.missingManaged.length}
     <p class="packs-note" role="status">{inventory.missingManaged.length} managed {kind === "resourcePack" ? "resource pack" : "shader pack"} file{inventory.missingManaged.length === 1 ? " is" : "s are"} missing. Aurora will not recreate files automatically.</p>
     <details class="missing-details"><summary>Missing managed files</summary><ul>{#each inventory.missingManaged as record}<li>{record.fileName} · {record.provider}</li>{/each}</ul></details>
@@ -116,6 +135,10 @@
                 {#if entry.warnings.length}<div><dt>Warnings</dt><dd><ul>{#each entry.warnings as warning}<li>{warning.message}</li>{/each}</ul></dd></div>{/if}
               </dl>
             </details>
+            {#if entry.provenance?.provider === "modrinth"}
+              {@const lifecycle = lifecycleEntries.find((item) => item.record.contentType === kind && item.record.projectId === entry.provenance?.projectId)}
+              {#if lifecycle}<div class="pack-details"><ProviderLifecycleActions instanceId={instance.id} {kind} title={entry.displayName} {lifecycle} onChanged={async () => { await refreshInstalled(instance.id, kind); }} /></div>{/if}
+            {/if}
             {#if removal?.entryId === entry.entryId}
               <div class="pack-confirm" role="group" aria-label={`Remove ${entry.displayName}?`}>
                 <p>Remove {entry.fileName} permanently? This cannot be undone.</p>

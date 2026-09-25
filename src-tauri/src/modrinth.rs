@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -12,7 +13,7 @@ use url::Url;
 use crate::downloads::{DownloadOptions, Sha512ArtifactSource};
 use crate::instance_content::{
     ContentCompatibility, ContentState, ContentType, DependencyKind, ProviderArtifactSource,
-    ProviderDependency, ProviderInstallPlan,
+    ProviderDependency, ProviderIdentity, ProviderInstallPlan, ProviderRecord,
 };
 
 const BASE: &str = "https://api.modrinth.com/v2/";
@@ -29,19 +30,25 @@ pub struct Context {
 #[derive(Debug, Clone)]
 pub struct Client {
     base: Url,
+    http: reqwest::Client,
 }
 
 impl Client {
     pub fn official() -> Self {
-        Self {
-            base: Url::parse(BASE).expect("fixed official Modrinth API URL"),
-        }
+        static OFFICIAL: OnceLock<Client> = OnceLock::new();
+        OFFICIAL
+            .get_or_init(|| Self {
+                base: Url::parse(BASE).expect("fixed official Modrinth API URL"),
+                http: crate::downloads::build_client(&DownloadOptions::default()),
+            })
+            .clone()
     }
 
     #[cfg(test)]
     fn for_testing(base: &str) -> Self {
         Self {
             base: Url::parse(base).unwrap(),
+            http: crate::downloads::build_client(&DownloadOptions::default()),
         }
     }
 
@@ -67,8 +74,8 @@ impl Client {
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, url: Url) -> Result<T, Error> {
-        let client = crate::downloads::build_client(&DownloadOptions::default());
-        let mut response = client
+        let mut response = self
+            .http
             .get(url)
             .header(
                 reqwest::header::USER_AGENT,
@@ -266,6 +273,46 @@ impl Client {
         version_id: &str,
         installed: &ContentState,
     ) -> Result<Resolved, Error> {
+        self.resolve_inner(context, kind, project_id, version_id, installed, None)
+            .await
+    }
+
+    pub async fn resolve_update(
+        &self,
+        context: &Context,
+        kind: ContentType,
+        project_id: &str,
+        version_id: &str,
+        installed: &ContentState,
+    ) -> Result<Resolved, Error> {
+        let replacing = ProviderIdentity {
+            content_type: kind,
+            provider: "modrinth".into(),
+            project_id: project_id.into(),
+        };
+        if installed.find(&replacing).is_none() {
+            return Err(Error::InvalidRequest);
+        }
+        self.resolve_inner(
+            context,
+            kind,
+            project_id,
+            version_id,
+            installed,
+            Some(replacing),
+        )
+        .await
+    }
+
+    async fn resolve_inner(
+        &self,
+        context: &Context,
+        kind: ContentType,
+        project_id: &str,
+        version_id: &str,
+        installed: &ContentState,
+        replacing: Option<ProviderIdentity>,
+    ) -> Result<Resolved, Error> {
         let mut graph = Graph {
             context,
             client: self,
@@ -275,6 +322,7 @@ impl Client {
             visiting: HashSet::new(),
             seen: HashMap::new(),
             warnings: Vec::new(),
+            replacing,
         };
         graph
             .visit(
@@ -315,6 +363,52 @@ impl Client {
             .ok_or(Error::NoCompatibleVersion)?;
         self.resolve(context, kind, project_id, &version_id, installed)
             .await
+    }
+
+    /// Publication time orders versions; release policy follows the installed
+    /// channel. A stable install never silently moves to beta or alpha.
+    pub async fn update_candidate(
+        &self,
+        context: &Context,
+        installed: &ProviderRecord,
+    ) -> Result<Option<VersionChoice>, Error> {
+        if installed.provider != "modrinth" {
+            return Err(Error::InvalidRequest);
+        }
+        let current = self.version(&installed.version_id).await?;
+        if current.project_id != installed.project_id
+            || choose_file(&current, installed.content_type)?.hashes.sha512 != installed.file_id
+        {
+            return Err(Error::InvalidResponse);
+        }
+        let allowed: &[&str] = match current.version_type.as_str() {
+            "release" => &["release"],
+            "beta" => &["release", "beta"],
+            "alpha" => &["release", "beta", "alpha"],
+            _ => return Err(Error::InvalidResponse),
+        };
+        let mut versions = self
+            .versions(context, installed.content_type, &installed.project_id)
+            .await?;
+        versions.retain(|candidate| {
+            candidate.project_id == installed.project_id
+                && candidate.date_published > current.date_published
+                && allowed.contains(&candidate.version_type.as_str())
+        });
+        versions.sort_by(|a, b| {
+            b.date_published
+                .cmp(&a.date_published)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(versions.first().map(|version| VersionChoice {
+            id: version.id.clone(),
+            name: version.name.clone(),
+            version_number: version.version_number.clone(),
+            version_type: version.version_type.clone(),
+            date_published: version.date_published.clone(),
+            environment: version.environment.clone(),
+            loaders: version.loaders.clone(),
+        }))
     }
 }
 
@@ -423,6 +517,7 @@ struct Graph<'a> {
     visiting: HashSet<String>,
     seen: HashMap<String, String>,
     warnings: Vec<String>,
+    replacing: Option<ProviderIdentity>,
 }
 
 impl Graph<'_> {
@@ -508,6 +603,7 @@ impl Graph<'_> {
                     && record.project_id == project.id
                     && record.version_id != version.id
                     && record.content_type == kind
+                    && self.replacing.as_ref() != Some(&record.identity())
             }) {
                 return Err(Error::DependencyConflict);
             }
@@ -516,6 +612,7 @@ impl Graph<'_> {
                     && record.project_id == project.id
                     && record.version_id == version.id
                     && record.content_type == kind
+                    && self.replacing.as_ref() != Some(&record.identity())
             });
             self.visiting.insert(project.id.clone());
             let mut dependencies = Vec::new();
@@ -1023,6 +1120,157 @@ mod tests {
                 Err(Error::NoCompatibleVersion)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn update_discovery_respects_publication_compatibility_and_release_channel() {
+        let mut current = version("11112222", "AAAABBBB", json!([]));
+        current["date_published"] = json!("2026-01-01T00:00:00Z");
+        let mut stable = version("22223333", "AAAABBBB", json!([]));
+        stable["date_published"] = json!("2026-02-01T00:00:00Z");
+        let mut beta = version("33334444", "AAAABBBB", json!([]));
+        beta["version_type"] = json!("beta");
+        beta["date_published"] = json!("2026-03-01T00:00:00Z");
+        let mut wrong_loader = version("44445555", "AAAABBBB", json!([]));
+        wrong_loader["date_published"] = json!("2026-04-01T00:00:00Z");
+        wrong_loader["loaders"] = json!(["forge"]);
+        let mut wrong_game = version("55556666", "AAAABBBB", json!([]));
+        wrong_game["date_published"] = json!("2026-05-01T00:00:00Z");
+        wrong_game["game_versions"] = json!(["1.20.1"]);
+        let mut routes = HashMap::new();
+        routes.insert("/v2/version/11112222".into(), current.clone());
+        routes.insert(
+            "/v2/project/AAAABBBB/version".into(),
+            json!([
+                wrong_game,
+                wrong_loader,
+                beta.clone(),
+                stable.clone(),
+                current.clone()
+            ]),
+        );
+        let first_server = server(routes);
+        let client = Client::for_testing(&format!("{}/v2/", first_server.base_url()));
+        let mut record = ProviderRecord {
+            content_type: ContentType::Mod,
+            provider: "modrinth".into(),
+            project_id: "AAAABBBB".into(),
+            version_id: "11112222".into(),
+            file_id: "a".repeat(128),
+            file_name: "11112222.jar".into(),
+            sha256: "b".repeat(64),
+            display_version: Some("1.0.0".into()),
+            compatibility: ContentCompatibility {
+                minecraft_versions: vec!["1.21.11".into()],
+                loader: Some("fabric".into()),
+                environment: Some("client_and_server".into()),
+            },
+            dependencies: vec![],
+            explicitly_retained: true,
+            requires: vec![],
+        };
+        assert_eq!(
+            client
+                .update_candidate(&context(), &record)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "22223333"
+        );
+        // A beta install may move to a newer compatible beta. The current
+        // version metadata, not a human-readable version string, sets policy.
+        let mut beta_current = current;
+        beta_current["version_type"] = json!("beta");
+        let mut beta_routes = HashMap::new();
+        beta_routes.insert("/v2/version/11112222".into(), beta_current);
+        beta_routes.insert("/v2/project/AAAABBBB/version".into(), json!([beta, stable]));
+        let beta_server = server(beta_routes);
+        let beta_client = Client::for_testing(&format!("{}/v2/", beta_server.base_url()));
+        assert_eq!(
+            beta_client
+                .update_candidate(&context(), &record)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "33334444"
+        );
+        record.file_id = "c".repeat(128);
+        assert!(matches!(
+            beta_client.update_candidate(&context(), &record).await,
+            Err(Error::InvalidResponse)
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_check_distinguishes_no_candidate_and_provider_failures() {
+        let mut record = ProviderRecord {
+            content_type: ContentType::Mod,
+            provider: "modrinth".into(),
+            project_id: "AAAABBBB".into(),
+            version_id: "11112222".into(),
+            file_id: "a".repeat(128),
+            file_name: "11112222.jar".into(),
+            sha256: "b".repeat(64),
+            display_version: Some("1.0.0".into()),
+            compatibility: ContentCompatibility {
+                minecraft_versions: vec!["1.21.11".into()],
+                loader: Some("fabric".into()),
+                environment: Some("client_and_server".into()),
+            },
+            dependencies: vec![],
+            explicitly_retained: true,
+            requires: vec![],
+        };
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/v2/version/11112222".into(),
+            version("11112222", "AAAABBBB", json!([])),
+        );
+        routes.insert(
+            "/v2/project/AAAABBBB/version".into(),
+            json!([version("11112222", "AAAABBBB", json!([]))]),
+        );
+        let no_update = server(routes);
+        let client = Client::for_testing(&format!("{}/v2/", no_update.base_url()));
+        assert!(
+            client
+                .update_candidate(&context(), &record)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        record.version_id = "99998888".into();
+        assert!(matches!(
+            client.update_candidate(&context(), &record).await,
+            Err(Error::NotFound)
+        ));
+        record.version_id = "11112222".into();
+
+        let rate = TestServer::spawn(Arc::new(|_| {
+            TestResponse::status(429).with_header("X-Ratelimit-Reset", "12")
+        }));
+        let client = Client::for_testing(&format!("{}/v2/", rate.base_url()));
+        assert!(matches!(
+            client.update_candidate(&context(), &record).await,
+            Err(Error::RateLimited(Some(12)))
+        ));
+
+        let malformed =
+            TestServer::spawn(Arc::new(|_| TestResponse::ok(br#"{"unexpected":true}"#)));
+        let client = Client::for_testing(&format!("{}/v2/", malformed.base_url()));
+        assert!(matches!(
+            client.update_candidate(&context(), &record).await,
+            Err(Error::InvalidResponse)
+        ));
+
+        let client = Client::for_testing("http://127.0.0.1:0/v2/");
+        assert!(matches!(
+            client.update_candidate(&context(), &record).await,
+            Err(Error::Network)
+        ));
     }
 
     #[tokio::test]

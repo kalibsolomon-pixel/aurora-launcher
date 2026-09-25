@@ -2,7 +2,7 @@
 //! validated instance id and a closed content type select a direct child of
 //! the isolated game directory. Provider records are evidence, never guesses.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use crate::instances::InstanceId;
 use crate::integrity::{ArtifactDigest, verify_file};
 use crate::paths::ManagedPaths;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
 const MAX_METADATA_BYTES: u64 = 256 * 1024;
@@ -89,6 +89,30 @@ pub struct ProviderRecord {
     pub display_version: Option<String>,
     pub compatibility: ContentCompatibility,
     pub dependencies: Vec<ProviderDependency>,
+    /// A direct user choice survives even while another installed item needs
+    /// this artifact. Legacy records are migrated conservatively to true.
+    pub explicitly_retained: bool,
+    /// Required edges that were actually satisfied at installation time.
+    /// Remote dependency metadata above is descriptive, not ownership.
+    pub requires: Vec<ProviderIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderIdentity {
+    pub content_type: ContentType,
+    pub provider: String,
+    pub project_id: String,
+}
+
+impl ProviderRecord {
+    pub fn identity(&self) -> ProviderIdentity {
+        ProviderIdentity {
+            content_type: self.content_type,
+            provider: self.provider.clone(),
+            project_id: self.project_id.clone(),
+        }
+    }
 }
 
 impl ProviderRecord {
@@ -133,6 +157,16 @@ impl ProviderRecord {
                 "provider compatibility or dependency is invalid".into(),
             ));
         }
+        if self.requires.iter().any(|edge| {
+            edge.provider.trim().is_empty()
+                || edge.provider.len() > 256
+                || edge.project_id.trim().is_empty()
+                || edge.project_id.len() > 256
+        }) {
+            return Err(ContentError::StateMalformed(
+                "provider edge is invalid".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -159,7 +193,26 @@ impl ContentState {
             .get("schemaVersion")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| ContentError::StateMalformed("schemaVersion is required".into()))?;
-        if version != u64::from(SCHEMA_VERSION) {
+        let mut value = value;
+        if version == 1 {
+            let entries = value
+                .get_mut("entries")
+                .and_then(serde_json::Value::as_array_mut)
+                .ok_or_else(|| ContentError::StateMalformed("entries are required".into()))?;
+            for entry in entries {
+                let fields = entry.as_object_mut().ok_or_else(|| {
+                    ContentError::StateMalformed("provider record is invalid".into())
+                })?;
+                if fields.contains_key("explicitlyRetained") || fields.contains_key("requires") {
+                    return Err(ContentError::StateMalformed(
+                        "v1 record contains v2 fields".into(),
+                    ));
+                }
+                fields.insert("explicitlyRetained".into(), serde_json::Value::Bool(true));
+                fields.insert("requires".into(), serde_json::json!([]));
+            }
+            value["schemaVersion"] = serde_json::json!(SCHEMA_VERSION);
+        } else if version != u64::from(SCHEMA_VERSION) {
             return Err(ContentError::StateVersion(version));
         }
         let state: Self = serde_json::from_value(value)
@@ -173,11 +226,62 @@ impl ContentState {
             return Err(ContentError::StateVersion(u64::from(self.schema_version)));
         }
         let mut names = HashSet::new();
+        let mut identities = HashSet::new();
         for entry in &self.entries {
             entry.validate()?;
             if !names.insert((entry.content_type, entry.file_name.to_lowercase())) {
                 return Err(ContentError::StateMalformed(
                     "duplicate provider filename".into(),
+                ));
+            }
+            if !identities.insert(entry.identity()) {
+                return Err(ContentError::StateMalformed(
+                    "duplicate provider project".into(),
+                ));
+            }
+        }
+        for entry in &self.entries {
+            let mut edges = HashSet::new();
+            for edge in &entry.requires {
+                if !edges.insert(edge) || edge == &entry.identity() || !identities.contains(edge) {
+                    return Err(ContentError::StateMalformed(
+                        "invalid installed dependency edge".into(),
+                    ));
+                }
+            }
+        }
+        let graph: HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.identity(), entry.requires.as_slice()))
+            .collect();
+        fn cycle(
+            node: &ProviderIdentity,
+            graph: &HashMap<ProviderIdentity, &[ProviderIdentity]>,
+            active: &mut HashSet<ProviderIdentity>,
+            done: &mut HashSet<ProviderIdentity>,
+        ) -> bool {
+            if done.contains(node) {
+                return false;
+            }
+            if !active.insert(node.clone()) {
+                return true;
+            }
+            if graph
+                .get(node)
+                .is_some_and(|edges| edges.iter().any(|edge| cycle(edge, graph, active, done)))
+            {
+                return true;
+            }
+            active.remove(node);
+            done.insert(node.clone());
+            false
+        }
+        let mut done = HashSet::new();
+        for identity in &identities {
+            if cycle(identity, &graph, &mut HashSet::new(), &mut done) {
+                return Err(ContentError::StateMalformed(
+                    "installed dependency graph contains a cycle".into(),
                 ));
             }
         }
@@ -191,6 +295,51 @@ impl ContentState {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::empty()),
             Err(error) => Err(ContentError::Io(error)),
         }
+    }
+
+    pub fn load_and_migrate(
+        managed: &ManagedPaths,
+        instance: &InstanceId,
+    ) -> Result<Self, ContentError> {
+        with_instance_lock(instance, || {
+            Self::load_and_migrate_locked(managed, instance)
+        })
+    }
+
+    fn load_and_migrate_locked(
+        managed: &ManagedPaths,
+        instance: &InstanceId,
+    ) -> Result<Self, ContentError> {
+        let path = state_path(managed, instance)?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::empty()),
+            Err(error) => return Err(ContentError::Io(error)),
+        };
+        let legacy = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|error| ContentError::StateMalformed(error.to_string()))?
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1);
+        let state = Self::from_json(&text)?;
+        if legacy {
+            state.save(managed, instance)?;
+        }
+        Ok(state)
+    }
+
+    pub fn required_by(&self, identity: &ProviderIdentity) -> Vec<ProviderIdentity> {
+        self.entries
+            .iter()
+            .filter(|record| record.requires.contains(identity))
+            .map(ProviderRecord::identity)
+            .collect()
+    }
+
+    pub fn find(&self, identity: &ProviderIdentity) -> Option<&ProviderRecord> {
+        self.entries
+            .iter()
+            .find(|record| record.identity() == *identity)
     }
 
     pub fn save(&self, managed: &ManagedPaths, instance: &InstanceId) -> Result<(), ContentError> {
@@ -216,6 +365,164 @@ impl ContentState {
         }
         Ok(())
     }
+}
+
+pub fn validate_provider_file(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    record: &ProviderRecord,
+) -> Result<PathBuf, ContentError> {
+    let directory = validate_directory(managed, instance, record.content_type)?;
+    let path = directory.join(&record.file_name);
+    let metadata = std::fs::symlink_metadata(&path).map_err(ContentError::Io)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(ContentError::UnsafePath);
+    }
+    let digest = ArtifactDigest::parse(&record.sha256).map_err(|_| ContentError::HashMismatch)?;
+    verify_file(&path, &digest, None).map_err(|_| ContentError::HashMismatch)?;
+    Ok(path)
+}
+
+/// Promote an already installed dependency when the user chooses it directly.
+/// The exact bytes are revalidated and no network acquisition occurs.
+pub fn retain_provider(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    identity: &ProviderIdentity,
+) -> Result<ProviderRecord, ContentError> {
+    with_instance_lock(instance, || {
+        let mut state = ContentState::load(managed, instance)?;
+        let record = state
+            .entries
+            .iter_mut()
+            .find(|record| record.identity() == *identity)
+            .ok_or(ContentError::ChangedSinceScan)?;
+        validate_provider_file(managed, instance, record)?;
+        if !record.explicitly_retained {
+            record.explicitly_retained = true;
+            let updated = record.clone();
+            state.save(managed, instance)?;
+            Ok(updated)
+        } else {
+            Ok(record.clone())
+        }
+    })
+}
+
+fn required_edges(
+    record: &ProviderRecord,
+    identities: &[ProviderIdentity],
+) -> Vec<ProviderIdentity> {
+    record
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::Required)
+        .filter_map(|dependency| {
+            identities
+                .iter()
+                .find(|identity| {
+                    identity.provider == dependency.provider
+                        && identity.project_id == dependency.project_id
+                })
+                .cloned()
+        })
+        .collect()
+}
+
+fn prune_orphans(state: &mut ContentState) {
+    loop {
+        let removable: HashSet<_> = state
+            .entries
+            .iter()
+            .filter(|record| {
+                !record.explicitly_retained && state.required_by(&record.identity()).is_empty()
+            })
+            .map(ProviderRecord::identity)
+            .collect();
+        if removable.is_empty() {
+            break;
+        }
+        state
+            .entries
+            .retain(|record| !removable.contains(&record.identity()));
+    }
+}
+
+pub fn removal_state(
+    current: &ContentState,
+    identity: &ProviderIdentity,
+) -> Result<ContentState, ContentError> {
+    let mut next = current.clone();
+    let record = next
+        .entries
+        .iter_mut()
+        .find(|record| record.identity() == *identity)
+        .ok_or(ContentError::ChangedSinceScan)?;
+    if !record.explicitly_retained && !current.required_by(identity).is_empty() {
+        return Err(ContentError::RequiredByInstalledContent);
+    }
+    record.explicitly_retained = false;
+    prune_orphans(&mut next);
+    next.validate()?;
+    Ok(next)
+}
+
+pub fn updated_state(
+    current: &ContentState,
+    root: &ProviderIdentity,
+    mut replacements: Vec<ProviderRecord>,
+) -> Result<ContentState, ContentError> {
+    let old = current.find(root).ok_or(ContentError::ChangedSinceScan)?;
+    if !old.explicitly_retained || !current.required_by(root).is_empty() {
+        return Err(ContentError::RequiredByInstalledContent);
+    }
+    if replacements.last().map(ProviderRecord::identity).as_ref() != Some(root) {
+        return Err(ContentError::StateMalformed(
+            "update graph has no root".into(),
+        ));
+    }
+    let mut next = current.clone();
+    next.entries.retain(|record| record.identity() != *root);
+    let mut identities: Vec<_> = next.entries.iter().map(ProviderRecord::identity).collect();
+    for replacement in &replacements {
+        let identity = replacement.identity();
+        if identities.contains(&identity) {
+            return Err(ContentError::Collision);
+        }
+        identities.push(identity);
+    }
+    for replacement in &mut replacements {
+        replacement.explicitly_retained = replacement.identity() == *root;
+        replacement.requires = required_edges(replacement, &identities);
+    }
+    let new_identities: HashSet<_> = replacements.iter().map(ProviderRecord::identity).collect();
+    next.entries.extend(replacements);
+    prune_orphans(&mut next);
+    if new_identities
+        .iter()
+        .any(|identity| next.find(identity).is_none())
+    {
+        return Err(ContentError::StateMalformed(
+            "update graph contains an unowned artifact".into(),
+        ));
+    }
+    next.validate()?;
+    Ok(next)
+}
+
+pub fn update_preview_state(
+    current: &ContentState,
+    root: &ProviderIdentity,
+    plans: &[ProviderInstallPlan],
+) -> Result<ContentState, ContentError> {
+    updated_state(
+        current,
+        root,
+        plans
+            .iter()
+            .map(|plan| plan.record("0".repeat(64)))
+            .collect(),
+    )
 }
 
 fn state_path(managed: &ManagedPaths, instance: &InstanceId) -> Result<PathBuf, ContentError> {
@@ -545,11 +852,7 @@ fn inspect(path: &Path, kind: ContentType, record: Option<&ProviderRecord>) -> C
         description,
         pack_format,
         warnings,
-        can_remove: file_type == "zip"
-            && matches!(
-                ownership,
-                ContentOwnership::UserManaged | ContentOwnership::ProviderManaged
-            ),
+        can_remove: file_type == "zip" && ownership == ContentOwnership::UserManaged,
     }
 }
 
@@ -808,6 +1111,8 @@ impl ProviderInstallPlan {
             display_version: self.display_version.clone(),
             compatibility: self.compatibility.clone(),
             dependencies: self.dependencies.clone(),
+            explicitly_retained: true,
+            requires: Vec::new(),
         }
     }
 }
@@ -842,6 +1147,16 @@ pub async fn install_provider_plans(
     instance: &InstanceId,
     plans: Vec<ProviderInstallPlan>,
 ) -> Result<Vec<ProviderRecord>, ContentError> {
+    let acquired = acquire_provider_plans(managed, plans).await?;
+    activate_provider_transaction(managed, instance, acquired, |state| {
+        state.save(managed, instance)
+    })
+}
+
+async fn acquire_provider_plans(
+    managed: &ManagedPaths,
+    plans: Vec<ProviderInstallPlan>,
+) -> Result<Vec<(ProviderRecord, PathBuf, u64)>, ContentError> {
     if plans.is_empty() || plans.len() > 64 {
         return Err(ContentError::StateMalformed(
             "provider plan size is invalid".into(),
@@ -869,20 +1184,44 @@ pub async fn install_provider_plans(
     .buffered(8)
     .collect::<Vec<_>>()
     .await;
-    let acquired = acquired.into_iter().collect::<Result<Vec<_>, _>>()?;
-    activate_provider_transaction(managed, instance, acquired, |state| {
-        state.save(managed, instance)
-    })
+    acquired.into_iter().collect::<Result<Vec<_>, _>>()
 }
 
 fn activate_provider_transaction(
     managed: &ManagedPaths,
     instance: &InstanceId,
-    acquired: Vec<(ProviderRecord, PathBuf, u64)>,
+    mut acquired: Vec<(ProviderRecord, PathBuf, u64)>,
     commit: impl FnOnce(&ContentState) -> Result<(), ContentError>,
 ) -> Result<Vec<ProviderRecord>, ContentError> {
     with_instance_lock(instance, || {
         let mut state = ContentState::load(managed, instance)?;
+        let direct = acquired
+            .last()
+            .map(|(record, _, _)| record.identity())
+            .ok_or_else(|| ContentError::StateMalformed("empty provider graph".into()))?;
+        let identities: Vec<_> = state
+            .entries
+            .iter()
+            .map(ProviderRecord::identity)
+            .chain(acquired.iter().map(|(record, _, _)| record.identity()))
+            .collect();
+        for (record, _, _) in &mut acquired {
+            record.explicitly_retained = record.identity() == direct;
+            record.requires = record
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.kind == DependencyKind::Required)
+                .filter_map(|dependency| {
+                    identities
+                        .iter()
+                        .find(|identity| {
+                            identity.provider == dependency.provider
+                                && identity.project_id == dependency.project_id
+                        })
+                        .cloned()
+                })
+                .collect();
+        }
         let mut keys = HashSet::new();
         let mut targets = Vec::new();
         let required = crate::instance_mods::managed_artifact_file_name(managed, instance)
@@ -962,6 +1301,271 @@ fn activate_provider_transaction(
         }
         Ok(acquired.into_iter().map(|(record, _, _)| record).collect())
     })
+}
+
+fn same_file(left: &ProviderRecord, right: &ProviderRecord) -> bool {
+    left.content_type == right.content_type
+        && left.file_name == right.file_name
+        && left.sha256 == right.sha256
+}
+
+struct RetiredFile {
+    target: PathBuf,
+    backup: PathBuf,
+    rollback_copy: PathBuf,
+}
+
+/// Commit one provider-independent lifecycle state transition. Every old file
+/// has a verified rollback copy before any target is moved; every new file is
+/// copied and verified from the content-addressed store before activation.
+fn apply_lifecycle_state(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    expected: &ContentState,
+    next: &ContentState,
+    acquired: &[(ProviderRecord, PathBuf, u64)],
+) -> Result<(), ContentError> {
+    apply_lifecycle_state_with_hooks(
+        managed,
+        instance,
+        expected,
+        next,
+        acquired,
+        |state| state.save(managed, instance),
+        || Ok(()),
+    )
+}
+
+fn apply_lifecycle_state_with_hooks(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    expected: &ContentState,
+    next: &ContentState,
+    acquired: &[(ProviderRecord, PathBuf, u64)],
+    commit: impl FnOnce(&ContentState) -> Result<(), ContentError>,
+    before_cleanup: impl FnOnce() -> Result<(), ContentError>,
+) -> Result<(), ContentError> {
+    with_instance_lock(instance, || {
+        let current = ContentState::load(managed, instance)?;
+        if &current != expected {
+            return Err(ContentError::ChangedSinceScan);
+        }
+        next.validate()?;
+        let required = crate::instance_mods::managed_artifact_file_name(managed, instance)
+            .map_err(|error| ContentError::StateMalformed(error.to_string()))?
+            .unwrap_or_default();
+        let protected = |record: &ProviderRecord| {
+            record.content_type == ContentType::Mod
+                && required
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&record.file_name))
+        };
+        for record in &current.entries {
+            if protected(record) {
+                return Err(ContentError::Collision);
+            }
+            validate_provider_file(managed, instance, record)?;
+        }
+        let retired: Vec<_> = current
+            .entries
+            .iter()
+            .filter(|record| {
+                next.find(&record.identity())
+                    .is_none_or(|updated| !same_file(record, updated))
+            })
+            .collect();
+        let incoming: Vec<_> = next
+            .entries
+            .iter()
+            .filter(|record| {
+                current
+                    .find(&record.identity())
+                    .is_none_or(|old| !same_file(old, record))
+            })
+            .collect();
+        if incoming.len() != acquired.len() {
+            return Err(ContentError::StateMalformed(
+                "acquired graph does not match lifecycle state".into(),
+            ));
+        }
+        let retired_paths: HashSet<_> = retired
+            .iter()
+            .map(|record| {
+                validate_directory(managed, instance, record.content_type)
+                    .map(|dir| dir.join(&record.file_name))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut staged = Vec::<(PathBuf, PathBuf)>::new();
+        let mut rollback = Vec::<RetiredFile>::new();
+        let mut activated = Vec::<PathBuf>::new();
+        let mut moved = 0usize;
+        let mut state_committed = false;
+        let result = (|| {
+            let mut targets = HashSet::new();
+            for record in &incoming {
+                if protected(record)
+                    || !targets.insert((record.content_type, record.file_name.to_lowercase()))
+                {
+                    return Err(ContentError::Collision);
+                }
+                let (acquired_record, source, size) = acquired
+                    .iter()
+                    .find(|(item, _, _)| item.identity() == record.identity())
+                    .ok_or_else(|| {
+                        ContentError::StateMalformed("acquired artifact is missing".into())
+                    })?;
+                let mut normalized_acquired = acquired_record.clone();
+                normalized_acquired.explicitly_retained = record.explicitly_retained;
+                normalized_acquired.requires = record.requires.clone();
+                if normalized_acquired != **record {
+                    return Err(ContentError::StateMalformed(
+                        "acquired artifact changed".into(),
+                    ));
+                }
+                let directory = ensure_directory(managed, instance, record.content_type)?;
+                let target = directory.join(&record.file_name);
+                if !retired_paths.contains(&target)
+                    && (std::fs::symlink_metadata(&target).is_ok()
+                        || std::fs::read_dir(&directory)
+                            .map_err(ContentError::Io)?
+                            .any(|entry| {
+                                entry.is_ok_and(|entry| {
+                                    entry
+                                        .file_name()
+                                        .to_string_lossy()
+                                        .eq_ignore_ascii_case(&record.file_name)
+                                })
+                            }))
+                {
+                    return Err(ContentError::Collision);
+                }
+                let digest = ArtifactDigest::parse(&record.sha256)
+                    .map_err(|_| ContentError::HashMismatch)?;
+                verify_file(source, &digest, Some(*size))
+                    .map_err(|_| ContentError::HashMismatch)?;
+                validate_provider_mod_artifact(record, source, *size)?;
+                let stage = directory.join(format!(".content-staged-{}", uuid::Uuid::new_v4()));
+                staged.push((target, stage.clone()));
+                std::fs::copy(source, &stage).map_err(ContentError::Io)?;
+                verify_file(&stage, &digest, Some(*size))
+                    .map_err(|_| ContentError::HashMismatch)?;
+            }
+            for record in &retired {
+                let target = validate_provider_file(managed, instance, record)?;
+                let directory = target.parent().ok_or(ContentError::UnsafePath)?;
+                let backup = directory.join(format!(".content-retired-{}", uuid::Uuid::new_v4()));
+                let rollback_copy =
+                    directory.join(format!(".content-rollback-{}", uuid::Uuid::new_v4()));
+                std::fs::copy(&target, &rollback_copy).map_err(ContentError::Io)?;
+                rollback.push(RetiredFile {
+                    target,
+                    backup,
+                    rollback_copy,
+                });
+                let digest = ArtifactDigest::parse(&record.sha256)
+                    .map_err(|_| ContentError::HashMismatch)?;
+                verify_file(
+                    &rollback.last().expect("just pushed").rollback_copy,
+                    &digest,
+                    None,
+                )
+                .map_err(|_| ContentError::HashMismatch)?;
+            }
+            for file in &rollback {
+                std::fs::rename(&file.target, &file.backup).map_err(ContentError::Io)?;
+                moved += 1;
+            }
+            for (target, stage) in &staged {
+                std::fs::hard_link(stage, target).map_err(|error| {
+                    if target.exists() {
+                        ContentError::Collision
+                    } else {
+                        ContentError::Io(error)
+                    }
+                })?;
+                activated.push(target.clone());
+            }
+            commit(next)?;
+            state_committed = true;
+            before_cleanup()?;
+            for file in &rollback {
+                std::fs::remove_file(&file.backup).map_err(ContentError::Io)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut rollback_failed = false;
+            for target in activated.iter().rev() {
+                if std::fs::remove_file(target).is_err() {
+                    rollback_failed = true;
+                }
+            }
+            for file in rollback.iter().take(moved).rev() {
+                let source = if file.backup.exists() {
+                    &file.backup
+                } else {
+                    &file.rollback_copy
+                };
+                if std::fs::hard_link(source, &file.target).is_err() {
+                    rollback_failed = true;
+                }
+            }
+            if state_committed && current.save(managed, instance).is_err() {
+                rollback_failed = true;
+            }
+            for (_, stage) in &staged {
+                let _ = std::fs::remove_file(stage);
+            }
+            if rollback_failed {
+                return Err(ContentError::StateMalformed(
+                    "lifecycle rollback could not restore every file".into(),
+                ));
+            }
+            for file in &rollback {
+                let _ = std::fs::remove_file(&file.backup);
+                let _ = std::fs::remove_file(&file.rollback_copy);
+            }
+            return Err(error);
+        }
+        for (_, stage) in &staged {
+            let _ = std::fs::remove_file(stage);
+        }
+        for file in &rollback {
+            let _ = std::fs::remove_file(&file.rollback_copy);
+        }
+        Ok(())
+    })
+}
+
+pub fn remove_provider_graph(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    expected: &ContentState,
+    identity: &ProviderIdentity,
+) -> Result<ContentState, ContentError> {
+    let next = removal_state(expected, identity)?;
+    apply_lifecycle_state(managed, instance, expected, &next, &[])?;
+    Ok(next)
+}
+
+pub async fn update_provider_graph(
+    managed: &ManagedPaths,
+    instance: &InstanceId,
+    expected: &ContentState,
+    root: &ProviderIdentity,
+    plans: Vec<ProviderInstallPlan>,
+) -> Result<ContentState, ContentError> {
+    let acquired = acquire_provider_plans(managed, plans).await?;
+    let next = updated_state(
+        expected,
+        root,
+        acquired
+            .iter()
+            .map(|(record, _, _)| record.clone())
+            .collect(),
+    )?;
+    apply_lifecycle_state(managed, instance, expected, &next, &acquired)?;
+    Ok(next)
 }
 
 fn activate_verified(
@@ -1094,6 +1698,7 @@ pub enum ContentError {
     OperationInProgress,
     Acquisition(String),
     InvalidProviderArtifact,
+    RequiredByInstalledContent,
 }
 impl ContentError {
     pub fn code(&self) -> &'static str {
@@ -1108,6 +1713,7 @@ impl ContentError {
             Self::OperationInProgress => "content_operation_in_progress",
             Self::Acquisition(_) => "content_acquisition_failed",
             Self::InvalidProviderArtifact => "content_invalid_artifact",
+            Self::RequiredByInstalledContent => "content_required_by_installed",
         }
     }
 }
@@ -1134,6 +1740,9 @@ impl fmt::Display for ContentError {
                 formatter,
                 "the provider artifact is not a valid Fabric mod JAR"
             ),
+            Self::RequiredByInstalledContent => {
+                formatter.write_str("this content is still required by another installed item")
+            }
         }
     }
 }
@@ -1210,6 +1819,8 @@ mod tests {
                     project_id: "another-project".into(),
                     version_id: None,
                 }],
+                explicitly_retained: true,
+                requires: vec![],
             }
         }
     }
@@ -1235,6 +1846,8 @@ mod tests {
                 environment: Some("client_and_server".into()),
             },
             dependencies: vec![],
+            explicitly_retained: true,
+            requires: vec![],
         }
     }
 
@@ -1773,14 +2386,23 @@ mod tests {
             ),
             Err(ContentError::ChangedSinceScan)
         ));
-        let after = remove(
+        assert!(matches!(
+            remove(
+                &fixture.managed,
+                &fixture.instance,
+                ContentType::ResourcePack,
+                &entry.entry_id,
+            ),
+            Err(ContentError::UnsupportedAction)
+        ));
+        let current = ContentState::load(&fixture.managed, &fixture.instance).unwrap();
+        remove_provider_graph(
             &fixture.managed,
             &fixture.instance,
-            ContentType::ResourcePack,
-            &entry.entry_id,
+            &current,
+            &current.entries[0].identity(),
         )
         .unwrap();
-        assert!(after.entries.is_empty());
         assert!(
             ContentState::load(&fixture.managed, &fixture.instance)
                 .unwrap()
@@ -1867,6 +2489,215 @@ mod tests {
                 .is_err()
             );
             assert_eq!(std::fs::read(&outside).unwrap(), b"external user bytes");
+        }
+    }
+
+    #[test]
+    fn v1_migration_retains_all_historical_content_and_rejects_bad_graphs() {
+        let fixture = Fixture::new();
+        let mut state = ContentState::empty();
+        for (kind, project, name) in [
+            (ContentType::Mod, "root", "root.jar"),
+            (ContentType::Mod, "old-dependency", "dependency.jar"),
+            (ContentType::ResourcePack, "pack", "pack.zip"),
+            (ContentType::ShaderPack, "shader", "shader.zip"),
+        ] {
+            let mut record = transaction_record(kind, name, b"bytes");
+            record.project_id = project.into();
+            state.entries.push(record);
+        }
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(1);
+        for entry in legacy["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("explicitlyRetained");
+            entry.as_object_mut().unwrap().remove("requires");
+        }
+        let path = state_path(&fixture.managed, &fixture.instance).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let migrated = ContentState::load_and_migrate(&fixture.managed, &fixture.instance).unwrap();
+        assert_eq!(migrated.entries.len(), 4);
+        assert!(
+            migrated
+                .entries
+                .iter()
+                .all(|record| record.explicitly_retained && record.requires.is_empty())
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["schemaVersion"],
+            2
+        );
+        legacy["entries"][0]["provider"] = serde_json::json!(null);
+        assert!(matches!(
+            ContentState::from_json(&legacy.to_string()),
+            Err(ContentError::StateMalformed(_))
+        ));
+        let mut broken = migrated.clone();
+        broken.entries[0].requires.push(ProviderIdentity {
+            content_type: ContentType::Mod,
+            provider: "missing".into(),
+            project_id: "missing".into(),
+        });
+        assert!(matches!(
+            broken.validate(),
+            Err(ContentError::StateMalformed(_))
+        ));
+        assert!(matches!(
+            ContentState::from_json(r#"{"schemaVersion":99,"entries":[]}"#),
+            Err(ContentError::StateVersion(99))
+        ));
+    }
+
+    #[test]
+    fn shared_dependencies_and_direct_promotion_control_orphan_cleanup() {
+        let mut state = ContentState::empty();
+        let mut a = transaction_record(ContentType::ResourcePack, "a.zip", b"a");
+        a.project_id = "A".into();
+        let mut b = transaction_record(ContentType::ResourcePack, "b.zip", b"b");
+        b.project_id = "B".into();
+        b.explicitly_retained = false;
+        let mut c = transaction_record(ContentType::ResourcePack, "c.zip", b"c");
+        c.project_id = "C".into();
+        c.explicitly_retained = false;
+        let mut d = transaction_record(ContentType::ResourcePack, "d.zip", b"d");
+        d.project_id = "D".into();
+        a.requires.push(b.identity());
+        b.requires.push(c.identity());
+        d.requires.push(c.identity());
+        state.entries = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+        state.validate().unwrap();
+        assert!(matches!(
+            removal_state(&state, &b.identity()),
+            Err(ContentError::RequiredByInstalledContent)
+        ));
+        let after_a = removal_state(&state, &a.identity()).unwrap();
+        assert!(after_a.find(&a.identity()).is_none());
+        assert!(after_a.find(&b.identity()).is_none());
+        assert!(after_a.find(&c.identity()).is_some());
+        let mut promoted = state.clone();
+        promoted.find(&b.identity()).unwrap();
+        promoted
+            .entries
+            .iter_mut()
+            .find(|record| record.identity() == b.identity())
+            .unwrap()
+            .explicitly_retained = true;
+        let after_promotion = removal_state(&promoted, &a.identity()).unwrap();
+        assert!(after_promotion.find(&b.identity()).is_some());
+        assert!(after_promotion.find(&c.identity()).is_some());
+        let after_d = removal_state(&after_promotion, &d.identity()).unwrap();
+        assert!(after_d.find(&c.identity()).is_some());
+        let after_b = removal_state(&after_d, &b.identity()).unwrap();
+        assert!(after_b.entries.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_replaces_same_and_changed_names_without_losing_old_bytes_on_failure() {
+        let fixture = Fixture::new();
+        let dir = fixture.dir(ContentType::ResourcePack);
+        let mut old_bytes = b"old working pack".to_vec();
+        let mut old = transaction_record(ContentType::ResourcePack, "pack.zip", &old_bytes);
+        old.project_id = "PACK".into();
+        std::fs::write(dir.join(&old.file_name), &old_bytes).unwrap();
+        let mut current = ContentState::empty();
+        current.entries.push(old.clone());
+        current.save(&fixture.managed, &fixture.instance).unwrap();
+        for name in ["pack.zip", "pack-v2.zip"] {
+            let new_bytes = format!("new bytes for {name}").into_bytes();
+            let source = fixture
+                .root
+                .join(format!("source-{}", uuid::Uuid::new_v4()));
+            std::fs::write(&source, &new_bytes).unwrap();
+            let mut new = transaction_record(ContentType::ResourcePack, name, &new_bytes);
+            new.project_id = "PACK".into();
+            new.version_id = format!("version-{name}");
+            let next = updated_state(&current, &old.identity(), vec![new.clone()]).unwrap();
+            let wrong_source = fixture.root.join("wrong-source");
+            std::fs::write(&wrong_source, b"tampered").unwrap();
+            assert!(matches!(
+                apply_lifecycle_state(
+                    &fixture.managed,
+                    &fixture.instance,
+                    &current,
+                    &next,
+                    &[(new.clone(), wrong_source, new_bytes.len() as u64)]
+                ),
+                Err(ContentError::HashMismatch)
+            ));
+            assert_eq!(std::fs::read(dir.join(&old.file_name)).unwrap(), old_bytes);
+            assert_eq!(
+                ContentState::load(&fixture.managed, &fixture.instance).unwrap(),
+                current
+            );
+            apply_lifecycle_state(
+                &fixture.managed,
+                &fixture.instance,
+                &current,
+                &next,
+                &[(new.clone(), source, new_bytes.len() as u64)],
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), new_bytes);
+            if name != old.file_name {
+                assert!(!dir.join(&old.file_name).exists());
+            }
+            current = next;
+            old = new;
+            old_bytes = new_bytes;
+        }
+    }
+
+    #[test]
+    fn lifecycle_restores_old_content_after_state_or_cleanup_failure() {
+        let fixture = Fixture::new();
+        let directory = fixture.dir(ContentType::ResourcePack);
+        let old = transaction_record(ContentType::ResourcePack, "old.zip", b"old verified bytes");
+        std::fs::write(directory.join("old.zip"), b"old verified bytes").unwrap();
+        let mut current = ContentState::empty();
+        current.entries.push(old.clone());
+        current.save(&fixture.managed, &fixture.instance).unwrap();
+        let mut new =
+            transaction_record(ContentType::ResourcePack, "new.zip", b"new verified bytes");
+        new.version_id = "22223333".into();
+        let source = fixture.root.join("verified-new");
+        std::fs::write(&source, b"new verified bytes").unwrap();
+        let next = updated_state(&current, &old.identity(), vec![new.clone()]).unwrap();
+        let artifact = [(new, source, b"new verified bytes".len() as u64)];
+        for cleanup_failure in [false, true] {
+            let result = apply_lifecycle_state_with_hooks(
+                &fixture.managed,
+                &fixture.instance,
+                &current,
+                &next,
+                &artifact,
+                |state| {
+                    if cleanup_failure {
+                        state.save(&fixture.managed, &fixture.instance)
+                    } else {
+                        Err(ContentError::StateMalformed(
+                            "injected state failure".into(),
+                        ))
+                    }
+                },
+                || {
+                    if cleanup_failure {
+                        Err(ContentError::StateMalformed(
+                            "injected cleanup failure".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read(directory.join("old.zip")).unwrap(),
+                b"old verified bytes"
+            );
+            assert!(!directory.join("new.zip").exists());
+            assert_eq!(
+                ContentState::load(&fixture.managed, &fixture.instance).unwrap(),
+                current
+            );
         }
     }
 }

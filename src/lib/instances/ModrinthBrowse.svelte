@@ -15,13 +15,14 @@
   } from "$lib/backend";
 
   let {
-    instanceId, instanceName, minecraftVersion, kind, installedProjectIds, onInstalled,
+    instanceId, instanceName, minecraftVersion, kind, installedProjectIds, dependencyOnlyProjectIds, onInstalled,
   }: {
     instanceId: string;
     instanceName: string;
     minecraftVersion: string;
     kind: ContentType;
     installedProjectIds: string[];
+    dependencyOnlyProjectIds: string[];
     onInstalled: (targetInstanceId: string, targetKind: ContentType) => Promise<void>;
   } = $props();
 
@@ -105,7 +106,7 @@
   }
 
   async function quickInstall(projectId: string, title: string): Promise<void> {
-    if (quickBusyProjectId || installedProjectIds.includes(projectId)) return;
+    if (quickBusyProjectId || (installedProjectIds.includes(projectId) && !dependencyOnlyProjectIds.includes(projectId))) return;
     const targetInstanceId = instanceId;
     const targetKind = kind;
     quickBusyProjectId = projectId;
@@ -242,8 +243,8 @@
               <span class="browse-meta">By {hit.author} · {hit.downloads.toLocaleString()} downloads</span>
             </div>
             <div class="browse-actions">
-              <button type="button" class="btn btn-quiet install-action" title={installedProjectIds.includes(hit.projectId) ? `${hit.title} is installed` : `Install latest compatible version of ${hit.title}`} aria-label={installedProjectIds.includes(hit.projectId) ? `${hit.title} is installed` : quickBusyProjectId === hit.projectId ? `Installing ${hit.title}` : `Install latest compatible version of ${hit.title}`} disabled={quickBusyProjectId !== null || installedProjectIds.includes(hit.projectId)} onclick={() => quickInstall(hit.projectId, hit.title)}>
-                {#if quickBusyProjectId === hit.projectId}<span class="spinner" aria-hidden="true"></span><span class="action-state">Installing…</span>{:else if installedProjectIds.includes(hit.projectId)}<span class="action-state">Installed</span>{:else}<span aria-hidden="true">↓</span>{/if}
+              <button type="button" class="btn btn-quiet install-action" title={dependencyOnlyProjectIds.includes(hit.projectId) ? `Keep ${hit.title} installed directly` : installedProjectIds.includes(hit.projectId) ? `${hit.title} is installed` : `Install latest compatible version of ${hit.title}`} aria-label={dependencyOnlyProjectIds.includes(hit.projectId) ? `Keep ${hit.title} installed directly` : installedProjectIds.includes(hit.projectId) ? `${hit.title} is installed` : quickBusyProjectId === hit.projectId ? `Installing ${hit.title}` : `Install latest compatible version of ${hit.title}`} disabled={quickBusyProjectId !== null || (installedProjectIds.includes(hit.projectId) && !dependencyOnlyProjectIds.includes(hit.projectId))} onclick={() => quickInstall(hit.projectId, hit.title)}>
+                {#if quickBusyProjectId === hit.projectId}<span class="spinner" aria-hidden="true"></span><span class="action-state">Installing…</span>{:else if dependencyOnlyProjectIds.includes(hit.projectId)}<span class="action-state">Keep</span>{:else if installedProjectIds.includes(hit.projectId)}<span class="action-state">Installed</span>{:else}<span aria-hidden="true">↓</span>{/if}
               </button>
               <button type="button" class="btn btn-quiet" disabled={busy !== null} onclick={() => openProject(hit.projectId)}>Details</button>
             </div>

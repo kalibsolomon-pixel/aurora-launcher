@@ -403,7 +403,9 @@ fn inspect_entry(
             Some("Aurora cannot prove that this entry is a user-managed mod file.".to_owned())
         }
         ModOwnership::UserManaged => None,
-        ModOwnership::ProviderManaged => None,
+        ModOwnership::ProviderManaged => {
+            Some("Use the provider lifecycle preview to remove this item safely.".to_owned())
+        }
     };
     let display_name = fabric_metadata
         .as_ref()
@@ -439,10 +441,7 @@ fn inspect_entry(
         metadata: fabric_metadata,
         warnings,
         can_toggle: ownership == ModOwnership::UserManaged,
-        can_remove: matches!(
-            ownership,
-            ModOwnership::UserManaged | ModOwnership::ProviderManaged
-        ),
+        can_remove: ownership == ModOwnership::UserManaged,
         action_blocked_reason: blocked_reason,
     }
 }
@@ -803,25 +802,7 @@ pub fn remove(
         let entry = resolve_mutable_entry(&inventory, entry_id, false)?;
         let mods = validate_mods_directory(managed, instance)?;
         let target = validate_current_regular_file(&mods, &entry.file_name)?;
-        if entry.ownership == ModOwnership::ProviderManaged {
-            let mut state = ContentState::load(managed, instance)
-                .map_err(|error| ModError::ContentState(error.to_string()))?;
-            let temporary = mods.join(format!(".content-removing-{}", uuid::Uuid::new_v4()));
-            std::fs::rename(&target, &temporary)
-                .map_err(|source| ModError::MutationIo { source })?;
-            state.entries.retain(|record| {
-                !(record.content_type == ContentType::Mod
-                    && record.file_name.eq_ignore_ascii_case(&entry.file_name))
-            });
-            if let Err(error) = state.save(managed, instance) {
-                std::fs::rename(&temporary, &target)
-                    .map_err(|source| ModError::MutationIo { source })?;
-                return Err(ModError::ContentState(error.to_string()));
-            }
-            std::fs::remove_file(temporary).map_err(|source| ModError::MutationIo { source })?;
-        } else {
-            std::fs::remove_file(target).map_err(|source| ModError::MutationIo { source })?;
-        }
+        std::fs::remove_file(target).map_err(|source| ModError::MutationIo { source })?;
         scan(managed, instance)
     })
 }
@@ -1236,6 +1217,8 @@ mod tests {
                 environment: Some("client".into()),
             },
             dependencies: vec![],
+            explicitly_retained: true,
+            requires: vec![],
         };
         let mut state = ContentState::empty();
         state.entries.push(record.clone());
@@ -1248,7 +1231,7 @@ mod tests {
             entry.provenance.as_ref().unwrap().project_id,
             "project-opaque"
         );
-        assert!(!entry.can_toggle && entry.can_remove);
+        assert!(!entry.can_toggle && !entry.can_remove);
         assert_eq!(
             set_enabled(&fixture.managed, &fixture.instance, &entry.entry_id, false)
                 .unwrap_err()

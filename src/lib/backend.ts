@@ -766,6 +766,50 @@ export interface ProviderRecord {
   displayVersion: string | null;
   compatibility: ContentCompatibility;
   dependencies: ProviderDependency[];
+  explicitlyRetained: boolean;
+  requires: ProviderIdentity[];
+}
+
+export interface ProviderIdentity {
+  contentType: ContentType;
+  provider: string;
+  projectId: string;
+}
+
+export interface ProviderLifecycleEntry {
+  record: ProviderRecord;
+  requiredBy: ProviderRecord[];
+  requires: ProviderRecord[];
+}
+
+export interface LifecycleItem {
+  contentType: ContentType;
+  provider: string;
+  projectId: string;
+  fileName: string;
+  displayVersion: string | null;
+}
+
+export interface LifecycleDelta {
+  willInstall: LifecycleItem[];
+  willRemove: LifecycleItem[];
+  willRetain: LifecycleItem[];
+  newRequirements: LifecycleItem[];
+  removedRequirements: LifecycleItem[];
+}
+
+export interface ProviderUpdatePreview {
+  current: LifecycleItem;
+  candidate: ModrinthVersionChoice;
+  delta: LifecycleDelta;
+  warnings: string[];
+  previewFingerprint: string;
+}
+
+export interface ProviderRemovalPreview {
+  root: LifecycleItem;
+  delta: LifecycleDelta;
+  previewFingerprint: string;
 }
 
 export interface ContentEntry {
@@ -880,6 +924,30 @@ export function installModrinth(instanceId: string, contentType: ContentType, pr
 
 export function quickInstallModrinth(instanceId: string, contentType: ContentType, projectId: string): Promise<ProviderRecord[]> {
   return contentInvoke("quick_install_modrinth", { instanceId, contentType, projectId });
+}
+
+export function getProviderLifecycle(instanceId: string): Promise<ProviderLifecycleEntry[]> {
+  return contentInvoke("get_provider_lifecycle", { instanceId });
+}
+
+export function checkModrinthUpdate(instanceId: string, contentType: ContentType, projectId: string): Promise<ModrinthVersionChoice | null> {
+  return contentInvoke("check_modrinth_update", { instanceId, contentType, projectId });
+}
+
+export function previewModrinthUpdate(instanceId: string, contentType: ContentType, projectId: string): Promise<ProviderUpdatePreview> {
+  return contentInvoke("preview_modrinth_update", { instanceId, contentType, projectId });
+}
+
+export function applyModrinthUpdate(instanceId: string, contentType: ContentType, projectId: string, previewFingerprint: string): Promise<void> {
+  return contentInvoke("apply_modrinth_update", { instanceId, contentType, projectId, previewFingerprint });
+}
+
+export function previewProviderRemoval(instanceId: string, contentType: ContentType, projectId: string): Promise<ProviderRemovalPreview> {
+  return contentInvoke("preview_provider_removal", { instanceId, contentType, projectId });
+}
+
+export function applyProviderRemoval(instanceId: string, contentType: ContentType, projectId: string, previewFingerprint: string): Promise<void> {
+  return contentInvoke("apply_provider_removal", { instanceId, contentType, projectId, previewFingerprint });
 }
 
 async function contentInvoke<T>(command: string, request: Record<string, unknown>): Promise<T> {

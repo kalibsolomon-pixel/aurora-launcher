@@ -10,8 +10,9 @@
     type ModSort,
     type RemovalCandidate,
   } from "$lib/instances/mods";
-  import type { InstanceSummary, ModEntry } from "$lib/backend";
+  import { getProviderLifecycle, type InstanceSummary, type ModEntry, type ProviderLifecycleEntry } from "$lib/backend";
   import ModrinthBrowse from "./ModrinthBrowse.svelte";
+  import ProviderLifecycleActions from "./ProviderLifecycleActions.svelte";
 
   let { instance }: { instance: InstanceSummary } = $props();
   let query = $state("");
@@ -21,6 +22,22 @@
   let removal = $state<RemovalCandidate | null>(null);
   let confirmButton: HTMLButtonElement | null = $state(null);
   let view = $state<"installed" | "browse">("installed");
+  let lifecycleEntries = $state<ProviderLifecycleEntry[]>([]);
+  let lifecycleError = $state("");
+
+  async function refreshLifecycle(targetId: string): Promise<void> {
+    try {
+      const entries = await getProviderLifecycle(targetId);
+      if (instance.id === targetId) { lifecycleEntries = entries; lifecycleError = ""; }
+    } catch (reason) {
+      if (instance.id === targetId) lifecycleError = reason instanceof Error ? reason.message : "Provider lifecycle is unavailable.";
+    }
+  }
+
+  async function refreshInstalled(targetId: string): Promise<void> {
+    await launcher.runLoadMods(targetId);
+    await refreshLifecycle(targetId);
+  }
 
   const inventory = $derived(launcher.modInventories[instance.id] ?? null);
   const entries = $derived(inventory?.entries ?? []);
@@ -36,6 +53,7 @@
       if (launcher.modInventories[instance.id] === undefined) {
         void launcher.runLoadMods(instance.id);
       }
+      void refreshLifecycle(instance.id);
     }
   });
 
@@ -85,7 +103,7 @@
     <button type="button" class="btn btn-quiet" aria-pressed={view === "browse"} onclick={() => view = "browse"}>Browse</button>
   </div>
   {#if view === "browse"}
-    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} kind="mod" installedProjectIds={entries.filter((entry) => entry.provenance?.provider === "modrinth").map((entry) => entry.provenance!.projectId)} onInstalled={async (targetId) => { await launcher.runLoadMods(targetId); }} />
+    <ModrinthBrowse instanceId={instance.id} instanceName={instance.displayName} minecraftVersion={instance.minecraftVersion} kind="mod" installedProjectIds={entries.filter((entry) => entry.provenance?.provider === "modrinth").map((entry) => entry.provenance!.projectId)} dependencyOnlyProjectIds={lifecycleEntries.filter((entry) => entry.record.contentType === "mod" && !entry.record.explicitlyRetained).map((entry) => entry.record.projectId)} onInstalled={async (targetId) => { await refreshInstalled(targetId); }} />
   {:else}
   {#if inventory?.missingManaged.length}
     <p class="mods-notice" role="status">{inventory.missingManaged.length} managed mod file{inventory.missingManaged.length === 1 ? " is" : "s are"} missing. Refresh or inspect the instance folder; Aurora will not recreate files automatically.</p>
@@ -131,6 +149,7 @@
       </button>
     </div>
   {/if}
+  {#if lifecycleError}<p class="mods-error" role="alert">{lifecycleError}</p>{/if}
 
   {#if inventory}
     <div class="mods-toolbar">
@@ -261,6 +280,11 @@
                 {/if}
               </dl>
             </details>
+
+            {#if entry.provenance?.provider === "modrinth"}
+              {@const lifecycle = lifecycleEntries.find((item) => item.record.contentType === "mod" && item.record.projectId === entry.provenance?.projectId)}
+              {#if lifecycle}<div class="mod-details"><ProviderLifecycleActions instanceId={instance.id} kind="mod" title={entry.displayName} {lifecycle} onChanged={async () => { await refreshInstalled(instance.id); }} /></div>{/if}
+            {/if}
 
             {#if removal?.entryId === entry.entryId}
               <div
