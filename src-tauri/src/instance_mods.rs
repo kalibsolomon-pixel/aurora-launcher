@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::io::Read as _;
+use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -26,6 +26,9 @@ use crate::paths::ManagedPaths;
 const MAX_METADATA_BYTES: u64 = 256 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4_096;
 const MAX_INSPECTED_JAR_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_NESTED_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NESTED_DEPTH: usize = 4;
+const MAX_NESTED_COUNT: usize = 128;
 const DISABLED_SUFFIX: &str = ".disabled";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -90,6 +93,9 @@ pub struct FabricModMetadata {
     pub conflicts: Vec<ModRelation>,
     pub breaks: Vec<ModRelation>,
     pub has_declared_icon: bool,
+    pub nested_mod_ids: Vec<String>,
+    #[serde(skip_serializing)]
+    nested_mod_versions: HashMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -135,6 +141,13 @@ struct FabricMetadataDocument {
     #[serde(default)]
     breaks: serde_json::Map<String, serde_json::Value>,
     icon: Option<serde_json::Value>,
+    #[serde(default)]
+    jars: Vec<NestedJarDeclaration>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NestedJarDeclaration {
+    file: String,
 }
 
 /// Reads the authoritative local inventory for one validated instance.
@@ -612,6 +625,24 @@ pub(crate) fn inspect_fabric_metadata(
             )],
         );
     };
+    drop(entry);
+    let mut nested_mod_ids = Vec::new();
+    let mut nested_mod_versions = HashMap::new();
+    let mut known_ids = HashSet::from([id.to_lowercase()]);
+    let mut nested_budget = MAX_NESTED_TOTAL_BYTES;
+    let mut nested_count = 0;
+    let mut nested_warnings = Vec::new();
+    inspect_declared_nested_jars(
+        &mut archive,
+        &document.jars,
+        0,
+        &mut nested_budget,
+        &mut nested_count,
+        &mut known_ids,
+        &mut nested_mod_ids,
+        &mut nested_mod_versions,
+        &mut nested_warnings,
+    );
     let authors = document
         .authors
         .into_iter()
@@ -647,9 +678,187 @@ pub(crate) fn inspect_fabric_metadata(
             conflicts: relations(document.conflicts),
             breaks: relations(document.breaks),
             has_declared_icon: document.icon.is_some(),
+            nested_mod_ids,
+            nested_mod_versions,
         }),
-        Vec::new(),
+        nested_warnings,
     )
+}
+
+fn valid_nested_path(path: &str) -> bool {
+    path.ends_with(".jar")
+        && !path.starts_with('/')
+        && !path.contains(['\\', ':'])
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_declared_nested_jars<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    declarations: &[NestedJarDeclaration],
+    depth: usize,
+    budget: &mut u64,
+    count: &mut usize,
+    known_ids: &mut HashSet<String>,
+    found_ids: &mut Vec<String>,
+    found_versions: &mut HashMap<String, Option<String>>,
+    warnings: &mut Vec<ModWarning>,
+) {
+    let mut declared = HashSet::new();
+    for declaration in declarations {
+        let path = &declaration.file;
+        if !valid_nested_path(path) || !declared.insert(path) {
+            warnings.push(ModWarning::new(
+                "nested_jar_invalid",
+                "A declared nested JAR path is invalid or duplicated.",
+            ));
+            continue;
+        }
+        *count += 1;
+        if depth >= MAX_NESTED_DEPTH || *count > MAX_NESTED_COUNT {
+            warnings.push(ModWarning::new(
+                "nested_jar_limit",
+                "Nested JAR inspection exceeded its depth or count bound.",
+            ));
+            return;
+        }
+        let indexes: Vec<_> = (0..archive.len())
+            .filter(|&index| {
+                archive
+                    .by_index(index)
+                    .is_ok_and(|entry| entry.name() == path)
+            })
+            .collect();
+        if indexes.len() != 1 {
+            warnings.push(ModWarning::new(
+                "nested_jar_missing",
+                "A declared nested JAR is missing or duplicated.",
+            ));
+            continue;
+        }
+        let mut nested_file = match archive.by_index(indexes[0]) {
+            Ok(file) => file,
+            Err(_) => {
+                warnings.push(ModWarning::new(
+                    "nested_jar_malformed",
+                    "A declared nested JAR cannot be read.",
+                ));
+                continue;
+            }
+        };
+        if nested_file.size() > *budget {
+            warnings.push(ModWarning::new(
+                "nested_jar_limit",
+                "Nested JAR bytes exceed the 64 MiB inspection bound.",
+            ));
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if nested_file
+            .by_ref()
+            .take(*budget + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > *budget
+        {
+            warnings.push(ModWarning::new(
+                "nested_jar_malformed",
+                "A declared nested JAR cannot be decompressed within the inspection bound.",
+            ));
+            continue;
+        }
+        *budget -= bytes.len() as u64;
+        drop(nested_file);
+        let mut nested = match zip::ZipArchive::new(Cursor::new(bytes)) {
+            Ok(nested) if nested.len() <= MAX_ARCHIVE_ENTRIES => nested,
+            _ => {
+                warnings.push(ModWarning::new(
+                    "nested_jar_malformed",
+                    "A declared nested JAR is malformed or exceeds the entry limit.",
+                ));
+                continue;
+            }
+        };
+        let metadata_indexes: Vec<_> = (0..nested.len())
+            .filter(|&index| {
+                nested
+                    .by_index(index)
+                    .is_ok_and(|entry| entry.name() == "fabric.mod.json")
+            })
+            .collect();
+        if metadata_indexes.len() != 1 {
+            warnings.push(ModWarning::new(
+                "nested_metadata_malformed",
+                "A nested JAR lacks one valid root fabric.mod.json.",
+            ));
+            continue;
+        }
+        let mut metadata_file = match nested.by_index(metadata_indexes[0]) {
+            Ok(file) if file.size() <= MAX_METADATA_BYTES => file,
+            _ => {
+                warnings.push(ModWarning::new(
+                    "nested_metadata_malformed",
+                    "Nested Fabric metadata exceeds its inspection bound.",
+                ));
+                continue;
+            }
+        };
+        let mut metadata_bytes = Vec::new();
+        if metadata_file
+            .by_ref()
+            .take(MAX_METADATA_BYTES + 1)
+            .read_to_end(&mut metadata_bytes)
+            .is_err()
+            || metadata_bytes.len() as u64 > MAX_METADATA_BYTES
+        {
+            warnings.push(ModWarning::new(
+                "nested_metadata_malformed",
+                "Nested Fabric metadata is unreadable.",
+            ));
+            continue;
+        }
+        drop(metadata_file);
+        let document: FabricMetadataDocument = match serde_json::from_slice(&metadata_bytes) {
+            Ok(document) => document,
+            Err(_) => {
+                warnings.push(ModWarning::new(
+                    "nested_metadata_malformed",
+                    "Nested Fabric metadata is malformed.",
+                ));
+                continue;
+            }
+        };
+        let Some(id) = document.id.filter(|id| !id.trim().is_empty()) else {
+            warnings.push(ModWarning::new(
+                "nested_metadata_malformed",
+                "Nested Fabric metadata lacks a mod ID.",
+            ));
+            continue;
+        };
+        let normalized_id = id.to_lowercase();
+        if !known_ids.insert(normalized_id.clone()) {
+            warnings.push(ModWarning::new(
+                "duplicate_mod_id",
+                "Nested Fabric metadata declares a duplicate mod ID.",
+            ));
+        } else {
+            found_ids.push(id);
+            found_versions.insert(normalized_id, clean_optional(document.version));
+        }
+        inspect_declared_nested_jars(
+            &mut nested,
+            &document.jars,
+            depth + 1,
+            budget,
+            count,
+            known_ids,
+            found_ids,
+            found_versions,
+            warnings,
+        );
+    }
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {
@@ -689,38 +898,44 @@ fn derive_local_warnings(entries: &mut [ModEntry]) {
     let enabled_ids: HashSet<String> = entries
         .iter()
         .filter(|entry| entry.enabled)
-        .filter_map(|entry| {
-            entry
-                .metadata
-                .as_ref()
-                .map(|metadata| metadata.id.to_lowercase())
-        })
+        .filter_map(|entry| entry.metadata.as_ref())
+        .flat_map(|metadata| std::iter::once(&metadata.id).chain(metadata.nested_mod_ids.iter()))
+        .map(|id| id.to_lowercase())
         .collect();
-    let mut id_counts = HashMap::<String, usize>::new();
-    for id in entries.iter().filter_map(|entry| {
-        entry
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.id.to_lowercase())
-    }) {
-        *id_counts.entry(id).or_default() += 1;
+    let mut declarations = HashMap::<String, (usize, HashSet<Option<String>>)>::new();
+    for metadata in entries.iter().filter_map(|entry| entry.metadata.as_ref()) {
+        let root = declarations.entry(metadata.id.to_lowercase()).or_default();
+        root.0 += 1;
+        root.1.insert(metadata.version.clone());
+        for id in &metadata.nested_mod_ids {
+            let key = id.to_lowercase();
+            declarations.entry(key.clone()).or_default().1.insert(
+                metadata
+                    .nested_mod_versions
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or(None),
+            );
+        }
     }
     let builtins = ["minecraft", "fabricloader", "java"];
     for entry in entries.iter_mut() {
         let Some(metadata) = &entry.metadata else {
             continue;
         };
-        if id_counts
-            .get(&metadata.id.to_lowercase())
-            .copied()
-            .unwrap_or_default()
-            > 1
+        if let Some(conflicting_id) = std::iter::once(&metadata.id)
+            .chain(metadata.nested_mod_ids.iter())
+            .find(|id| {
+                declarations
+                    .get(&id.to_lowercase())
+                    .is_some_and(|(roots, versions)| *roots > 1 || versions.len() > 1)
+            })
         {
             entry.warnings.push(ModWarning::new(
                 "duplicate_mod_id",
                 format!(
-                    "More than one local artifact declares the mod id '{}'.",
-                    metadata.id
+                    "Local artifacts declare conflicting copies of the mod id '{}'.",
+                    conflicting_id
                 ),
             ));
         }
@@ -1433,6 +1648,251 @@ mod tests {
         assert_eq!(
             inventory.entries.first().unwrap().file_name,
             "entry-000.txt"
+        );
+    }
+
+    #[test]
+    fn declared_nested_modules_satisfy_local_dependencies_without_hiding_bad_archives() {
+        let fixture = Fixture::new("nested-modules");
+        let nested_bytes = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(
+                    br#"{"schemaVersion":1,"id":"fabric-resource-loader-v1","version":"1.0"}"#,
+                )
+                .unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let outer = fixture.mods().join("api-style.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&outer).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"{"schemaVersion":1,"id":"api-style","version":"1.0","jars":[{"file":"META-INF/jars/module.jar"}]}"#).unwrap();
+        writer
+            .start_file(
+                "META-INF/jars/module.jar",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(&nested_bytes).unwrap();
+        writer.finish().unwrap();
+        jar(
+            &fixture.mods().join("consumer.jar"),
+            Some(&metadata(
+                "consumer",
+                "Consumer",
+                r#"{"fabric-resource-loader-v1":"*"}"#,
+            )),
+        );
+        let inventory = scan(&fixture.managed, &fixture.instance).unwrap();
+        let outer_entry = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.file_name == "api-style.jar")
+            .unwrap();
+        assert_eq!(
+            outer_entry.metadata.as_ref().unwrap().nested_mod_ids,
+            ["fabric-resource-loader-v1"]
+        );
+        assert!(outer_entry.warnings.is_empty());
+        let consumer = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.file_name == "consumer.jar")
+            .unwrap();
+        assert!(
+            !consumer
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "required_dependency_missing")
+        );
+
+        // Fabric bundles commonly overlap: identical nested modules are one
+        // loader identity, while different versions remain a real conflict.
+        let overlapping = fixture.mods().join("overlapping.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&overlapping).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"{"schemaVersion":1,"id":"overlapping","version":"1.0","jars":[{"file":"module.jar"}]}"#).unwrap();
+        writer
+            .start_file("module.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&nested_bytes).unwrap();
+        writer.finish().unwrap();
+        let inventory = scan(&fixture.managed, &fixture.instance).unwrap();
+        assert!(inventory.entries.iter().all(|entry| {
+            !entry
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "duplicate_mod_id")
+        }));
+
+        let divergent_nested = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(
+                    br#"{"schemaVersion":1,"id":"fabric-resource-loader-v1","version":"2.0"}"#,
+                )
+                .unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let divergent = fixture.mods().join("divergent.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&divergent).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"{"schemaVersion":1,"id":"divergent","version":"1.0","jars":[{"file":"module.jar"}]}"#).unwrap();
+        writer
+            .start_file("module.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&divergent_nested).unwrap();
+        writer.finish().unwrap();
+        let inventory = scan(&fixture.managed, &fixture.instance).unwrap();
+        assert!(
+            inventory
+                .entries
+                .iter()
+                .find(|entry| entry.file_name == "divergent.jar")
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "duplicate_mod_id")
+        );
+
+        let missing = fixture.mods().join("missing-nested.jar");
+        jar(&missing, Some(br#"{"schemaVersion":1,"id":"missing-nested","version":"1.0","jars":[{"file":"nested/absent.jar"}]}"#));
+        let (_, warnings) =
+            inspect_fabric_metadata(&missing, std::fs::metadata(&missing).unwrap().len());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "nested_jar_missing")
+        );
+
+        let malformed = fixture.mods().join("bad-nested.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&malformed).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(br#"{"schemaVersion":1,"id":"bad-nested","version":"1.0","jars":[{"file":"nested/bad.jar"}]}"#).unwrap();
+        writer
+            .start_file("nested/bad.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"not a jar").unwrap();
+        writer.finish().unwrap();
+        let (_, warnings) =
+            inspect_fabric_metadata(&malformed, std::fs::metadata(&malformed).unwrap().len());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "nested_jar_malformed")
+        );
+
+        let malformed_metadata = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"{").unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let bad_metadata = fixture.mods().join("bad-metadata.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&bad_metadata).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"schemaVersion":1,"id":"bad-metadata","jars":[{"file":"module.jar"}]}"#)
+            .unwrap();
+        writer
+            .start_file("module.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&malformed_metadata).unwrap();
+        writer.finish().unwrap();
+        let (_, warnings) = inspect_fabric_metadata(
+            &bad_metadata,
+            std::fs::metadata(&bad_metadata).unwrap().len(),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "nested_metadata_malformed")
+        );
+        let too_many_entries = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            for index in 0..=MAX_ARCHIVE_ENTRIES {
+                writer
+                    .start_file(
+                        format!("entry-{index}.txt"),
+                        zip::write::SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+            }
+            writer.finish().unwrap().into_inner()
+        };
+        let bounded = fixture.mods().join("bounded.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&bounded).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"schemaVersion":1,"id":"bounded","jars":[{"file":"module.jar"}]}"#)
+            .unwrap();
+        writer
+            .start_file("module.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&too_many_entries).unwrap();
+        writer.finish().unwrap();
+        let (_, warnings) =
+            inspect_fabric_metadata(&bounded, std::fs::metadata(&bounded).unwrap().len());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "nested_jar_malformed")
+        );
+
+        let oversized_metadata = {
+            let cursor = Cursor::new(Vec::new());
+            let mut writer = zip::ZipWriter::new(cursor);
+            writer
+                .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            writer
+                .write_all(&vec![b'x'; MAX_METADATA_BYTES as usize + 1])
+                .unwrap();
+            writer.finish().unwrap().into_inner()
+        };
+        let too_large = fixture.mods().join("oversized-metadata.jar");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&too_large).unwrap());
+        writer
+            .start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"schemaVersion":1,"id":"oversized","jars":[{"file":"module.jar"}]}"#)
+            .unwrap();
+        writer
+            .start_file("module.jar", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&oversized_metadata).unwrap();
+        writer.finish().unwrap();
+        let (_, warnings) =
+            inspect_fabric_metadata(&too_large, std::fs::metadata(&too_large).unwrap().len());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.code == "nested_metadata_malformed")
         );
     }
 }
