@@ -111,6 +111,15 @@ describe("instance workspace navigation", () => {
     assert.deepEqual(selectInstanceTab(globalState("instances"), "overview"), globalState("instances"));
   });
 
+  it("places the implemented Mods tab between Overview and Settings", () => {
+    const state = openInstance(globalState("instances"), "abc123");
+    assert.deepEqual(selectInstanceTab(state, "mods"), {
+      kind: "instance",
+      instanceId: "abc123",
+      tab: "mods",
+    });
+  });
+
   it("navigates back to the Instances page from a workspace", () => {
     const state = openInstance(globalState("home"), "abc123", "settings");
     assert.deepEqual(backToInstances(), globalState("instances"));

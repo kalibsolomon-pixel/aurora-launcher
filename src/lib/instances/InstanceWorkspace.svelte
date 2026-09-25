@@ -4,6 +4,7 @@
   import { INSTANCE_TABS, resolveWorkspace } from "$lib/launcher/navigation";
   import { draftIsDirty, instanceContentStatus } from "$lib/launcher/instanceStatus";
   import InstanceOverviewPanel from "$lib/instances/InstanceOverviewPanel.svelte";
+  import InstanceModsPanel from "$lib/instances/InstanceModsPanel.svelte";
   import InstanceSettingsPanel from "$lib/instances/InstanceSettingsPanel.svelte";
   import type { InstanceTab } from "$lib/launcher/navigation";
 
@@ -47,6 +48,7 @@
 
   const tabLabels: Record<InstanceTab, string> = {
     overview: "Overview",
+    mods: "Mods",
     settings: "Settings",
   };
 
@@ -207,6 +209,8 @@
     <div id="instance-tabpanel" role="tabpanel" aria-labelledby="instance-tab-{tab}">
       {#if tab === "overview"}
         <InstanceOverviewPanel {instance} />
+      {:else if tab === "mods"}
+        <InstanceModsPanel {instance} />
       {:else}
         <InstanceSettingsPanel {instance} />
       {/if}

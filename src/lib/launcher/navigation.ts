@@ -25,7 +25,7 @@ export const GLOBAL_PAGES = [
 export type GlobalPage = (typeof GLOBAL_PAGES)[number];
 
 /** Instance-local workspace tabs with real implemented functionality. */
-export const INSTANCE_TABS = ["overview", "settings"] as const;
+export const INSTANCE_TABS = ["overview", "mods", "settings"] as const;
 
 export type InstanceTab = (typeof INSTANCE_TABS)[number];
 

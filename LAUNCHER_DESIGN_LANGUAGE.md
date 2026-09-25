@@ -99,7 +99,7 @@ architecture + Aurora's hierarchy, spacing, identity, and restraint*.
 │ brand    │  Instances ›                [Open    │
 │ ──────   │  Instance name  [status]    folder]  │
 │ Home     │                  [Play]              │
-│ Instances│  Overview │ Settings                  │
+│ Instances│  Overview │ Mods │ Settings           │
 │ Accounts│  ────────────────────────             │
 │ Settings │                                      │
 │ About    │   grouped content (scrolls           │
@@ -149,7 +149,7 @@ Opening an instance replaces the global page with a stable contextual shell:
    as a quiet subtitle, and the contextual actions **Open folder** (secondary) and
    **Play** (primary) at the top-right. The header is information-dense, never a
    hero card: no UUIDs, raw paths, hashes, or release internals.
-2. **Secondary tab row** — a compact horizontal `tablist` (Overview, Settings)
+2. **Secondary tab row** — a compact horizontal `tablist` (Overview, Mods, Settings)
    directly under the header, keyboard-operable (roving tabindex, arrow keys), with
    the active tab marked by weight and an accent underline plus `aria-selected` —
    selection is never color-alone. An unsaved Settings draft shows a text "Unsaved"
@@ -158,9 +158,9 @@ Opening an instance replaces the global page with a stable contextual shell:
    mounted while tabs switch.
 
 There are never three simultaneous navigation columns: the global sidebar plus the
-instance tab row is the whole navigation surface. Instance tabs may later grow
-Mods, Resource Packs, Shaders, and Logs; placeholder tabs for unbuilt features are
-prohibited.
+instance tab row is the whole navigation surface. Mods is the first implemented
+content tab. Instance tabs may later grow Resource Packs, Shaders, and Logs;
+placeholder tabs for unbuilt features are prohibited.
 
 ### Compact information density
 
@@ -178,6 +178,39 @@ Aurora's density rules, learned from the workspace phase:
 - Duplicate information is a defect: one fact appears in one place per surface
   (Home shows the selected instance's readiness; the workspace Overview shows the
   open instance's — the same derivation, not a copy-paste).
+
+### Dense local-content lists
+
+Mods establishes the reusable dense content-list pattern for instance-owned
+collections. The page starts with one compact title/action row (**Refresh**, **Open
+folder**), followed by one labeled search field and at most two restrained native
+selects for filtering and sorting. Search is visually primary; controls wrap below
+it at the minimum window rather than forcing horizontal scrolling.
+
+The list is one grouped surface. Entries are hairline-separated rows, never a card
+per item. Row hierarchy is: generic content glyph → display name and optional
+version → quiet type/author metadata → truncated filename/size → at most one visible
+warning summary. Secondary metadata and full warning lists live in a native details
+expansion, not across permanent columns. Long names and filenames ellipsize in the
+row and remain available in details/title text. This keeps 50–100 entries scannable
+without shrinking targets.
+
+The trailing action area aligns a textual state (**Enabled**, **Disabled**,
+**Required**, or unclassified file type), an accessible mod-specific switch for
+ordinary user-managed mods, and one restrained contextual menu. Required
+launcher-managed content uses calm working-color text plus the words **Required**
+and **Protected**; it never uses a large warning block or Pandora-style red row.
+Unknown entries explain why actions are unavailable. Destructive removal expands an
+inline confirmation inside the row, names both the mod and exact filename, moves
+focus to the confirmation, supports Escape/cancel focus return, and keeps the
+destructive action secondary.
+
+Warnings use the semantic warning token plus an icon and text; they are never
+color-only and never imply binary compatibility. Disabled state is redundant in
+text, switch position, and row treatment. During a running game, one compact status
+sentence above the list explains that changes apply next launch. Loading, no-result,
+empty-directory, and page-level error states reuse the standard patterns and do not
+advertise online providers that do not exist.
 
 ## E. Spacing system
 
@@ -443,12 +476,12 @@ operating-system surfaces only, and the two are never swapped for each other.
 
 ## Future information architecture (documented, not built)
 
-- **Instance workspace tabs** — Mods, Resource Packs, Shaders, and Logs are the
-  intended next tabs inside an instance's workspace (and Worlds/Servers a possible
-  later stage). No backend capability exists for them yet; they must not be fake
-  tabs. The typed `InstanceTab` model is the extension point.
-- **Library** — a content/mod browsing destination. No backend capability exists
-  (no mod management, no content sources); it must not be a fake screen.
+- **Instance workspace tabs** — Mods is implemented. Resource Packs, Shaders, and
+  Logs are intended later tabs inside an instance's workspace (and Worlds/Servers
+  a possible later stage). No fake tab appears before its backend capability; the
+  typed `InstanceTab` model remains the extension point.
+- **Library** — a future online content-browsing destination. No provider backend
+  exists; local Mods management does not justify a fake marketplace screen.
 - **Settings** is built (launcher-wide appearance preferences and Windows desktop
   integration). Further launcher-wide preferences belong there as real behavior
   arrives; About remains the status/version surface. Instance-specific settings

@@ -311,6 +311,47 @@ impl From<crate::shortcuts::ShortcutError> for CommandError {
     }
 }
 
+impl From<crate::instance_mods::ModError> for CommandError {
+    fn from(error: crate::instance_mods::ModError) -> Self {
+        let code = error.code();
+        eprintln!("[aurora-launcher] local mod operation failed ({code}): {error}");
+        let message = match &error {
+            crate::instance_mods::ModError::DirectoryMissing
+            | crate::instance_mods::ModError::DirectoryRead { .. } => {
+                "This instance's mods folder is unavailable. Check the folder and try Refresh."
+                    .to_owned()
+            }
+            crate::instance_mods::ModError::Boundary { .. }
+            | crate::instance_mods::ModError::BoundaryEscape
+            | crate::instance_mods::ModError::UnsafeEntry => {
+                "Aurora refused the operation because the local entry could not be proven safe."
+                    .to_owned()
+            }
+            crate::instance_mods::ModError::InstalledState(_) => {
+                "Aurora Client ownership could not be verified from this instance's installed state."
+                    .to_owned()
+            }
+            crate::instance_mods::ModError::StaleEntry => {
+                "This mod changed since the list was loaded. Refresh and try again.".to_owned()
+            }
+            crate::instance_mods::ModError::RequiredArtifact => {
+                "Aurora Client is required and cannot be disabled or removed here.".to_owned()
+            }
+            crate::instance_mods::ModError::TargetConflict(name) => format!(
+                "A local file named '{name}' already exists. Aurora did not overwrite it."
+            ),
+            crate::instance_mods::ModError::MutationInProgress => {
+                "Another mod change is already in progress for this instance.".to_owned()
+            }
+            crate::instance_mods::ModError::MutationIo { .. }
+            | crate::instance_mods::ModError::State(_) => {
+                "The local mod change could not be completed. Refresh and try again.".to_owned()
+            }
+        };
+        Self::new(code, message)
+    }
+}
+
 impl From<InvalidArtifactSource> for CommandError {
     fn from(error: InvalidArtifactSource) -> Self {
         Self::new("artifact_source_invalid", error.to_string())
@@ -1816,6 +1857,129 @@ pub fn open_instance_folder(
         CommandError::new(
             "instance_folder_open_failure",
             format!("the instance folder could not be opened: {error}"),
+        )
+    })
+}
+
+/// A registered instance whose authoritative local mods inventory is requested.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceModsRequest {
+    instance_id: String,
+}
+
+/// A safe mutation request. `entry_id` is an opaque scan-derived token, never
+/// a path or filename supplied by the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetInstanceModEnabledRequest {
+    instance_id: String,
+    entry_id: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveInstanceModRequest {
+    instance_id: String,
+    entry_id: String,
+}
+
+fn registered_instance(
+    managed: &ManagedPaths,
+    instance_id: &str,
+) -> Result<crate::instances::InstanceId, CommandError> {
+    let instance = crate::instances::InstanceId::new(instance_id.trim())?;
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+    if registry.find(&instance).is_none() {
+        return Err(CommandError::new(
+            "instance_not_found",
+            format!("no instance '{instance}' exists in the launcher's registry"),
+        ));
+    }
+    Ok(instance)
+}
+
+/// Scans one registered instance's actual mods directory on a blocking worker.
+/// Search/filter/sort in the presentation layer operates on this snapshot and
+/// never triggers another filesystem scan per keystroke.
+#[tauri::command]
+pub async fn get_instance_mods(
+    app: AppHandle,
+    request: InstanceModsRequest,
+) -> Result<crate::instance_mods::ModInventory, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::instance_mods::scan(&managed, &instance)
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            "mod_inventory_unavailable",
+            format!("the local mod inventory worker stopped unexpectedly: {error}"),
+        )
+    })?;
+    result.map_err(CommandError::from)
+}
+
+/// Enables or disables one current user-managed JAR through a same-directory
+/// rename and returns the resulting authoritative inventory.
+#[tauri::command]
+pub async fn set_instance_mod_enabled(
+    app: AppHandle,
+    request: SetInstanceModEnabledRequest,
+) -> Result<crate::instance_mods::ModInventory, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::instance_mods::set_enabled(&managed, &instance, &request.entry_id, request.enabled)
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            "mod_mutation_failure",
+            format!("the local mod mutation worker stopped unexpectedly: {error}"),
+        )
+    })?;
+    result.map_err(CommandError::from)
+}
+
+/// Permanently removes one current user-managed local JAR after the frontend's
+/// explicit confirmation, then returns the authoritative inventory.
+#[tauri::command]
+pub async fn remove_instance_mod(
+    app: AppHandle,
+    request: RemoveInstanceModRequest,
+) -> Result<crate::instance_mods::ModInventory, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::instance_mods::remove(&managed, &instance, &request.entry_id)
+    })
+    .await
+    .map_err(|error| {
+        CommandError::new(
+            "mod_mutation_failure",
+            format!("the local mod removal worker stopped unexpectedly: {error}"),
+        )
+    })?;
+    result.map_err(CommandError::from)
+}
+
+/// Opens only the exact derived mods directory of a registered instance.
+#[tauri::command]
+pub fn open_instance_mods_folder(
+    app: AppHandle,
+    request: InstanceModsRequest,
+) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let folder = crate::instance_mods::validate_mods_directory(&managed, &instance)?;
+    tauri_plugin_opener::open_path(&folder, None::<&str>).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("the instance mods folder could not be opened: {error}"),
         )
     })
 }

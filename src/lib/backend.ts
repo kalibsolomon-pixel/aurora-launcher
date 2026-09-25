@@ -674,6 +674,133 @@ export async function openInstanceFolder(instanceId: string): Promise<void> {
   }
 }
 
+export type ModFileType =
+  | "enabledJar"
+  | "disabledJar"
+  | "unexpectedFile"
+  | "directory"
+  | "link";
+
+export type ModOwnership =
+  | "launcherManagedRequired"
+  | "userManaged"
+  | "unknown";
+
+export interface ModRelation {
+  modId: string;
+  requirement: string;
+}
+
+export interface FabricModMetadata {
+  id: string;
+  name: string | null;
+  version: string | null;
+  description: string | null;
+  authors: string[];
+  environment: string | null;
+  depends: ModRelation[];
+  recommends: ModRelation[];
+  suggests: ModRelation[];
+  conflicts: ModRelation[];
+  breaks: ModRelation[];
+  hasDeclaredIcon: boolean;
+}
+
+export interface ModWarning {
+  code: string;
+  message: string;
+}
+
+/** One direct child of the authoritative instance mods directory. */
+export interface ModEntry {
+  /** Opaque scan identity; never a filesystem path. */
+  entryId: string;
+  fileName: string;
+  displayName: string;
+  enabled: boolean;
+  fileType: ModFileType;
+  sizeBytes: number | null;
+  modifiedUnixMillis: number | null;
+  ownership: ModOwnership;
+  metadata: FabricModMetadata | null;
+  warnings: ModWarning[];
+  canToggle: boolean;
+  canRemove: boolean;
+  actionBlockedReason: string | null;
+}
+
+export interface ModInventory {
+  instanceId: string;
+  entries: ModEntry[];
+}
+
+export async function getInstanceMods(instanceId: string): Promise<ModInventory> {
+  try {
+    return await invoke<ModInventory>("get_instance_mods", { request: { instanceId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The local mod inventory could not be loaded.",
+    );
+  }
+}
+
+export async function setInstanceModEnabled(
+  instanceId: string,
+  entryId: string,
+  enabled: boolean,
+): Promise<ModInventory> {
+  try {
+    return await invoke<ModInventory>("set_instance_mod_enabled", {
+      request: { instanceId, entryId, enabled },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The local mod state could not be changed.",
+    );
+  }
+}
+
+export async function removeInstanceMod(
+  instanceId: string,
+  entryId: string,
+): Promise<ModInventory> {
+  try {
+    return await invoke<ModInventory>("remove_instance_mod", {
+      request: { instanceId, entryId },
+    });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The local mod could not be removed.",
+    );
+  }
+}
+
+export async function openInstanceModsFolder(instanceId: string): Promise<void> {
+  try {
+    await invoke<void>("open_instance_mods_folder", { request: { instanceId } });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) {
+      throw new LauncherBackendError(error.code, error.message);
+    }
+    throw new LauncherBackendError(
+      "backend_unavailable",
+      "The instance mods folder could not be opened.",
+    );
+  }
+}
+
 export type InstanceValidationStatus =
   | "ready"
   | "damaged"

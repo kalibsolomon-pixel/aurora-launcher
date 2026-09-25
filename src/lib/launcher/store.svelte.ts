@@ -9,6 +9,7 @@ import {
   getAccounts,
   getInstanceRuntimeStatus,
   getLauncherState,
+  getInstanceMods,
   getPlayReadiness,
   installGame,
   installInstanceConfiguration,
@@ -16,15 +17,18 @@ import {
   listFabricLoaderVersions,
   listMinecraftVersions,
   openInstanceFolder,
+  openInstanceModsFolder,
   planFabricInstall,
   planMinecraftInstall,
   playInstance,
   refreshAccountSession,
   removeAccount,
+  removeInstanceMod,
   renameInstance,
   retryInstanceInstall,
   selectAccount,
   selectInstance,
+  setInstanceModEnabled,
   updateInstanceConfiguration,
   validateInstance,
   validateInstalledGame,
@@ -50,6 +54,7 @@ import {
   type LaunchProgressEvent,
   type MinecraftPlanSummary,
   type MinecraftVersion,
+  type ModInventory,
   type PlayReadiness,
   type RuntimeProgressEvent,
   type RuntimeStatusDto,
@@ -110,6 +115,15 @@ class LauncherStore {
   // Instance folder opening (the workspace header's contextual action).
   folderBusy = $state<string | null>(null);
   folderError = $state<LauncherBackendError | null>(null);
+
+  // Filesystem-authoritative local Mods snapshots. Search/filter/sort are
+  // presentation-only over these snapshots; only explicit refresh/mutation
+  // calls cross the native boundary.
+  modInventories = $state<Record<string, ModInventory>>({});
+  modInventoryBusy = $state<string | null>(null);
+  modMutationBusy = $state<string | null>(null);
+  modFolderBusy = $state<string | null>(null);
+  modError = $state<LauncherBackendError | null>(null);
 
   // Managed Java runtime for the selected instance.
   runtimeStatus = $state<RuntimeStatusDto | null>(null);
@@ -450,6 +464,62 @@ class LauncherStore {
       this.folderError = backendError(cause, "The instance folder could not be opened.");
     } finally {
       this.folderBusy = null;
+    }
+  }
+
+  async runLoadMods(id: string): Promise<void> {
+    if (this.modInventoryBusy === id) return;
+    this.modInventoryBusy = id;
+    this.modError = null;
+    try {
+      this.modInventories[id] = await getInstanceMods(id);
+    } catch (cause: unknown) {
+      this.modError = backendError(cause, "The local mod inventory could not be loaded.");
+    } finally {
+      this.modInventoryBusy = null;
+    }
+  }
+
+  async runSetModEnabled(id: string, entryId: string, enabled: boolean): Promise<void> {
+    if (this.modMutationBusy !== null) return;
+    this.modMutationBusy = entryId;
+    this.modError = null;
+    try {
+      this.modInventories[id] = await setInstanceModEnabled(id, entryId, enabled);
+    } catch (cause: unknown) {
+      const error = backendError(cause, "The mod state could not be changed.");
+      await this.runLoadMods(id);
+      this.modError = error;
+    } finally {
+      this.modMutationBusy = null;
+    }
+  }
+
+  async runRemoveMod(id: string, entryId: string): Promise<void> {
+    if (this.modMutationBusy !== null) return;
+    this.modMutationBusy = entryId;
+    this.modError = null;
+    try {
+      this.modInventories[id] = await removeInstanceMod(id, entryId);
+    } catch (cause: unknown) {
+      const error = backendError(cause, "The mod could not be removed.");
+      await this.runLoadMods(id);
+      this.modError = error;
+    } finally {
+      this.modMutationBusy = null;
+    }
+  }
+
+  async runOpenModsFolder(id: string): Promise<void> {
+    if (this.modFolderBusy !== null) return;
+    this.modFolderBusy = id;
+    this.modError = null;
+    try {
+      await openInstanceModsFolder(id);
+    } catch (cause: unknown) {
+      this.modError = backendError(cause, "The instance mods folder could not be opened.");
+    } finally {
+      this.modFolderBusy = null;
     }
   }
 
