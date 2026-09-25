@@ -17,6 +17,7 @@
 //! could replace both artifact URL and expected digest together. No signing
 //! infrastructure exists, so none is invented.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,7 @@ impl ReleaseManifest {
             });
         }
 
+        let mut versions = HashSet::new();
         for (index, release) in manifest.releases.iter().enumerate() {
             release
                 .validate()
@@ -72,6 +74,13 @@ impl ReleaseManifest {
                     aurora_version: release.aurora_version.clone(),
                     reason,
                 })?;
+            if !versions.insert(release.aurora_version.as_str()) {
+                return Err(ManifestError::InvalidRelease {
+                    index,
+                    aurora_version: release.aurora_version.clone(),
+                    reason: "duplicate Aurora version".to_owned(),
+                });
+            }
         }
 
         Ok(manifest)
@@ -90,10 +99,7 @@ impl ReleaseManifest {
     ///
     /// Selection is exact, mirroring the launcher's version-selection
     /// policy everywhere: no "latest", no channel fallback, no
-    /// substitution. The first matching release wins; manifests list
-    /// versions uniquely in practice, and a duplicated version with
-    /// disagreeing facts is a manifest authoring error surfaced by the
-    /// exactness of this lookup.
+    /// substitution. Parsing rejects duplicate Aurora versions.
     pub fn resolve_exact(
         &self,
         aurora_version: &str,
@@ -454,6 +460,19 @@ mod tests {
         let missing_field = r#"{ "schemaVersion": 1, "releases": [ { "channel": "stable" } ] }"#;
         let error = ReleaseManifest::from_json(missing_field).unwrap_err();
         assert!(matches!(error, ManifestError::Json(_)));
+    }
+
+    #[test]
+    fn rejects_duplicate_release_versions_even_across_channels() {
+        let mut duplicate: serde_json::Value = serde_json::from_str(VALID_MANIFEST).unwrap();
+        let version = duplicate["releases"][0]["auroraVersion"].clone();
+        duplicate["releases"][1]["auroraVersion"] = version;
+        let error = ReleaseManifest::from_json(&duplicate.to_string()).unwrap_err();
+        assert!(matches!(
+            error,
+            ManifestError::InvalidRelease { index: 1, .. }
+        ));
+        assert!(error.to_string().contains("duplicate Aurora version"));
     }
 
     #[test]
