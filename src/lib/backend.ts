@@ -683,6 +683,7 @@ export type ModFileType =
 
 export type ModOwnership =
   | "launcherManagedRequired"
+  | "providerManaged"
   | "userManaged"
   | "unknown";
 
@@ -722,6 +723,8 @@ export interface ModEntry {
   sizeBytes: number | null;
   modifiedUnixMillis: number | null;
   ownership: ModOwnership;
+  sha256: string | null;
+  provenance: ProviderRecord | null;
   metadata: FabricModMetadata | null;
   warnings: ModWarning[];
   canToggle: boolean;
@@ -732,6 +735,95 @@ export interface ModEntry {
 export interface ModInventory {
   instanceId: string;
   entries: ModEntry[];
+  missingManaged: ProviderRecord[];
+}
+
+export type ContentType = "mod" | "resourcePack" | "shaderPack";
+export type ContentOwnership = ModOwnership;
+export type DependencyKind = "required" | "optional" | "incompatible";
+
+export interface ProviderDependency {
+  kind: DependencyKind;
+  provider: string;
+  projectId: string;
+  versionId: string | null;
+}
+
+export interface ContentCompatibility {
+  minecraftVersions: string[];
+  loader: string | null;
+  environment: string | null;
+}
+
+export interface ProviderRecord {
+  contentType: ContentType;
+  provider: string;
+  projectId: string;
+  versionId: string;
+  fileId: string;
+  fileName: string;
+  sha256: string;
+  displayVersion: string | null;
+  compatibility: ContentCompatibility;
+  dependencies: ProviderDependency[];
+}
+
+export interface ContentEntry {
+  entryId: string;
+  contentType: ContentType;
+  fileName: string;
+  displayName: string;
+  fileType: "zip" | "directory" | "link" | "unexpectedFile" | "unreadable";
+  sizeBytes: number | null;
+  modifiedUnixMillis: number | null;
+  ownership: ContentOwnership;
+  sha256: string | null;
+  provenance: ProviderRecord | null;
+  description: string | null;
+  packFormat: number | null;
+  warnings: ModWarning[];
+  canRemove: boolean;
+}
+
+export interface ContentInventory {
+  instanceId: string;
+  contentType: ContentType;
+  entries: ContentEntry[];
+  missingManaged: ProviderRecord[];
+}
+
+export interface InstanceContentContext {
+  instanceId: string;
+  minecraftVersion: string;
+  loader: "fabric";
+  loaderVersion: string;
+  auroraVersion: string;
+  environment: "client";
+}
+
+async function contentInvoke<T>(command: string, request: Record<string, unknown>): Promise<T> {
+  try {
+    return await invoke<T>(command, { request });
+  } catch (error: unknown) {
+    if (isBackendCommandError(error)) throw new LauncherBackendError(error.code, error.message);
+    throw new LauncherBackendError("backend_unavailable", "Instance content is unavailable.");
+  }
+}
+
+export function getInstanceContentContext(instanceId: string): Promise<InstanceContentContext> {
+  return contentInvoke("get_instance_content_context", { instanceId });
+}
+
+export function getInstanceContent(instanceId: string, contentType: ContentType): Promise<ContentInventory> {
+  return contentInvoke("get_instance_content", { instanceId, contentType });
+}
+
+export function removeInstanceContent(instanceId: string, contentType: ContentType, entryId: string): Promise<ContentInventory> {
+  return contentInvoke("remove_instance_content", { instanceId, contentType, entryId });
+}
+
+export function openInstanceContentFolder(instanceId: string, contentType: ContentType): Promise<void> {
+  return contentInvoke("open_instance_content_folder", { instanceId, contentType });
 }
 
 export async function getInstanceMods(instanceId: string): Promise<ModInventory> {

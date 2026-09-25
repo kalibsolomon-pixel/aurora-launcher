@@ -68,6 +68,7 @@
 
   function stateLabel(entry: ModEntry): string {
     if (entry.ownership === "launcherManagedRequired") return "Required";
+    if (entry.ownership === "providerManaged") return "Managed";
     if (entry.fileType === "enabledJar") return "Enabled";
     if (entry.fileType === "disabledJar") return "Disabled";
     if (entry.fileType === "link") return "Link";
@@ -77,6 +78,10 @@
 </script>
 
 <section class="mods-panel" aria-labelledby="mods-title">
+  {#if inventory?.missingManaged.length}
+    <p class="mods-notice" role="status">{inventory.missingManaged.length} managed mod file{inventory.missingManaged.length === 1 ? " is" : "s are"} missing. Refresh or inspect the instance folder; Aurora will not recreate files automatically.</p>
+    <details class="missing-details"><summary>Missing managed files</summary><ul>{#each inventory.missingManaged as record}<li>{record.fileName} · {record.provider}</li>{/each}</ul></details>
+  {/if}
   <div class="mods-heading">
     <div>
       <h3 id="mods-title" class="group-title">Mods</h3>
@@ -235,7 +240,8 @@
               <summary>Details</summary>
               <dl>
                 <div><dt>File</dt><dd>{entry.fileName}</dd></div>
-                <div><dt>Ownership</dt><dd>{entry.ownership === "launcherManagedRequired" ? "Managed by Aurora · required" : entry.ownership === "userManaged" ? "User-managed local mod" : "Unclassified"}</dd></div>
+                <div><dt>Ownership</dt><dd>{entry.ownership === "launcherManagedRequired" ? "Managed by Aurora · required" : entry.ownership === "providerManaged" ? `Managed · ${entry.provenance?.provider}` : entry.ownership === "userManaged" ? "Local mod" : "Unclassified"}</dd></div>
+                {#if entry.provenance}<div><dt>Provider</dt><dd>{entry.provenance.provider} · {entry.provenance.projectId} · {entry.provenance.displayVersion ?? entry.provenance.versionId}</dd></div>{/if}
                 {#if entry.metadata}
                   <div><dt>Mod ID</dt><dd>{entry.metadata.id}</dd></div>
                   {#if entry.metadata.environment}<div><dt>Environment</dt><dd>{entry.metadata.environment}</dd></div>{/if}
@@ -293,6 +299,7 @@
   .mods-heading { justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-4); }
   .mods-heading-actions, .remove-actions { gap: var(--space-2); flex-wrap: wrap; }
   .mods-notice { margin: 0 0 var(--space-3); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); background: var(--color-working-soft); color: var(--color-working); font-size: var(--text-secondary); }
+  .missing-details { margin: 0 0 var(--space-4); font-size: var(--text-metadata); color: var(--color-text-secondary); }
   .mods-error { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-3); padding: var(--space-3); border-radius: var(--radius-sm); background: var(--color-error-soft); color: var(--color-error); font-size: var(--text-secondary); flex-wrap: wrap; }
   .mods-error p { margin: 0; flex: 1; }
   .mods-error code { color: var(--color-text-muted); font-size: var(--text-metadata); }

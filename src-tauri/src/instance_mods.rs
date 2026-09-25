@@ -12,14 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::aurora;
+use crate::instance_content::{ContentState, ContentType, ProviderRecord};
 use crate::instances::InstanceId;
+use crate::integrity::{ArtifactDigest, verify_file};
 use crate::paths::ManagedPaths;
 
 const MAX_METADATA_BYTES: u64 = 256 * 1024;
@@ -32,6 +33,7 @@ const DISABLED_SUFFIX: &str = ".disabled";
 pub struct ModInventory {
     pub instance_id: String,
     pub entries: Vec<ModEntry>,
+    pub missing_managed: Vec<ProviderRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,6 +47,8 @@ pub struct ModEntry {
     pub size_bytes: Option<u64>,
     pub modified_unix_millis: Option<u64>,
     pub ownership: ModOwnership,
+    pub sha256: Option<String>,
+    pub provenance: Option<ProviderRecord>,
     pub metadata: Option<FabricModMetadata>,
     pub warnings: Vec<ModWarning>,
     pub can_toggle: bool,
@@ -66,6 +70,7 @@ pub enum ModFileType {
 #[serde(rename_all = "camelCase")]
 pub enum ModOwnership {
     LauncherManagedRequired,
+    ProviderManaged,
     UserManaged,
     Unknown,
 }
@@ -136,12 +141,25 @@ struct FabricMetadataDocument {
 pub fn scan(managed: &ManagedPaths, instance: &InstanceId) -> Result<ModInventory, ModError> {
     let mods = validate_mods_directory(managed, instance)?;
     let managed_file = managed_artifact_file_name(managed, instance)?;
+    let content_state = ContentState::load(managed, instance)
+        .map_err(|error| ModError::ContentState(error.to_string()))?;
     let mut entries = Vec::new();
     let children = std::fs::read_dir(&mods).map_err(|source| ModError::DirectoryRead { source })?;
 
     for child in children {
         match child {
-            Ok(child) => entries.push(inspect_entry(&child.path(), managed_file.as_deref())),
+            Ok(child) => {
+                let name = child.file_name().to_string_lossy().into_owned();
+                let provider = content_state.entries.iter().find(|record| {
+                    record.content_type == ContentType::Mod
+                        && record.file_name.eq_ignore_ascii_case(&name)
+                });
+                entries.push(inspect_entry(
+                    &child.path(),
+                    managed_file.as_deref(),
+                    provider,
+                ));
+            }
             Err(source) => entries.push(ModEntry {
                 entry_id: opaque_id(b"unreadable-directory-entry"),
                 file_name: "Unreadable entry".to_owned(),
@@ -151,6 +169,8 @@ pub fn scan(managed: &ManagedPaths, instance: &InstanceId) -> Result<ModInventor
                 size_bytes: None,
                 modified_unix_millis: None,
                 ownership: ModOwnership::Unknown,
+                sha256: None,
+                provenance: None,
                 metadata: None,
                 warnings: vec![ModWarning::new(
                     "entry_unreadable",
@@ -178,6 +198,17 @@ pub fn scan(managed: &ManagedPaths, instance: &InstanceId) -> Result<ModInventor
     });
     Ok(ModInventory {
         instance_id: instance.to_string(),
+        missing_managed: content_state
+            .entries
+            .iter()
+            .filter(|record| {
+                record.content_type == ContentType::Mod
+                    && !entries
+                        .iter()
+                        .any(|entry| entry.file_name.eq_ignore_ascii_case(&record.file_name))
+            })
+            .cloned()
+            .collect(),
         entries,
     })
 }
@@ -212,7 +243,7 @@ pub fn validate_mods_directory(
     Ok(mods)
 }
 
-fn managed_artifact_file_name(
+pub(crate) fn managed_artifact_file_name(
     managed: &ManagedPaths,
     instance: &InstanceId,
 ) -> Result<Option<Vec<String>>, ModError> {
@@ -241,7 +272,11 @@ fn managed_artifact_file_name(
     }))
 }
 
-fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
+fn inspect_entry(
+    path: &Path,
+    managed_files: Option<&[String]>,
+    provider: Option<&ProviderRecord>,
+) -> ModEntry {
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -271,7 +306,7 @@ fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
                 || file_name.eq_ignore_ascii_case(&format!("{managed}{DISABLED_SUFFIX}"))
         })
     });
-    let ownership = if is_managed {
+    let mut ownership = if is_managed {
         ModOwnership::LauncherManagedRequired
     } else if matches!(
         file_type,
@@ -280,6 +315,35 @@ fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
         ModOwnership::UserManaged
     } else {
         ModOwnership::Unknown
+    };
+    let mut sha256 = None;
+    let mut provenance = None;
+    let provider_mismatch = if !is_managed {
+        if let Some(provider) = provider {
+            if matches!(file_type, ModFileType::EnabledJar) {
+                if let Ok(digest) = ArtifactDigest::parse(&provider.sha256) {
+                    if verify_file(path, &digest, None).is_ok() {
+                        ownership = ModOwnership::ProviderManaged;
+                        sha256 = Some(provider.sha256.clone());
+                        provenance = Some(provider.clone());
+                        false
+                    } else {
+                        ownership = ModOwnership::Unknown;
+                        true
+                    }
+                } else {
+                    ownership = ModOwnership::Unknown;
+                    true
+                }
+            } else {
+                ownership = ModOwnership::Unknown;
+                true
+            }
+        } else {
+            false
+        }
+    } else {
+        false
     };
     let size_bytes = metadata.is_file().then_some(metadata.len());
     let modified_unix_millis = metadata
@@ -324,6 +388,12 @@ fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
             "A required managed mod is disabled outside the launcher; instance readiness may be damaged.",
         ));
     }
+    if provider_mismatch {
+        warnings.push(ModWarning::new(
+            "content_hash_mismatch",
+            "This file no longer matches its provider-managed record. Actions are blocked.",
+        ));
+    }
     let blocked_reason = match ownership {
         ModOwnership::LauncherManagedRequired => Some(
             "This mod is required and is maintained by the verified installation system."
@@ -333,6 +403,7 @@ fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
             Some("Aurora cannot prove that this entry is a user-managed mod file.".to_owned())
         }
         ModOwnership::UserManaged => None,
+        ModOwnership::ProviderManaged => None,
     };
     let display_name = fabric_metadata
         .as_ref()
@@ -363,10 +434,15 @@ fn inspect_entry(path: &Path, managed_files: Option<&[String]>) -> ModEntry {
         size_bytes,
         modified_unix_millis,
         ownership,
+        sha256,
+        provenance,
         metadata: fabric_metadata,
         warnings,
         can_toggle: ownership == ModOwnership::UserManaged,
-        can_remove: ownership == ModOwnership::UserManaged,
+        can_remove: matches!(
+            ownership,
+            ModOwnership::UserManaged | ModOwnership::ProviderManaged
+        ),
         action_blocked_reason: blocked_reason,
     }
 }
@@ -381,6 +457,8 @@ fn unavailable_entry(file_name: String, reason: String) -> ModEntry {
         size_bytes: None,
         modified_unix_millis: None,
         ownership: ModOwnership::Unknown,
+        sha256: None,
+        provenance: None,
         metadata: None,
         warnings: vec![ModWarning::new("entry_unreadable", reason)],
         can_toggle: false,
@@ -687,7 +765,7 @@ pub fn set_enabled(
 ) -> Result<ModInventory, ModError> {
     with_mutation_lock(instance, || {
         let inventory = scan(managed, instance)?;
-        let entry = resolve_mutable_entry(&inventory, entry_id)?;
+        let entry = resolve_mutable_entry(&inventory, entry_id, true)?;
         if entry.enabled == enabled {
             return Ok(inventory);
         }
@@ -722,10 +800,28 @@ pub fn remove(
 ) -> Result<ModInventory, ModError> {
     with_mutation_lock(instance, || {
         let inventory = scan(managed, instance)?;
-        let entry = resolve_mutable_entry(&inventory, entry_id)?;
+        let entry = resolve_mutable_entry(&inventory, entry_id, false)?;
         let mods = validate_mods_directory(managed, instance)?;
         let target = validate_current_regular_file(&mods, &entry.file_name)?;
-        std::fs::remove_file(target).map_err(|source| ModError::MutationIo { source })?;
+        if entry.ownership == ModOwnership::ProviderManaged {
+            let mut state = ContentState::load(managed, instance)
+                .map_err(|error| ModError::ContentState(error.to_string()))?;
+            let temporary = mods.join(format!(".content-removing-{}", uuid::Uuid::new_v4()));
+            std::fs::rename(&target, &temporary)
+                .map_err(|source| ModError::MutationIo { source })?;
+            state.entries.retain(|record| {
+                !(record.content_type == ContentType::Mod
+                    && record.file_name.eq_ignore_ascii_case(&entry.file_name))
+            });
+            if let Err(error) = state.save(managed, instance) {
+                std::fs::rename(&temporary, &target)
+                    .map_err(|source| ModError::MutationIo { source })?;
+                return Err(ModError::ContentState(error.to_string()));
+            }
+            std::fs::remove_file(temporary).map_err(|source| ModError::MutationIo { source })?;
+        } else {
+            std::fs::remove_file(target).map_err(|source| ModError::MutationIo { source })?;
+        }
         scan(managed, instance)
     })
 }
@@ -733,6 +829,7 @@ pub fn remove(
 fn resolve_mutable_entry<'a>(
     inventory: &'a ModInventory,
     entry_id: &str,
+    toggle: bool,
 ) -> Result<&'a ModEntry, ModError> {
     let entry = inventory
         .entries
@@ -742,7 +839,7 @@ fn resolve_mutable_entry<'a>(
     if entry.ownership == ModOwnership::LauncherManagedRequired {
         return Err(ModError::RequiredArtifact);
     }
-    if entry.ownership != ModOwnership::UserManaged || !entry.can_remove || !entry.can_toggle {
+    if !entry.can_remove || (toggle && !entry.can_toggle) {
         return Err(ModError::UnsafeEntry);
     }
     Ok(entry)
@@ -779,26 +876,12 @@ fn validate_file_name(file_name: &str) -> Result<(), ModError> {
     Ok(())
 }
 
-fn mutation_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
-    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
-    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn with_mutation_lock<T>(
     instance: &InstanceId,
     operation: impl FnOnce() -> Result<T, ModError>,
 ) -> Result<T, ModError> {
-    let lock = {
-        let mut locks = mutation_locks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        locks
-            .entry(instance.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let _guard = lock.try_lock().map_err(|_| ModError::MutationInProgress)?;
-    operation()
+    crate::instance_content::with_instance_lock(instance, || Ok(operation()))
+        .map_err(|_| ModError::MutationInProgress)?
 }
 
 fn is_enabled_jar(name: &str) -> bool {
@@ -832,6 +915,7 @@ pub enum ModError {
     Boundary { source: std::io::Error },
     BoundaryEscape,
     InstalledState(String),
+    ContentState(String),
     StaleEntry,
     RequiredArtifact,
     UnsafeEntry,
@@ -849,6 +933,7 @@ impl ModError {
             }
             Self::BoundaryEscape | Self::UnsafeEntry => "mod_entry_unsafe",
             Self::InstalledState(_) => "aurora_installation_invalid",
+            Self::ContentState(_) => "content_state_malformed",
             Self::StaleEntry => "mod_entry_stale",
             Self::RequiredArtifact => "mod_required_artifact",
             Self::TargetConflict(_) => "mod_target_conflict",
@@ -880,6 +965,9 @@ impl fmt::Display for ModError {
                 formatter,
                 "Aurora ownership could not be established from installed state: {reason}"
             ),
+            Self::ContentState(reason) => {
+                write!(formatter, "content state could not be used: {reason}")
+            }
             Self::StaleEntry => write!(
                 formatter,
                 "this mod changed since the inventory was loaded; refresh and try again"
@@ -1125,6 +1213,59 @@ mod tests {
             "mod_required_artifact"
         );
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn provider_mod_evidence_is_distinct_from_fabric_metadata_and_detects_tamper() {
+        let fixture = Fixture::new("provider-evidence");
+        let path = fixture.mods().join("managed.jar");
+        jar(&path, Some(&metadata("managed", "Managed Mod", "{}")));
+        let digest = format!("{:x}", sha2::Sha256::digest(std::fs::read(&path).unwrap()));
+        let record = ProviderRecord {
+            content_type: ContentType::Mod,
+            provider: "synthetic".into(),
+            project_id: "project-opaque".into(),
+            version_id: "version-opaque".into(),
+            file_id: "file-opaque".into(),
+            file_name: "managed.jar".into(),
+            sha256: digest.clone(),
+            display_version: Some("1.2.3".into()),
+            compatibility: crate::instance_content::ContentCompatibility {
+                minecraft_versions: vec!["1.21.11".into()],
+                loader: Some("fabric".into()),
+                environment: Some("client".into()),
+            },
+            dependencies: vec![],
+        };
+        let mut state = ContentState::empty();
+        state.entries.push(record.clone());
+        state.save(&fixture.managed, &fixture.instance).unwrap();
+        let inventory = scan(&fixture.managed, &fixture.instance).unwrap();
+        let entry = &inventory.entries[0];
+        assert_eq!(entry.ownership, ModOwnership::ProviderManaged);
+        assert_eq!(entry.sha256.as_deref(), Some(digest.as_str()));
+        assert_eq!(
+            entry.provenance.as_ref().unwrap().project_id,
+            "project-opaque"
+        );
+        assert!(!entry.can_toggle && entry.can_remove);
+        assert_eq!(
+            set_enabled(&fixture.managed, &fixture.instance, &entry.entry_id, false)
+                .unwrap_err()
+                .code(),
+            "mod_entry_unsafe"
+        );
+        std::fs::write(&path, b"tampered").unwrap();
+        let tampered = scan(&fixture.managed, &fixture.instance).unwrap();
+        assert_eq!(tampered.entries[0].ownership, ModOwnership::Unknown);
+        assert!(!tampered.entries[0].can_remove);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            scan(&fixture.managed, &fixture.instance)
+                .unwrap()
+                .missing_managed,
+            vec![record]
+        );
     }
 
     #[test]

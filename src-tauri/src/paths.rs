@@ -78,6 +78,8 @@ impl ManagedPaths {
             root: root.clone(),
             game: root.join("game"),
             mods: root.join("mods"),
+            resourcepacks: root.join("resourcepacks"),
+            shaderpacks: root.join("shaderpacks"),
             config: root.join("config"),
             logs: root.join("logs"),
         }
@@ -90,6 +92,8 @@ pub struct InstancePaths {
     root: PathBuf,
     game: PathBuf,
     mods: PathBuf,
+    resourcepacks: PathBuf,
+    shaderpacks: PathBuf,
     config: PathBuf,
     logs: PathBuf,
 }
@@ -107,6 +111,14 @@ impl InstancePaths {
     /// Aurora plus optional instance-scoped mods.
     pub fn mods(&self) -> &Path {
         &self.mods
+    }
+
+    pub fn resourcepacks(&self) -> &Path {
+        &self.resourcepacks
+    }
+
+    pub fn shaderpacks(&self) -> &Path {
+        &self.shaderpacks
     }
 
     /// Minecraft, Fabric, Aurora, and mod configuration.

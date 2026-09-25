@@ -23,6 +23,8 @@ function entry(
     sizeBytes: 1024,
     modifiedUnixMillis: 1,
     ownership: "userManaged",
+    sha256: null,
+    provenance: null,
     metadata: {
       id,
       name: displayName,
@@ -98,13 +100,15 @@ describe("local mod list projection", () => {
 });
 
 describe("remove confirmation state", () => {
-  it("starts only for proven user-managed entries", () => {
+  it("starts for local and proven provider-managed entries, never required files", () => {
     assert.equal(beginRemoval(fixture[3]!), null);
     assert.deepEqual(beginRemoval(fixture[0]!), {
       entryId: "zeta",
       displayName: "Zeta",
       fileName: "zeta.jar",
     });
+    assert.equal(beginRemoval(entry("managed", "Managed", { ownership: "providerManaged" }))?.entryId, "managed");
+    assert.equal(beginRemoval(entry("unknown", "Unknown", { ownership: "unknown", canRemove: false })), null);
   });
 
   it("reconciles a confirmation against the latest inventory", () => {

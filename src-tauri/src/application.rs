@@ -331,6 +331,9 @@ impl From<crate::instance_mods::ModError> for CommandError {
                 "Aurora Client ownership could not be verified from this instance's installed state."
                     .to_owned()
             }
+            crate::instance_mods::ModError::ContentState(_) => {
+                "Provider content state is malformed or unsupported. No content was changed.".to_owned()
+            }
             crate::instance_mods::ModError::StaleEntry => {
                 "This mod changed since the list was loaded. Refresh and try again.".to_owned()
             }
@@ -349,6 +352,34 @@ impl From<crate::instance_mods::ModError> for CommandError {
             }
         };
         Self::new(code, message)
+    }
+}
+
+impl From<crate::instance_content::ContentError> for CommandError {
+    fn from(error: crate::instance_content::ContentError) -> Self {
+        let code = error.code();
+        eprintln!("[aurora-launcher] content operation failed ({code}): {error}");
+        Self::new(
+            code,
+            match code {
+                "content_state_malformed" => {
+                    "Provider content state is malformed or unsupported. No content was changed."
+                }
+                "content_changed_since_scan" => {
+                    "This content changed since Refresh. Refresh and try again."
+                }
+                "content_collision" => {
+                    "A file already exists at that name. Nothing was overwritten."
+                }
+                "content_unsafe_path" => "Aurora refused an unsafe content path.",
+                "content_hash_mismatch" => "Content did not match its expected SHA-256.",
+                "content_operation_in_progress" => {
+                    "Another content change is in progress for this instance."
+                }
+                "unsupported_content_action" => "This content entry cannot be changed here.",
+                _ => "The content operation could not be completed. Refresh and try again.",
+            },
+        )
     }
 }
 
@@ -1988,6 +2019,130 @@ pub fn open_instance_mods_folder(
         CommandError::new(
             "instance_folder_open_failure",
             format!("the instance mods folder could not be opened: {error}"),
+        )
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceContentRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveInstanceContentRequest {
+    instance_id: String,
+    content_type: crate::instance_content::ContentType,
+    entry_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceContentContext {
+    instance_id: String,
+    minecraft_version: String,
+    loader: String,
+    loader_version: String,
+    aurora_version: String,
+    environment: String,
+}
+
+#[tauri::command]
+pub fn get_instance_content_context(
+    app: AppHandle,
+    request: InstanceModsRequest,
+) -> Result<InstanceContentContext, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let registry = InstanceRegistry::load(&managed.instance_registry_file())?;
+    let record = registry.find(&instance).ok_or_else(|| {
+        CommandError::new(
+            "instance_not_found",
+            "Instance was removed during the request.",
+        )
+    })?;
+    Ok(InstanceContentContext {
+        instance_id: instance.to_string(),
+        minecraft_version: record.release().minecraft_version().to_owned(),
+        loader: "fabric".to_owned(),
+        loader_version: record.release().fabric_loader_version().to_owned(),
+        aurora_version: record.release().aurora_version().to_owned(),
+        environment: "client".to_owned(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_instance_content(
+    app: AppHandle,
+    request: InstanceContentRequest,
+) -> Result<crate::instance_content::ContentInventory, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    if request.content_type == crate::instance_content::ContentType::Mod {
+        return Err(CommandError::new(
+            "unsupported_content_action",
+            "Use the Mods inventory for Fabric mods.",
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::instance_content::scan(&managed, &instance, request.content_type)
+    })
+    .await
+    .map_err(|_| {
+        CommandError::new(
+            "content_unavailable",
+            "The content inventory worker stopped.",
+        )
+    })?
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub async fn remove_instance_content(
+    app: AppHandle,
+    request: RemoveInstanceContentRequest,
+) -> Result<crate::instance_content::ContentInventory, CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    if request.content_type == crate::instance_content::ContentType::Mod {
+        return Err(CommandError::new(
+            "unsupported_content_action",
+            "Use the Mods action for Fabric mods.",
+        ));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::instance_content::remove(
+            &managed,
+            &instance,
+            request.content_type,
+            &request.entry_id,
+        )
+    })
+    .await
+    .map_err(|_| {
+        CommandError::new(
+            "content_unavailable",
+            "The content mutation worker stopped.",
+        )
+    })?
+    .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn open_instance_content_folder(
+    app: AppHandle,
+    request: InstanceContentRequest,
+) -> Result<(), CommandError> {
+    let managed = managed_paths(&app)?;
+    let instance = registered_instance(&managed, &request.instance_id)?;
+    let folder =
+        crate::instance_content::ensure_directory(&managed, &instance, request.content_type)?;
+    tauri_plugin_opener::open_path(&folder, None::<&str>).map_err(|error| {
+        CommandError::new(
+            "instance_folder_open_failure",
+            format!("content folder could not be opened: {error}"),
         )
     })
 }

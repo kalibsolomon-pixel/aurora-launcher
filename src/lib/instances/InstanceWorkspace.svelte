@@ -5,6 +5,7 @@
   import { draftIsDirty, instanceContentStatus } from "$lib/launcher/instanceStatus";
   import InstanceOverviewPanel from "$lib/instances/InstanceOverviewPanel.svelte";
   import InstanceModsPanel from "$lib/instances/InstanceModsPanel.svelte";
+  import InstancePacksPanel from "$lib/instances/InstancePacksPanel.svelte";
   import InstanceSettingsPanel from "$lib/instances/InstanceSettingsPanel.svelte";
   import type { InstanceTab } from "$lib/launcher/navigation";
 
@@ -49,6 +50,8 @@
   const tabLabels: Record<InstanceTab, string> = {
     overview: "Overview",
     mods: "Mods",
+    resourcePacks: "Resource Packs",
+    shaders: "Shaders",
     settings: "Settings",
   };
 
@@ -211,6 +214,10 @@
         <InstanceOverviewPanel {instance} />
       {:else if tab === "mods"}
         <InstanceModsPanel {instance} />
+      {:else if tab === "resourcePacks"}
+        <InstancePacksPanel {instance} kind="resourcePack" />
+      {:else if tab === "shaders"}
+        <InstancePacksPanel {instance} kind="shaderPack" />
       {:else}
         <InstanceSettingsPanel {instance} />
       {/if}
@@ -272,6 +279,7 @@
      workspace header — a third navigation column is deliberately absent. */
   .workspace-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: var(--space-1);
     border-bottom: 1px solid var(--color-border);
     margin-bottom: var(--space-5);

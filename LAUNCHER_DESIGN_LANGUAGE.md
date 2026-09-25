@@ -158,8 +158,8 @@ Opening an instance replaces the global page with a stable contextual shell:
    mounted while tabs switch.
 
 There are never three simultaneous navigation columns: the global sidebar plus the
-instance tab row is the whole navigation surface. Mods is the first implemented
-content tab. Instance tabs may later grow Resource Packs, Shaders, and Logs;
+instance tab row is the whole navigation surface. Mods, Resource Packs, and
+Shaders are implemented content tabs. Instance tabs may later grow Logs;
 placeholder tabs for unbuilt features are prohibited.
 
 ### Compact information density
@@ -476,8 +476,8 @@ operating-system surfaces only, and the two are never swapped for each other.
 
 ## Future information architecture (documented, not built)
 
-- **Instance workspace tabs** — Mods is implemented. Resource Packs, Shaders, and
-  Logs are intended later tabs inside an instance's workspace (and Worlds/Servers
+- **Instance workspace tabs** — Mods, Resource Packs, and Shaders are implemented. Logs is
+  intended later inside an instance's workspace (and Worlds/Servers
   a possible later stage). No fake tab appears before its backend capability; the
   typed `InstanceTab` model remains the extension point.
 - **Library** — a future online content-browsing destination. No provider backend

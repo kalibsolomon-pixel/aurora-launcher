@@ -8,6 +8,7 @@ pub mod distribution;
 pub mod downloads;
 pub mod fabric;
 pub mod install;
+pub mod instance_content;
 pub mod instance_mods;
 pub mod instances;
 pub mod integrity;
@@ -52,6 +53,10 @@ pub fn run() {
             application::set_instance_mod_enabled,
             application::remove_instance_mod,
             application::open_instance_mods_folder,
+            application::get_instance_content_context,
+            application::get_instance_content,
+            application::remove_instance_content,
+            application::open_instance_content_folder,
             application::validate_instance,
             application::get_instance_runtime_status,
             application::ensure_instance_runtime,

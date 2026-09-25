@@ -111,12 +111,18 @@ describe("instance workspace navigation", () => {
     assert.deepEqual(selectInstanceTab(globalState("instances"), "overview"), globalState("instances"));
   });
 
-  it("places the implemented Mods tab between Overview and Settings", () => {
+  it("opens each implemented content tab inside the same instance", () => {
     const state = openInstance(globalState("instances"), "abc123");
     assert.deepEqual(selectInstanceTab(state, "mods"), {
       kind: "instance",
       instanceId: "abc123",
       tab: "mods",
+    });
+    assert.deepEqual(selectInstanceTab(state, "resourcePacks"), {
+      kind: "instance", instanceId: "abc123", tab: "resourcePacks",
+    });
+    assert.deepEqual(selectInstanceTab(state, "shaders"), {
+      kind: "instance", instanceId: "abc123", tab: "shaders",
     });
   });
 

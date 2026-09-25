@@ -10,6 +10,7 @@ import {
   getInstanceRuntimeStatus,
   getLauncherState,
   getInstanceMods,
+  getInstanceContent,
   getPlayReadiness,
   installGame,
   installInstanceConfiguration,
@@ -18,12 +19,14 @@ import {
   listMinecraftVersions,
   openInstanceFolder,
   openInstanceModsFolder,
+  openInstanceContentFolder,
   planFabricInstall,
   planMinecraftInstall,
   playInstance,
   refreshAccountSession,
   removeAccount,
   removeInstanceMod,
+  removeInstanceContent,
   renameInstance,
   retryInstanceInstall,
   selectAccount,
@@ -55,6 +58,8 @@ import {
   type MinecraftPlanSummary,
   type MinecraftVersion,
   type ModInventory,
+  type ContentInventory,
+  type ContentType,
   type PlayReadiness,
   type RuntimeProgressEvent,
   type RuntimeStatusDto,
@@ -124,6 +129,10 @@ class LauncherStore {
   modMutationBusy = $state<string | null>(null);
   modFolderBusy = $state<string | null>(null);
   modError = $state<LauncherBackendError | null>(null);
+  contentInventories = $state<Record<string, ContentInventory>>({});
+  contentBusy = $state<string | null>(null);
+  contentMutationBusy = $state<string | null>(null);
+  contentError = $state<LauncherBackendError | null>(null);
 
   // Managed Java runtime for the selected instance.
   runtimeStatus = $state<RuntimeStatusDto | null>(null);
@@ -529,6 +538,39 @@ class LauncherStore {
     } finally {
       this.modFolderBusy = null;
     }
+  }
+
+  private contentKey(id: string, kind: ContentType): string { return `${id}:${kind}`; }
+
+  async runLoadContent(id: string, kind: ContentType): Promise<void> {
+    const key = this.contentKey(id, kind);
+    if (this.contentBusy === key) return;
+    this.contentBusy = key;
+    this.contentError = null;
+    try {
+      this.contentInventories[key] = await getInstanceContent(id, kind);
+    } catch (cause: unknown) {
+      this.contentError = backendError(cause, "The content inventory could not be loaded.");
+    } finally { this.contentBusy = null; }
+  }
+
+  async runRemoveContent(id: string, kind: ContentType, entryId: string): Promise<void> {
+    if (this.contentMutationBusy !== null) return;
+    this.contentMutationBusy = entryId;
+    this.contentError = null;
+    try {
+      this.contentInventories[this.contentKey(id, kind)] = await removeInstanceContent(id, kind, entryId);
+    } catch (cause: unknown) {
+      const error = backendError(cause, "The content could not be removed.");
+      await this.runLoadContent(id, kind);
+      this.contentError = error;
+    } finally { this.contentMutationBusy = null; }
+  }
+
+  async runOpenContentFolder(id: string, kind: ContentType): Promise<void> {
+    this.contentError = null;
+    try { await openInstanceContentFolder(id, kind); }
+    catch (cause: unknown) { this.contentError = backendError(cause, "The content folder could not be opened."); }
   }
 
   /**

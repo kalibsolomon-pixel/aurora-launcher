@@ -9,7 +9,7 @@
  *   Settings, About, and Developer in development builds only);
  * - the INSTANCE WORKSPACE level (one open instance plus its local tab).
  *
- * Instance-local content (future Mods/Resource Packs/Logs tabs and friends)
+ * Instance-local content (Mods, Resource Packs, Shaders, and future Logs)
  * extends `InstanceTab`, never the global destinations.
  */
 
@@ -25,7 +25,7 @@ export const GLOBAL_PAGES = [
 export type GlobalPage = (typeof GLOBAL_PAGES)[number];
 
 /** Instance-local workspace tabs with real implemented functionality. */
-export const INSTANCE_TABS = ["overview", "mods", "settings"] as const;
+export const INSTANCE_TABS = ["overview", "mods", "resourcePacks", "shaders", "settings"] as const;
 
 export type InstanceTab = (typeof INSTANCE_TABS)[number];
 
